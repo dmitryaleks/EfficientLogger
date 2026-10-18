@@ -1,6 +1,6 @@
 # EfficientLogger — Implementation Plan
 
-> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M8 done. Both modes are usable: `EfficientLogger.builder(...).build()` gives the async logger (the default), and `.synchronous().build()` the sync one. Next: M9.
+> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M9 done. Both modes are usable: `EfficientLogger.builder(...).build()` gives the async logger (the default), and `.synchronous().build()` the sync one. Tests show `log()` allocates nothing, whether it queues, drops, writes (sync) or is called after close, and neither does the async worker. Next: M10 (optional: benchmarks and a README).
 
 ## 1. Context
 Today the user writes multiple JSON log files through log4j, appending across restarts.
@@ -397,6 +397,12 @@ On Windows `parkNanos` is about 16 ms granular. Don't use microsecond parks for 
   - Measure 1 M calls in a static loop that returns a count, with the calibration overhead subtracted.
   - Assert ≤ 256 B on the producer and ≤ 4 KiB on the worker. Any per-call allocation would show up as ≥ 16 MB.
   - Variants: the drop path (worker gated, every call returns false) and the sync path.
+  - **As built in M9 (`AllocationTest`):**
+    - **Warm-up.** It runs 2 rounds identical to the measured ones, then measures 2 rounds and passes if either is within the allowance. The planned warm-up (5 × 200 K calls) wasn't enough. The first 1 M-call round is the first in which the queue passes a quarter full, so `log()` wakes the worker for the first time. The JIT then recompiles it, which allocates 2,392 bytes once. Every later round allocates 0, with escape analysis on or off. An allocation in every call would still show in both rounds, so the limits stay at 256 B and 4 KiB.
+    - **The measured code is read directly**, not through a lambda.
+    - **Variants:** async (caller and worker, 1 M calls per round, nothing dropped), the drop path (worker gated), `log()` after close, and sync (100 K calls per round, since each one writes to a file).
+    - **Escape analysis check.** Each Gradle task passes `efficientlogger.escapeAnalysis`, and a test checks it against the JVM's `DoEscapeAnalysis` setting, so a misconfigured `allocationTestNoEA` can't pass silently.
+    - **Checking the check.** An allocation planted in `log()` that never leaves it passes `allocationTest`, because the JIT removes it. `allocationTestNoEA` fails on it at exactly 24 B per call.
 - **Windows:** always close loggers (try-with-resources) so `@TempDir` cleanup works. No timing assertions finer than 100 ms.
 
 ---

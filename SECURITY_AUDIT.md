@@ -83,6 +83,7 @@ below was re-run against the new jar.
 | F2 | Mostly fixed | Before writing, the logger refuses any path that isn't a regular file (a symlink, FIFO, device or directory), using a NOFOLLOW stat so it never opens or blocks on one; it is dropped and retried like any I/O error. At `build()`, a POSIX directory writable by other users without the sticky bit draws a warning. | A planted symlink and a directory are refused, the symlink's target is untouched, and a world-writable directory is flagged |
 | F8 | Fixed | A too-large message is counted and warned about on its own (once), not fed into the queue-full episode logic. Overflow episode warnings are rate-limited to one every 10 s, folding the dropped counts into the next report. The `WarningHandler` contract now says it must not block, and rate-limiting means it is called at most occasionally. | 1,000,000 too-large messages produce 1 warning (was ~9,900); 20,000 overflow cycles produce 3 (was ~9,400) |
 | F10 | Fixed | New `filePermissions(Set<PosixFilePermission>)` option creates new files with the given POSIX permissions and the directory with those plus execute, instead of the umask default; existing files keep theirs. Off POSIX it is a no-op with a one-time warning. | A logger built with `rw-------` creates a `rw-------` file and a `rwx------` directory even under umask 022 |
+| F12 | Mostly fixed | Gradle upgraded to 8.14.4 (past the repository-failover advisories), with `distributionSha256Sum` pinning the distribution and the wrapper jar refreshed to 8.14.4's genuine one. `gradle/verification-metadata.xml` pins the SHA-256 of every plugin and dependency. Toolchain auto-download is off, so the build pulls no unverified JDK. | A build from an empty Gradle home re-downloads the distribution and every dependency and verifies them all; a tampered artifact fails it |
 | F7 | Fixed | The worker now backs off to a timed poll on a slot a cut-off `log()` call never published, instead of spinning a core, and `close()` gives up after the queue stops draining for 2 s instead of waiting forever, with a warning. The worker loop can no longer be exited by an error, and a worker that does stop closes the logger. | A simulated cut-off producer no longer pegs a core, and `close()` finishes |
 | F13 | Fixed (with F7) | The worker's error handling can no longer throw its way out of the loop, and if a worker thread ever stops while the logger is open, admission is closed and a warning is emitted. | Covered by the F7 tests and the existing error-path tests |
 | F4 | Fixed | `log()` rejects an ID that can't fit in a file name with one length comparison, before queueing or locking. It is counted in `droppedInvalidId` and warned about once. Invalid IDs are no longer copied into a file name first, and those kept as entries are at most 255 chars. | The 50-million-char ID is rejected at once |
@@ -109,6 +110,11 @@ logger creates is tracked separately as F10.
 A handler that blocks forever (F8) can still stall the worker on the rare call that reaches it;
 the logger can't fix a handler that never returns, so the contract requires one that does, and
 rate-limiting keeps the calls rare.
+
+For F12, the benchmark plugin is still applied to the main build rather than an isolated
+subproject; moving it is optional and not done here, since the plugin and its dependencies are now
+pinned by checksum. Dependency verification must be regenerated when a dependency changes
+(`./gradlew --write-verification-metadata sha256 build jmhJar` from a clean Gradle home).
 
 ## Threat model
 

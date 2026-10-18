@@ -253,7 +253,9 @@ the disk.
 
 `build` runs the unit, integration and stress tests, then the allocation tests in two separate
 JVMs (`allocationTest` and `allocationTestNoEA`). It passes on Windows 11 and on Ubuntu 24.04
-(WSL 2). The library is
+(WSL 2). It needs a JDK 17 installed locally: the build won't download one (see below), and the
+Gradle wrapper and every dependency are pinned by checksum (`gradle/wrapper/gradle-wrapper.properties`
+and `gradle/verification-metadata.xml`), so a tampered download fails the build. The library is
 `build/libs/EfficientLogger-1.0-SNAPSHOT.jar`, with no dependencies. Benchmarks run separately:
 
 ```

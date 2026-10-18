@@ -46,13 +46,14 @@ final class SyncLogger implements EfficientLogger {
                     + " new files follow the directory's access rules instead", null);
         }
         budget = new OpenFileBudget(config.maxOpenFiles);
+        FileCreationBudget fileBudget = new FileCreationBudget(config.maxFiles);
         clock = hooks.nanoClock;
         closeTimeout = config.closeTimeout;
         stripes = new Stripe[config.syncStripes];
         for (int i = 0; i < stripes.length; i++) {
             stripes[i] = new Stripe(new FileTable(config.fileNamePattern, config.lineSeparator,
                     config.fileBufferBytes, config.maxFileEntries, hooks.sinks,
-                    budget, warnings));
+                    budget, fileBudget, warnings));
         }
     }
 

@@ -8,6 +8,7 @@ final class FileState {
     static final byte OPEN = 0;
     static final byte FAILED = 1; // not open; retry opening at retryAtNanos
     static final byte INVALID = 2; // the ID can't be used as a file name
+    static final byte CAPPED = 3; // no file: the logger is at its maxFiles limit
 
     final String id;
     final Path path; // null when INVALID

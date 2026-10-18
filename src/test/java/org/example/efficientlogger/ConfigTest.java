@@ -48,6 +48,7 @@ class ConfigTest {
         assertEquals(16L << 20, c.maxQueuedChars);
         assertEquals(8192, c.fileBufferBytes);
         assertEquals(1024, c.maxOpenFiles);
+        assertEquals(Integer.MAX_VALUE, c.maxFiles);
         assertEquals(Duration.ofMillis(100).toNanos(), c.flushIntervalNanos);
         assertFalse(c.eagerWakeup);
         assertEquals(Duration.ofSeconds(10), c.closeTimeout);
@@ -92,6 +93,7 @@ class ConfigTest {
                 .maxQueuedChars(50_000)
                 .fileBufferBytes(4096)
                 .maxOpenFiles(600)
+                .maxFiles(5000)
                 .flushIntervalMillis(250)
                 .eagerWakeup(true)
                 .closeTimeout(Duration.ofSeconds(3))
@@ -106,6 +108,7 @@ class ConfigTest {
         assertEquals(50_000, c.maxQueuedChars);
         assertEquals(4096, c.fileBufferBytes);
         assertEquals(600, c.maxOpenFiles);
+        assertEquals(5000, c.maxFiles);
         assertEquals(Duration.ofMillis(250).toNanos(), c.flushIntervalNanos);
         assertTrue(c.eagerWakeup);
         assertEquals(Duration.ofSeconds(3), c.closeTimeout);
@@ -127,6 +130,7 @@ class ConfigTest {
                 option("fileBufferBytes(63)", b -> b.fileBufferBytes(63)),
                 option("fileBufferBytes(16 MiB + 1)", b -> b.fileBufferBytes((16 << 20) + 1)),
                 option("maxOpenFiles(0)", b -> b.maxOpenFiles(0)),
+                option("maxFiles(0)", b -> b.maxFiles(0)),
                 option("flushIntervalMillis(-1)", b -> b.flushIntervalMillis(-1)),
                 option("flushIntervalMillis(60001)", b -> b.flushIntervalMillis(60_001)),
                 option("closeTimeout(-1 ms)", b -> b.closeTimeout(Duration.ofMillis(-1))),
@@ -157,6 +161,8 @@ class ConfigTest {
                 option("fileBufferBytes(64)", b -> b.fileBufferBytes(64)),
                 option("fileBufferBytes(16 MiB)", b -> b.fileBufferBytes(16 << 20)),
                 option("maxOpenFiles(1)", b -> b.maxOpenFiles(1)),
+                option("maxFiles(1)", b -> b.maxFiles(1)),
+                option("maxFiles(MAX)", b -> b.maxFiles(Integer.MAX_VALUE)),
                 option("flushIntervalMillis(0)", b -> b.flushIntervalMillis(0)),
                 option("flushIntervalMillis(60000)", b -> b.flushIntervalMillis(60_000)),
                 option("closeTimeout(0)", b -> b.closeTimeout(Duration.ZERO)),

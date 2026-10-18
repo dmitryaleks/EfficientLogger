@@ -36,6 +36,7 @@ All set on the builder; each setter checks its argument at once.
 | `maxQueuedChars(long)` | 16 Mi | 1 to 2^38−1, total `String.length()` of queued messages. A single longer message is always dropped. Async only. |
 | `fileBufferBytes(int)` | 8192 | 64 B to 16 MiB. Async: one per file with unwritten data. Sync: one per stripe. |
 | `maxOpenFiles(int)` | 1024 | At least 1. When reached, the least recently used file is closed, and reopened when next needed. |
+| `maxFiles(int)` | unlimited | Most new files the logger will create. Beyond it, messages for IDs without a file yet are dropped and counted. Reopening an existing file doesn't count. Set it when IDs are untrusted. |
 | `flushIntervalMillis(long)` | 100 | 0 to 60,000. The longest a message waits before it is handed to the OS. 0 writes after every batch. Async only. |
 | `eagerWakeup(boolean)` | false | Wake the worker for every message instead of when the queue is a quarter full. Lower latency to disk, more CPU. Async only. |
 | `closeTimeout(Duration)` | 10 s | How long `close()` waits for the queue to drain. |
@@ -82,6 +83,10 @@ Combining an async-only option with `synchronous()`, or `syncStripes` without it
   a warning per ID for the first 100. On a case-insensitive file system, `Foo` and `foo` share a
   file. Their relative order isn't guaranteed, and a message larger than the buffer can be split
   around the other ID's lines.
+- **Use IDs from a bounded set.** Each distinct ID is a separate file, so IDs taken straight from
+  untrusted input (a user ID, a header) let a caller fill the disk or the directory with files, and
+  once more IDs are active than `maxOpenFiles` the logger opens and closes a file per message, which
+  is far slower. Map untrusted values to a bounded set of IDs, and set `maxFiles` as a backstop.
 - **I/O errors** don't throw. The messages for that file are dropped for one second, then it is
   retried. A missing directory is created again. Error warnings are limited to one every
   10 seconds, and the number held back is reported at close.

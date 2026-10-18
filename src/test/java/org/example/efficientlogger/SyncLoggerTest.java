@@ -210,6 +210,22 @@ class SyncLoggerTest {
     }
 
     @Test
+    void maxFilesCapsTheNumberOfFilesCreated() throws IOException {
+        try (EfficientLogger logger = builder().maxFiles(2).build()) {
+            assertTrue(logger.log("a", "{}"));
+            assertTrue(logger.log("b", "{}"));
+            assertFalse(logger.log("c", "{}"), "over maxFiles: no file for c");
+            assertFalse(logger.log("c", "{}"), "still capped");
+            assertEquals(2, logger.stats().droppedInvalidId());
+        }
+        assertTrue(Files.exists(file("a")));
+        assertTrue(Files.exists(file("b")));
+        assertFalse(Files.exists(file("c")));
+        assertEquals(1, warnings.size(), warnings.toString());
+        assertTrue(warnings.get(0).contains("maxFiles"), warnings.get(0));
+    }
+
+    @Test
     void warnsAtBuildWhenTheDirectoryIsExposedToOtherUsers() {
         FakeSinks sinks = new FakeSinks(dir.toAbsolutePath().normalize());
         sinks.directoryExposedReason = "the log directory path /x is writable by other users; restrict it";

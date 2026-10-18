@@ -30,6 +30,7 @@ public final class EfficientLoggerBuilder {
     Long maxQueuedChars;
     Integer fileBufferBytes;
     Integer maxOpenFiles;
+    Integer maxFiles;
     Long flushIntervalMillis;
     Boolean eagerWakeup;
     Duration closeTimeout;
@@ -98,6 +99,18 @@ public final class EfficientLoggerBuilder {
      */
     public EfficientLoggerBuilder maxOpenFiles(int files) {
         this.maxOpenFiles = checkRange("maxOpenFiles", files, 1, Integer.MAX_VALUE);
+        return this;
+    }
+
+    /**
+     * Maximum number of new files the logger will create, at least 1. Unlimited by default. Once
+     * reached, messages for IDs that don't have a file yet are dropped and counted (in
+     * {@code stats().droppedInvalidId()}), with one warning. Reopening a file that already exists
+     * doesn't count, so a bounded set of IDs never hits the limit. Set it when IDs can come from
+     * untrusted input, so they can't fill the disk with files.
+     */
+    public EfficientLoggerBuilder maxFiles(int files) {
+        this.maxFiles = checkRange("maxFiles", files, 1, Integer.MAX_VALUE);
         return this;
     }
 

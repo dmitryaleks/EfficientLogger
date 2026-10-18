@@ -38,6 +38,7 @@ final class AsyncLogger implements EfficientLogger {
         int number = LOGGER_NUMBERS.incrementAndGet();
         warnings = new Warnings(config.warningHandler, config.maxIdLength, config.maxQueuedChars);
         budget = new OpenFileBudget(config.maxOpenFiles);
+        FileCreationBudget fileBudget = new FileCreationBudget(config.maxFiles);
         admission = new Admission(config.maxQueuedMessages, config.maxQueuedChars);
         tracker = new OverflowTracker(admission, config, warnings);
         maxChars = config.maxQueuedChars;
@@ -60,7 +61,7 @@ final class AsyncLogger implements EfficientLogger {
         for (int i = 0; i < n; i++) {
             rings[i] = new MpscRing(config.ringCapacity, startIndex, config.wakeCount, config.wakeChars);
             FileTable files = new FileTable(config.fileNamePattern, config.lineSeparator, config.fileBufferBytes,
-                    config.maxFileEntries, hooks.sinks, budget, warnings);
+                    config.maxFileEntries, hooks.sinks, budget, fileBudget, warnings);
             workers[i] = new Worker(rings[i], files, admission, tracker, warnings, hooks.nanoClock, batchSize,
                     config.flushIntervalNanos, config.eagerWakeup, hooks.beforeBatch);
         }

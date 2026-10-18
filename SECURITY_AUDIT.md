@@ -84,6 +84,7 @@ below was re-run against the new jar.
 | F8 | Fixed | A too-large message is counted and warned about on its own (once), not fed into the queue-full episode logic. Overflow episode warnings are rate-limited to one every 10 s, folding the dropped counts into the next report. The `WarningHandler` contract now says it must not block, and rate-limiting means it is called at most occasionally. | 1,000,000 too-large messages produce 1 warning (was ~9,900); 20,000 overflow cycles produce 3 (was ~9,400) |
 | F10 | Fixed | New `filePermissions(Set<PosixFilePermission>)` option creates new files with the given POSIX permissions and the directory with those plus execute, instead of the umask default; existing files keep theirs. Off POSIX it is a no-op with a one-time warning. | A logger built with `rw-------` creates a `rw-------` file and a `rwx------` directory even under umask 022 |
 | F12 | Mostly fixed | Gradle upgraded to 8.14.4 (past the repository-failover advisories), with `distributionSha256Sum` pinning the distribution and the wrapper jar refreshed to 8.14.4's genuine one. `gradle/verification-metadata.xml` pins the SHA-256 of every plugin and dependency. Toolchain auto-download is off, so the build pulls no unverified JDK. | A build from an empty Gradle home re-downloads the distribution and every dependency and verifies them all; a tampered artifact fails it |
+| F3 | Mostly fixed | New `maxFiles(int)` option caps how many new files the logger creates; beyond it, messages for IDs without a file are dropped and counted, with one warning. Reopening an existing file doesn't count, so a bounded ID set never trips it. The docs now tell callers to use IDs from a bounded set. | With `maxFiles(2)`, a third distinct ID's file is never created; re-logging an existing ID is unaffected |
 | F7 | Fixed | The worker now backs off to a timed poll on a slot a cut-off `log()` call never published, instead of spinning a core, and `close()` gives up after the queue stops draining for 2 s instead of waiting forever, with a warning. The worker loop can no longer be exited by an error, and a worker that does stop closes the logger. | A simulated cut-off producer no longer pegs a core, and `close()` finishes |
 | F13 | Fixed (with F7) | The worker's error handling can no longer throw its way out of the loop, and if a worker thread ever stops while the logger is open, admission is closed and a warning is emitted. | Covered by the F7 tests and the existing error-path tests |
 | F4 | Fixed | `log()` rejects an ID that can't fit in a file name with one length comparison, before queueing or locking. It is counted in `droppedInvalidId` and warned about once. Invalid IDs are no longer copied into a file name first, and those kept as entries are at most 255 chars. | The 50-million-char ID is rejected at once |
@@ -115,6 +116,13 @@ For F12, the benchmark plugin is still applied to the main build rather than an 
 subproject; moving it is optional and not done here, since the plugin and its dependencies are now
 pinned by checksum. Dependency verification must be regenerated when a dependency changes
 (`./gradlew --write-verification-metadata sha256 build jmhJar` from a clean Gradle home).
+
+For F3, `maxFiles` bounds the new files created within a run but doesn't track files across
+restarts (an existing file reopened after a restart isn't a new file), and it doesn't reduce the
+open-and-close churn once active IDs exceed `maxOpenFiles` — the real remedy for both is using IDs
+from a bounded set, which the docs now call for. The still-per-call `lastByte` probe on reopen
+(the audit's third suggestion) is unchanged, since skipping it safely would need a larger
+rework of how files are evicted.
 
 ## Threat model
 

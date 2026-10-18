@@ -24,6 +24,7 @@ class FileTableTest {
             (message, cause) -> warningLog.add(cause == null ? message : message + " | " + cause.getMessage()));
     private FakeSinks sinks = new FakeSinks(DIR);
     private OpenFileBudget budget = new OpenFileBudget(1024);
+    private FileCreationBudget fileBudget = new FileCreationBudget(FileCreationBudget.UNLIMITED);
 
     private FileTable table(int bufferBytes) {
         return table(bufferBytes, "\n", 1024 + FileTable.EXTRA_ENTRIES);
@@ -31,7 +32,7 @@ class FileTableTest {
 
     private FileTable table(int bufferBytes, String separator, int maxEntries) {
         return new FileTable(FileNamePattern.parse(DIR, "{id}.json"), separator.getBytes(US_ASCII),
-                bufferBytes, maxEntries, sinks, budget, warnings);
+                bufferBytes, maxEntries, sinks, budget, fileBudget, warnings);
     }
 
     /** Emits the table's queued warnings and returns everything emitted since the last call. */
@@ -371,6 +372,49 @@ class FileTableTest {
         assertEquals(100, w.size());
         assertTrue(w.get(99).endsWith("(further invalid ids won't be reported)"), w.get(99));
         assertEquals(150, t.droppedInvalidId());
+    }
+
+    // ---- max files ----
+
+    @Test
+    void capsNewFilesAtMaxFiles() {
+        fileBudget = new FileCreationBudget(2);
+        FileTable t = table(8192);
+        t.append("a", "{}", 0);
+        t.append("b", "{}", 0);
+        t.append("c", "{}", 0); // over the cap: no file created
+        t.flushDirty(0);
+
+        assertEquals("{}\n", sinks.content(file("a")));
+        assertEquals("{}\n", sinks.content(file("b")));
+        assertNull(sinks.content(file("c")), "no file for the capped id");
+        assertEquals(2, t.written());
+        assertEquals(1, t.droppedInvalidId(), "the capped message is counted");
+        List<String> w = warnings(t);
+        assertEquals(1, w.size(), w.toString());
+        assertTrue(w.get(0).contains("maxFiles"), w.get(0));
+
+        t.append("c", "{}", 0); // still capped
+        t.append("d", "{}", 0); // another new id, also capped
+        assertEquals(3, t.droppedInvalidId());
+        assertTrue(warnings(t).isEmpty(), "warned only once");
+    }
+
+    @Test
+    void reopeningAnExistingFileDoesNotCountAgainstMaxFiles() {
+        sinks.preset(file("a"), "{\"old\":1}\n"); // a already exists on disk
+        fileBudget = new FileCreationBudget(1); // room for just one new file
+        FileTable t = table(8192);
+
+        t.append("a", "{\"n\":2}", 0); // reopens the existing file: doesn't use the budget
+        t.append("b", "{}", 0); // one new file: uses the budget
+        t.append("c", "{}", 0); // over the cap: capped
+        t.flushDirty(0);
+
+        assertEquals("{\"old\":1}\n{\"n\":2}\n", sinks.content(file("a")));
+        assertEquals("{}\n", sinks.content(file("b")));
+        assertNull(sinks.content(file("c")));
+        assertEquals(1, t.droppedInvalidId());
     }
 
     // ---- I/O errors ----

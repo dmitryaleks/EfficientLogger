@@ -45,6 +45,7 @@ final class FileTable {
     private final int maxEntries;
     private final SinkFactory sinks;
     private final OpenFileBudget budget;
+    private final FileCreationBudget fileBudget;
     private final Warnings warnings;
 
     private final HashMap<String, FileState> files;
@@ -66,13 +67,14 @@ final class FileTable {
     private List<Warnings.Pending> pendingWarnings;
 
     FileTable(FileNamePattern pattern, byte[] separator, int bufferBytes, int maxEntries,
-            SinkFactory sinks, OpenFileBudget budget, Warnings warnings) {
+            SinkFactory sinks, OpenFileBudget budget, FileCreationBudget fileBudget, Warnings warnings) {
         this.pattern = pattern;
         this.separator = separator;
         this.bufferBytes = bufferBytes;
         this.maxEntries = maxEntries;
         this.sinks = sinks;
         this.budget = budget;
+        this.fileBudget = fileBudget;
         this.warnings = warnings;
         this.files = new HashMap<>(Math.min(maxEntries, 4096) * 4 / 3 + 1);
     }
@@ -280,6 +282,14 @@ final class FileTable {
         Sink sink = null;
         try {
             int last = sinks.lastByte(f.path);
+            if (last < 0 && !fileBudget.tryCreate()) {
+                // The file doesn't exist yet and the logger is at its maxFiles limit: don't create
+                // another. Reopening a file that already exists (last >= 0) is always allowed.
+                budget.release();
+                f.state = FileState.CAPPED;
+                reportMaxFilesReached();
+                return;
+            }
             sink = openSink(f.path, now);
             if (last >= 0 && last != '\n') {
                 // The file ends mid-line, e.g. after a crash: finish that line so ours starts clean.
@@ -439,7 +449,8 @@ final class FileTable {
     }
 
     private void dropFor(FileState f) {
-        add(f.state == FileState.INVALID ? DROPPED_INVALID_ID : LOST_IO_ERROR, 1);
+        boolean noFile = f.state == FileState.INVALID || f.state == FileState.CAPPED;
+        add(noFile ? DROPPED_INVALID_ID : LOST_IO_ERROR, 1);
     }
 
     private void add(int counter, long n) {
@@ -532,6 +543,13 @@ final class FileTable {
     }
 
     // ---- warnings ----
+
+    private void reportMaxFilesReached() {
+        if (warnings.admitMaxFilesReport()) {
+            warn("the logger has reached its limit of " + fileBudget.max() + " files (maxFiles); dropping"
+                    + " messages for ids without a file yet (counted in stats().droppedInvalidId())", null);
+        }
+    }
 
     private void reportInvalidId(String id, String reason) {
         int n = warnings.admitInvalidIdReport();

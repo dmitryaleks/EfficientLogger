@@ -18,6 +18,7 @@ final class Warnings {
     private final WarningHandler handler;
     private final AtomicInteger invalidIdReports = new AtomicInteger();
     private final AtomicBoolean thrashReported = new AtomicBoolean();
+    private final AtomicBoolean maxFilesReported = new AtomicBoolean();
     private final AtomicLong tooLongIds = new AtomicLong();
     private final AtomicBoolean tooLongIdsReported = new AtomicBoolean();
     private final AtomicLong oversizeMessages = new AtomicLong();
@@ -151,6 +152,11 @@ final class Warnings {
     /** True the first time only. */
     boolean admitThrashReport() {
         return !thrashReported.get() && thrashReported.compareAndSet(false, true);
+    }
+
+    /** True the first time only: the logger reached its maxFiles limit. */
+    boolean admitMaxFilesReport() {
+        return !maxFilesReported.get() && maxFilesReported.compareAndSet(false, true);
     }
 
     /**

@@ -26,6 +26,7 @@ final class AsyncLogger implements EfficientLogger {
     private final Warnings warnings;
     private final OpenFileBudget budget;
     private final long maxChars;
+    private final int maxIdLength;
     private final long startIndex;
     private final Duration closeTimeout;
     private final AtomicLong tooLarge = new AtomicLong();
@@ -36,11 +37,12 @@ final class AsyncLogger implements EfficientLogger {
 
     AsyncLogger(Config config, TestHooks hooks) {
         int number = LOGGER_NUMBERS.incrementAndGet();
-        warnings = new Warnings(config.warningHandler);
+        warnings = new Warnings(config.warningHandler, config.maxIdLength);
         budget = new OpenFileBudget(config.maxOpenFiles);
         admission = new Admission(config.maxQueuedMessages, config.maxQueuedChars);
         tracker = new OverflowTracker(admission, config, warnings);
         maxChars = config.maxQueuedChars;
+        maxIdLength = config.maxIdLength;
         startIndex = hooks.ringStartIndex;
         closeTimeout = config.closeTimeout;
 
@@ -72,6 +74,14 @@ final class AsyncLogger implements EfficientLogger {
     public boolean log(String id, String json) {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(json, "json");
+        if (id.length() > maxIdLength) {
+            // It can't fit in a file name. Rejecting it here keeps a huge ID out of the queue,
+            // where maxQueuedChars doesn't count it.
+            if (warnings.countTooLongId()) {
+                rings[0].wakeConsumer(); // a worker reports it, so the caller does no I/O
+            }
+            return false;
+        }
         int len = json.length();
         if (len > maxChars) {
             tracker.recordDrop(); // before tooLarge, so stats() never sees more too-large than drops
@@ -127,12 +137,13 @@ final class AsyncLogger implements EfficientLogger {
 
     @Override
     public LoggerStats stats() {
-        long accepted = 0;
+        long tooLongIds = warnings.tooLongIds(); // counted as accepted and dropped for an invalid id
+        long accepted = tooLongIds;
         for (MpscRing ring : rings) {
             accepted += ring.tail() - startIndex;
         }
         long written = 0;
-        long invalidId = 0;
+        long invalidId = tooLongIds;
         long lostIoError = 0;
         for (Worker w : workers) {
             written += w.files.written();

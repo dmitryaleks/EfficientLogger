@@ -52,7 +52,11 @@ Combining an async-only option with `synchronous()`, or `syncStripes` without it
 - **Whole lines.** Every OS write carries whole lines (a message larger than the buffer is the
   one exception), so a crash can't leave half a line followed by the next one. If a file ends
   mid-line when it is opened, for example after a crash, a line separator is written first.
-- **JSON is not checked.** Pass single-line JSON; a newline inside a message would split it.
+- **One message, one line.** A raw CR or LF in a message is written as a space. Other control
+  characters (except tab), U+2028 and U+2029 are written as `\u` escapes. So a message can't
+  forge extra lines or send control codes to a terminal. Valid JSON means the same afterwards: it
+  can have raw line breaks only between tokens, and inside strings an escape means the same as
+  the character. The JSON isn't otherwise checked.
 - **`flush()`** waits until everything logged before it has been handed to the OS. It is not
   an fsync. In sync mode it returns at once.
 - **`close()`** stops accepting messages, writes everything already accepted, and closes the
@@ -61,12 +65,19 @@ Combining an async-only option with `synchronous()`, or `syncStripes` without it
   the lines on disk are exactly the `log()` calls that returned true, less any that `stats()`
   counts as lost to an invalid ID or an I/O error (in async mode those are found after `log()`
   has returned).
-- **IDs must make portable file names.** They can't be empty, contain `/ \ : * ? " < > |`,
-  control characters or unpaired surrogates, end in a dot or space, be `.` or `..`, or be a Windows device name such as
-  `CON` or `NUL`, and the whole name must fit in 255 characters and bytes. Messages for other IDs
-  are dropped and counted, with a warning per ID for the first 100. On a case-insensitive file
-  system, `Foo` and `foo` share a file; their lines stay whole, but their relative order isn't
-  guaranteed.
+- **IDs must make portable, safe file names.** The whole name must fit in 255 characters and
+  bytes; `log()` rejects a longer ID at once, before queueing it. The name can't:
+  - be empty, `.` or `..`, or a Windows device name such as `CON` or `NUL`
+  - contain `/ \ : * ? " < > | ~`, control characters, invisible formatting characters (such
+    as bidi overrides and zero-width spaces or joiners), line separators or unpaired surrogates
+  - start with `-`, which a shell command run on `*` would take as an option
+  - end in a dot or space
+
+  `~` is excluded because Windows 8.3 short names contain one, so an ID such as `VERYLO~1` could
+  otherwise write into another ID's file. Messages for invalid IDs are dropped and counted, with
+  a warning per ID for the first 100. On a case-insensitive file system, `Foo` and `foo` share a
+  file. Their relative order isn't guaranteed, and a message larger than the buffer can be split
+  around the other ID's lines.
 - **I/O errors** don't throw. The messages for that file are dropped for one second, then it is
   retried. A missing directory is created again. Error warnings are limited to one every
   10 seconds, and the number held back is reported at close.
@@ -106,6 +117,11 @@ measures the loggers, not the disk. The test machine is an 8-core, 16-thread AMD
 PRO 350, running Windows 11 with JDK 17.0.12, and Ubuntu 24.04 under WSL 2 with
 Temurin 17.0.20.1. JMH is 1.37. Each figure comes from one fork, with 2 × 1 s of warm-up and
 3 × 1 s of measurement, so read the differences in orders of magnitude, not in percent.
+
+These figures predate the line-break and ID checks described under "What to expect". In a
+back-to-back comparison on Windows, those checks cost one worker about 7% of its peak
+throughput, about 10 ns per 85-character message. Sync mode's throughput was unchanged. For
+callers, `log()` gained only a length comparison on the ID.
 
 **Throughput, threads calling `log()` flat out.** The figures are messages written per second.
 The async EfficientLogger drops messages instead of making callers wait, so for it the calls

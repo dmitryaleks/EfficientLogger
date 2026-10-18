@@ -302,6 +302,43 @@ class AsyncLoggerTest {
         assertEquals("dropped 2 messages before close (2 in total)", warnings.get(1));
     }
 
+    // ---- what gets written ----
+
+    @Test
+    void aMessageCantSpanLines() {
+        AsyncLogger logger = manual(builder().flushIntervalMillis(0));
+        logger.log("a", "{\"note\":\"hi\"}\n{\"forged\":true}");
+        logger.log("a", "{\r\n  \"n\": 1\r\n}");
+        logger.worker(0).runOnce();
+        assertEquals("{\"note\":\"hi\"} {\"forged\":true}\n{    \"n\": 1  }\n", content("a"));
+    }
+
+    @Test
+    void rejectsIdsTooLongForAFileNameAtOnce() {
+        AsyncLogger logger = manual(builder()); // "{id}.json" leaves room for 250 chars
+        String longest = "a".repeat(250);
+        assertTrue(logger.log(longest, json(1)));
+        assertFalse(logger.log("a".repeat(251), json(2)));
+        assertFalse(logger.log("b".repeat(10_000_000), json(3)));
+
+        LoggerStats s = logger.stats();
+        assertEquals(1, s.queuedMessages(), "the long ids never reach the queue");
+        assertEquals(3, s.accepted());
+        assertEquals(2, s.droppedInvalidId());
+        assertTrue(warnings.isEmpty(), "the caller doesn't report it; a worker does");
+
+        logger.worker(0).runOnce();
+        assertEquals(List.of("dropping messages whose id is longer than 250 chars, the most a file name has room"
+                + " for (further ones are only counted, in stats().droppedInvalidId())"), warnings);
+
+        logger.close(Duration.ZERO);
+        drainAndFinish(logger);
+        s = logger.stats();
+        assertEquals(s.accepted(), s.written() + s.droppedInvalidId() + s.lostIoError());
+        assertEquals(json(1) + "\n", content(longest));
+        assertEquals(1, warnings.size(), "reported once");
+    }
+
     // ---- errors ----
 
     @Test

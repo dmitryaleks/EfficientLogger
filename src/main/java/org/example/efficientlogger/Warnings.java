@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** The logger's warning output: safe calls to the user's handler, and logger-wide report limits. */
 final class Warnings {
@@ -17,6 +18,9 @@ final class Warnings {
     private final WarningHandler handler;
     private final AtomicInteger invalidIdReports = new AtomicInteger();
     private final AtomicBoolean thrashReported = new AtomicBoolean();
+    private final AtomicLong tooLongIds = new AtomicLong();
+    private final AtomicBoolean tooLongIdsReported = new AtomicBoolean();
+    private final int maxIdLength;
 
     // Guarded by this.
     private boolean ioErrorReported;
@@ -24,7 +28,34 @@ final class Warnings {
     private long suppressedIoErrors;
 
     Warnings(WarningHandler handler) {
+        this(handler, FileNamePattern.MAX_NAME_LENGTH);
+    }
+
+    Warnings(WarningHandler handler, int maxIdLength) {
         this.handler = handler;
+        this.maxIdLength = maxIdLength;
+    }
+
+    /**
+     * Counts a message dropped because its ID was too long for a file name. Any thread; no I/O.
+     * True for the first one, so the caller can make sure {@link #reportTooLongIds} runs soon.
+     */
+    boolean countTooLongId() {
+        return tooLongIds.getAndIncrement() == 0;
+    }
+
+    /** Messages dropped so far because their ID was too long. */
+    long tooLongIds() {
+        return tooLongIds.get();
+    }
+
+    /** Reports, once per logger, that messages are being dropped for over-long IDs. Cheap otherwise. */
+    void reportTooLongIds() {
+        if (tooLongIds.get() != 0 && !tooLongIdsReported.get() && tooLongIdsReported.compareAndSet(false, true)) {
+            emit("dropping messages whose id is longer than " + maxIdLength
+                    + " chars, the most a file name has room for (further ones are only counted,"
+                    + " in stats().droppedInvalidId())", null);
+        }
     }
 
     /** Passes a warning to the handler. Anything the handler throws is ignored. */

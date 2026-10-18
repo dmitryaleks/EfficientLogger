@@ -9,14 +9,22 @@ import java.nio.file.Path;
  *
  * <p>The rules are the same on every OS: a name accepted on Linux is also valid on Windows and
  * macOS. An ID can never escape the directory, name a Windows device, or produce a name the OS
- * would silently change (for example by dropping a trailing dot).
+ * would silently change (for example by dropping a trailing dot). Nor can it produce a name that
+ * is unsafe to handle or show:
+ * <ul>
+ *   <li>one that a shell command run on {@code *} would take as an option (a leading '-')
+ *   <li>one that could be a Windows 8.3 short name, and so another file's alias (a '~')
+ *   <li>one with control, invisible formatting or line-separator characters, which can hide
+ *       or disguise what the name is, or act on a terminal it is printed to
+ * </ul>
+ * So a valid file name is safe to print in a warning as it is.
  */
 final class FileNamePattern {
 
     static final String PLACEHOLDER = "{id}";
     static final int MAX_NAME_LENGTH = 255;
 
-    private static final String RESERVED_CHARS = "/\\:*?\"<>|";
+    private static final String RESERVED_CHARS = "/\\:*?\"<>|~";
     private static final int MAX_QUOTED_LENGTH = 100;
 
     private final Path directory;
@@ -55,6 +63,11 @@ final class FileNamePattern {
         return directory;
     }
 
+    /** The longest ID that can fit in a file name: any longer one is invalid. */
+    int maxIdLength() {
+        return MAX_NAME_LENGTH - prefix.length() - suffix.length();
+    }
+
     /** The file name for {@code id}. Allocates. */
     String fileName(String id) {
         return prefix + id + suffix;
@@ -69,6 +82,11 @@ final class FileNamePattern {
     String invalidReason(String id) {
         if (id.isEmpty()) {
             return "the id is empty";
+        }
+        long nameLength = (long) prefix.length() + id.length() + suffix.length();
+        if (nameLength > MAX_NAME_LENGTH) {
+            // Checked before building the name, which could be huge.
+            return "the file name would be " + nameLength + " chars, longer than " + MAX_NAME_LENGTH + " chars";
         }
         String name = fileName(id);
         String reason = invalidNameReason(name);
@@ -100,21 +118,27 @@ final class FileNamePattern {
         if (name.equals(".") || name.equals("..")) {
             return "is '.' or '..'";
         }
-        for (int i = 0; i < len; i++) {
+        if (name.charAt(0) == '-') {
+            return "starts with '-'";
+        }
+        for (int i = 0; i < len; ) {
             char c = name.charAt(i);
-            if (c < 0x20 || c == 0x7F) {
-                return "contains a control character (" + unicode(c) + ")";
-            }
-            if (RESERVED_CHARS.indexOf(c) >= 0) {
-                return "contains '" + c + "'";
-            }
-            if (Character.isSurrogate(c)) {
-                if (Character.isHighSurrogate(c) && i + 1 < len && Character.isLowSurrogate(name.charAt(i + 1))) {
-                    i++;
-                    continue;
-                }
+            int cp;
+            if (Character.isHighSurrogate(c) && i + 1 < len && Character.isLowSurrogate(name.charAt(i + 1))) {
+                cp = Character.toCodePoint(c, name.charAt(i + 1));
+            } else if (Character.isSurrogate(c)) {
                 return "contains an unpaired surrogate (" + unicode(c) + ")";
+            } else {
+                cp = c;
+                if (RESERVED_CHARS.indexOf(c) >= 0) {
+                    return "contains '" + c + "'";
+                }
             }
+            String kind = unsafeKind(cp);
+            if (kind != null) {
+                return "contains " + kind + " (" + unicode(cp) + ")";
+            }
+            i += Character.charCount(cp);
         }
         char last = name.charAt(len - 1);
         if (last == '.' || last == ' ') {
@@ -151,13 +175,36 @@ final class FileNamePattern {
         return false;
     }
 
-    /** {@code s} in quotes, with control chars and surrogates escaped and long input shortened. */
+    /**
+     * What makes code point {@code cp} unsafe in a file name, or null if nothing does: control
+     * characters (C0, DEL and C1), invisible formatting characters (such as bidi overrides,
+     * zero-width characters and tag characters), and line and paragraph separators.
+     */
+    static String unsafeKind(int cp) {
+        switch (Character.getType(cp)) {
+            case Character.CONTROL:
+                return "a control character";
+            case Character.FORMAT:
+                return "an invisible formatting character";
+            case Character.LINE_SEPARATOR:
+            case Character.PARAGRAPH_SEPARATOR:
+                return "a line or paragraph separator";
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * {@code s} in quotes for a warning, with long input shortened. Control, formatting and
+     * separator characters, and all surrogates, are escaped, so the result can't act on a
+     * terminal or disguise itself.
+     */
     static String quote(String s) {
         int shown = Math.min(s.length(), MAX_QUOTED_LENGTH);
         StringBuilder sb = new StringBuilder(shown + 24).append('"');
         for (int i = 0; i < shown; i++) {
             char c = s.charAt(i);
-            if (c < 0x20 || c == 0x7F || Character.isSurrogate(c)) {
+            if (Character.isSurrogate(c) || unsafeKind(c) != null) {
                 sb.append(unicode(c));
             } else {
                 sb.append(c);
@@ -170,7 +217,11 @@ final class FileNamePattern {
         return sb.toString();
     }
 
-    private static String unicode(char c) {
-        return String.format("\\u%04X", (int) c);
+    /** Java-style escapes for a code point: one for a BMP char, two (a surrogate pair) otherwise. */
+    private static String unicode(int cp) {
+        if (Character.isBmpCodePoint(cp)) {
+            return String.format("\\u%04X", cp);
+        }
+        return String.format("\\u%04X\\u%04X", (int) Character.highSurrogate(cp), (int) Character.lowSurrogate(cp));
     }
 }

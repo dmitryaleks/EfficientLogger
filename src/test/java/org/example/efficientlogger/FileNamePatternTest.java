@@ -41,6 +41,8 @@ class FileNamePatternTest {
                 arguments("{id}.", "ends with '.'"),
                 arguments("{id} ", "ends with ' '"),
                 arguments("NUL.{id}", "reserved device name"),
+                arguments("-{id}.json", "starts with '-'"),
+                arguments("{id}~1.log", "contains '~'"),
                 arguments("a".repeat(255) + "{id}", "longer than 255 chars"));
     }
 
@@ -65,6 +67,11 @@ class FileNamePatternTest {
                 arguments("{id}.json", "COM10"),
                 arguments("{id}.json", "NULL"),
                 arguments("{id}", ".hidden"),
+                arguments("events-{id}.json", "-rf"), // the name starts with "events-"
+                arguments("{id}.json", "a b-c_d.e"),
+                arguments("{id}.json", cp(0x645, 0x631, 0x62D, 0x628, 0x627)), // Arabic, right to left
+                arguments("{id}.json", cp(0x1F44D, 0x1F3FD)), // emoji with a skin-tone modifier
+                arguments("{id}.json", "a" + cp(0xA0) + "b"), // a no-break space is visible as a space
                 arguments("{id}.json", "a".repeat(250))); // 255 chars
     }
 
@@ -104,6 +111,23 @@ class FileNamePatternTest {
                 arguments("{id}.json", "LPT1", "reserved device name"),
                 arguments("{id}.json", "com0", "reserved device name"),
                 arguments("{id}.json", "COM¹", "reserved device name"),
+                // Option injection into shell commands run on *, and Windows 8.3 short names
+                arguments("{id}.json", "-rf", "starts with '-'"),
+                arguments("{id}.json", "--use-compress-program=sh x.sh", "starts with '-'"),
+                arguments("{id}.log", "VERYLO~1", "contains '~'"),
+                arguments("{id}.json", "a~b", "contains '~'"),
+                // Characters that hide or disguise a name, or act on a terminal
+                arguments("{id}.json", "a" + cp(0x85) + "b", "control character (\\u0085)"),
+                arguments("{id}.json", "a" + cp(0x9B) + "b", "control character (\\u009B)"),
+                arguments("{id}.json", "invoice" + cp(0x202E) + "nosj.exe", "invisible formatting character (\\u202E)"),
+                arguments("{id}.json", "a" + cp(0x2066) + "b", "invisible formatting character (\\u2066)"),
+                arguments("{id}.json", "a" + cp(0x200B) + "b", "invisible formatting character (\\u200B)"),
+                arguments("{id}.json", cp(0x1F468, 0x200D, 0x1F469), "invisible formatting character (\\u200D)"),
+                arguments("{id}.json", "a" + cp(0xFEFF) + "b", "invisible formatting character (\\uFEFF)"),
+                arguments("{id}.json", "a" + cp(0xAD) + "b", "invisible formatting character (\\u00AD)"),
+                arguments("{id}.json", "a" + cp(0xE0041) + "b", "invisible formatting character (\\uDB40\\uDC41)"),
+                arguments("{id}.json", "a" + cp(0x2028) + "b", "line or paragraph separator (\\u2028)"),
+                arguments("{id}.json", "a" + cp(0x2029) + "b", "line or paragraph separator (\\u2029)"),
                 arguments("{id}.json", "a".repeat(251), "longer than 255 chars"),
                 arguments("{id}.json", "東".repeat(84), "longer than 255 bytes")); // 257 bytes, 89 chars
     }
@@ -133,6 +157,26 @@ class FileNamePatternTest {
 
         String longReason = pattern.invalidReason("x".repeat(10_000));
         assertTrue(longReason.length() < 300, longReason);
-        assertTrue(longReason.contains("(10005 chars)"), longReason);
+        assertTrue(longReason.contains("would be 10005 chars"), longReason);
+    }
+
+    @Test
+    void knowsTheLongestIdThatFits() {
+        assertEquals(255 - "events-".length() - ".json".length(),
+                FileNamePattern.parse(DIR, "events-{id}.json").maxIdLength());
+        assertEquals(255, FileNamePattern.parse(DIR, "{id}").maxIdLength());
+    }
+
+    @Test
+    void quoteEscapesWhatCouldActOnATerminalOrDisguiseText() {
+        String s = "a" + cp(0x1B) + "b" + cp(0x9B) + "c" + cp(0x202E) + "d" + cp(0x200B) + "e" + cp(0x2028) + "f"
+                + cp(0x1F600) + "g" + cp(0xA0) + "h";
+        assertEquals("\"a\\u001Bb\\u009Bc\\u202Ed\\u200Be\\u2028f\\uD83D\\uDE00g" + cp(0xA0) + "h\"",
+                FileNamePattern.quote(s));
+    }
+
+    /** A string of the given code points. */
+    private static String cp(int... codePoints) {
+        return new String(codePoints, 0, codePoints.length);
     }
 }

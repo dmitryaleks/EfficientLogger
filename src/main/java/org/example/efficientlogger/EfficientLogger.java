@@ -34,11 +34,16 @@ public interface EfficientLogger extends AutoCloseable {
 
     /**
      * Appends {@code json} and a line separator to the file for {@code id}, creating the file if
-     * needed. {@code json} should be a single line; it is not validated.
+     * needed.
      *
-     * @return true if the message was accepted. False if it was dropped: the queue was full or the
-     *     message too large (async), the id can't be used in a file name or the file has an I/O
-     *     error (sync; in async mode these are found later and only counted), or the logger is closed
+     * <p>A message always stays on one line. A raw CR or LF in it is written as a space, and other
+     * control characters (except tab), U+2028 and U+2029 as {@code \}{@code uXXXX} escapes. None of
+     * this changes what valid JSON means. The JSON is not otherwise checked.
+     *
+     * @return true if the message was accepted. False if it was dropped: the id is too long for a
+     *     file name; the queue was full or the message too large (async); the id can't be used in a
+     *     file name for another reason, or the file has an I/O error (sync; in async mode these are
+     *     found later and only counted); or the logger is closed
      * @throws NullPointerException if {@code id} or {@code json} is null
      */
     boolean log(String id, String json);

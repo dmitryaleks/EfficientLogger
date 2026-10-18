@@ -30,11 +30,13 @@ final class SyncLogger implements EfficientLogger {
     private final Warnings warnings;
     private final OpenFileBudget budget;
     private final LongSupplier clock;
+    private final int maxIdLength;
     private final AtomicLong rejectedClosed = new AtomicLong();
     private volatile boolean closed;
 
     SyncLogger(Config config, TestHooks hooks) {
-        warnings = new Warnings(config.warningHandler);
+        warnings = new Warnings(config.warningHandler, config.maxIdLength);
+        maxIdLength = config.maxIdLength;
         budget = new OpenFileBudget(config.maxOpenFiles);
         clock = hooks.nanoClock;
         closeTimeout = config.closeTimeout;
@@ -50,6 +52,12 @@ final class SyncLogger implements EfficientLogger {
     public boolean log(String id, String json) {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(json, "json");
+        if (id.length() > maxIdLength) {
+            // It can't fit in a file name: reject it before taking a lock or copying it.
+            warnings.countTooLongId();
+            warnings.reportTooLongIds(); // outside any lock, like sync mode's other warnings
+            return false;
+        }
         if (closed) {
             rejectedClosed.incrementAndGet();
             return false;
@@ -90,7 +98,7 @@ final class SyncLogger implements EfficientLogger {
     @Override
     public LoggerStats stats() {
         long written = 0;
-        long invalidId = 0;
+        long invalidId = warnings.tooLongIds();
         long lostIoError = 0;
         for (Stripe s : stripes) {
             written += s.files.written();

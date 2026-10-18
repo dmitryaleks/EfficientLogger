@@ -121,6 +121,7 @@ final class Worker implements Runnable, MpscRing.Handler {
             files.flushDirty(now);
         }
         tracker.check();
+        warnings.reportTooLongIds();
         warnings.emitAll(files.takeWarnings());
         return n;
     }
@@ -130,6 +131,7 @@ final class Worker implements Runnable, MpscRing.Handler {
         try {
             files.closeAll(clock.getAsLong());
             tracker.finalReport();
+            warnings.reportTooLongIds();
             warnings.emitAll(files.takeWarnings());
             warnings.reportSuppressedIoErrors(); // each worker does; the last to finish catches the rest
         } finally {

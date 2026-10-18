@@ -72,6 +72,22 @@ exposed. "Verified" means reproduced on the platforms above.
 | F17 | Package-private test hooks can be reached by code in the same package | Info | Hostile code already on the classpath | By reading |
 | F18 | Crafted IDs can put all traffic on one worker or one sync lock | Info | IDs come from untrusted input | By reading |
 
+### Status since the audit
+
+Recommendations 1 and 2 have been implemented in the commit after this audit's. Each probe
+below was re-run against the new jar.
+
+| # | Status | What changed | Probe now |
+|---|---|---|---|
+| F1 | Fixed | A raw CR or LF in a message is written as a space. Other C0 controls except tab, C1 controls, U+2028 and U+2029 become `\uXXXX` escapes. | The forged line stays on the first line, and escape codes are written as text |
+| F4 | Fixed | `log()` rejects an ID that can't fit in a file name with one length comparison, before queueing or locking. It is counted in `droppedInvalidId` and warned about once. Invalid IDs are no longer copied into a file name first, and those kept as entries are at most 255 chars. | The 50-million-char ID is rejected at once |
+| F5 | Fixed | `~` is no longer allowed in a file name. | `VERYLO~1` is rejected; the other ID's file is untouched |
+| F6 | Partly fixed | A file name can't start with `-`. An ID can still name an unrelated file with the same prefix and suffix, so keep the directory for this logger's files. | The `tar` chain's ID is rejected, and `tar` runs nothing |
+| F11 | Fixed | File names can't contain control, invisible formatting (category Cf) or line and paragraph separator characters, so valid paths print safely in warnings. `quote()` escapes the same characters. | |
+
+The other findings are still open. The new checks cost one async worker about 7% of its peak
+throughput (see the README); sync mode was unchanged.
+
 ## Threat model
 
 - **`id` and `json` may be attacker-influenced.** A server might use a user or tenant ID as `id`

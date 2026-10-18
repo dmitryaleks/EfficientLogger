@@ -69,6 +69,21 @@ class FileTableTest {
     }
 
     @Test
+    void escapesSurviveBeingWrittenInPieces() {
+        // Far larger than the 64-byte buffer, with an escape (6 bytes) or a space at every 4th char.
+        String message = ("ab" + (char) 1 + "\n").repeat(100);
+        String expected = "ab\\u0001 ".repeat(100) + "\n";
+        FileTable buffered = table(64);
+        buffered.append("a", message, 0);
+        buffered.flushDirty(1);
+        assertEquals(expected, sinks.content(file("a")));
+
+        FileTable writeThrough = table(64);
+        assertTrue(writeThrough.writeThrough("b", message, 0));
+        assertEquals(expected, sinks.content(file("b")));
+    }
+
+    @Test
     void holdsBuffersOnlyWhileFilesHaveUnwrittenRecords() {
         FileTable t = table(8192);
         t.append("a", "{}", 0);

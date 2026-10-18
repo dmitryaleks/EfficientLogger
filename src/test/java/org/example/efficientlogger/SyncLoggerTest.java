@@ -162,6 +162,34 @@ class SyncLoggerTest {
     }
 
     @Test
+    void rejectsIdsTooLongForAFileNameAtOnce() throws IOException {
+        int longest = 255 - "events-".length() - ".json".length();
+        try (EfficientLogger logger = builder().build()) {
+            assertTrue(logger.log("a".repeat(longest), "{}"));
+            assertFalse(logger.log("a".repeat(longest + 1), "{}"));
+            assertFalse(logger.log("b".repeat(10_000_000), "{}"));
+
+            LoggerStats s = logger.stats();
+            assertEquals(3, s.accepted());
+            assertEquals(1, s.written());
+            assertEquals(2, s.droppedInvalidId());
+        }
+        assertEquals("{}\n", read("a".repeat(longest)));
+        assertEquals(1, warnings.size(), warnings.toString());
+        assertTrue(warnings.get(0).startsWith("dropping messages whose id is longer than " + longest + " chars"),
+                warnings.get(0));
+    }
+
+    @Test
+    void aMessageCantSpanLinesOrCarryControlCodes() throws IOException {
+        try (EfficientLogger logger = builder().build()) {
+            logger.log("a", "{\"a\":1}\n{\"b\":2}");
+            logger.log("a", "{\"t\":\"" + (char) 0x1B + "[2J\"}");
+        }
+        assertEquals("{\"a\":1} {\"b\":2}\n{\"t\":\"\\u001b[2J\"}\n", read("a"));
+    }
+
+    @Test
     void rejectsMessagesAfterClose() {
         EfficientLogger logger = builder().build();
         assertTrue(logger.log("a", "{}"));

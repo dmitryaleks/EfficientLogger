@@ -228,6 +228,13 @@ final class AsyncLogger implements EfficientLogger {
         return () -> {
             try {
                 worker.run();
+            } catch (Throwable t) {
+                // worker.run() guards its own loop, so this is a last resort. Don't leave the logger
+                // accepting messages that no worker will write.
+                if (!Admission.isClosed(admission.get())) {
+                    admission.close();
+                    warnings.emit("a logging worker stopped unexpectedly; the logger is now closed", t);
+                }
             } finally {
                 if (running.decrementAndGet() == 0) {
                     removeShutdownHook();

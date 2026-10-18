@@ -20,6 +20,7 @@ final class Warnings {
     private final AtomicBoolean thrashReported = new AtomicBoolean();
     private final AtomicLong tooLongIds = new AtomicLong();
     private final AtomicBoolean tooLongIdsReported = new AtomicBoolean();
+    private final AtomicBoolean incompleteCloseReported = new AtomicBoolean();
     private final int maxIdLength;
 
     // Guarded by this.
@@ -121,5 +122,16 @@ final class Warnings {
     /** True the first time only. */
     boolean admitThrashReport() {
         return !thrashReported.get() && thrashReported.compareAndSet(false, true);
+    }
+
+    /**
+     * Reports, once per logger, that close stopped waiting with messages still unwritten because
+     * the queue stopped draining, which a log() call cut off by a fatal error can cause.
+     */
+    void reportIncompleteClose() {
+        if (!incompleteCloseReported.get() && incompleteCloseReported.compareAndSet(false, true)) {
+            emit("close stopped waiting with messages still queued; a log() call was probably cut off"
+                    + " by a fatal error such as StackOverflowError, so its message never arrived", null);
+        }
     }
 }

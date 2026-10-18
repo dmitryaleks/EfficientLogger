@@ -27,6 +27,12 @@ final class Worker implements Runnable, MpscRing.Handler {
     private static final int SPINS = 64;
     private static final long CLOSING_POLL_NANOS = TimeUnit.MICROSECONDS.toNanos(100);
     private static final long ERROR_PAUSE_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
+    /** Passes spent waiting for one slot to be published before the worker stops spinning for it. */
+    private static final int STALL_SPINS = 100;
+    /** How often the worker then polls a slot that stays unpublished (a producer cut off mid-publish). */
+    private static final long STUCK_SLOT_POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
+    /** After close, how long the queue size may stop falling before the worker gives up and finishes. */
+    static final long STUCK_CLOSE_NANOS = TimeUnit.SECONDS.toNanos(2);
 
     final MpscRing ring;
     final FileTable files;
@@ -42,6 +48,7 @@ final class Worker implements Runnable, MpscRing.Handler {
     private long batchNanos; // time of the current batch, for append()
     private long releasable; // admission to release once the current batch's slots are free
     private int emptyTimedWakeups;
+    private int stalledPasses; // consecutive passes waiting for an unpublished head slot
 
     private final AtomicLong flushRequested = new AtomicLong();
     private volatile long flushDone;
@@ -64,18 +71,37 @@ final class Worker implements Runnable, MpscRing.Handler {
 
     @Override
     public void run() {
+        boolean closing = false;   // the queue has been observed closed
+        long closeCount = 0;       // its size the last time that changed
+        long closeStableNanos = 0; // when it last changed
         try {
             for (;;) {
                 try {
                     Thread.interrupted(); // a leftover interrupt would make every park() return at once
                     int n = runOnce();
+                    if (n > 0) {
+                        stalledPasses = 0;
+                    }
                     if (n == batchSize) {
                         continue;
                     }
                     long word = admission.get();
                     if (Admission.isClosed(word)) {
-                        if (Admission.messages(word) == 0) {
+                        long count = Admission.messages(word);
+                        if (count == 0) {
                             break; // everything admitted, logger-wide, has been consumed
+                        }
+                        // The queue won't reach zero if a log() call was cut off between being
+                        // admitted and publishing its message (e.g. a StackOverflowError). Once the
+                        // size has stopped falling for a while, give up so close can't wait forever.
+                        long now = clock.getAsLong();
+                        if (!closing || count != closeCount) {
+                            closing = true;
+                            closeCount = count;
+                            closeStableNanos = now;
+                        } else if (now - closeStableNanos >= STUCK_CLOSE_NANOS) {
+                            warnings.reportIncompleteClose();
+                            break;
                         }
                         if (n == 0) {
                             waitWhileClosing();
@@ -84,14 +110,13 @@ final class Worker implements Runnable, MpscRing.Handler {
                     }
                     if (n == 0) {
                         if (ring.head() != ring.tail()) {
-                            spinThenYield(); // a producer is between claiming a slot and publishing it
+                            awaitPublish(); // a producer is between claiming a slot and publishing it
                         } else {
                             idle();
                         }
                     }
                 } catch (Throwable t) {
-                    reportError("unexpected error in the worker thread", t);
-                    LockSupport.parkNanos(this, ERROR_PAUSE_NANOS);
+                    recover(t);
                 }
             }
         } finally {
@@ -262,6 +287,32 @@ final class Worker implements Runnable, MpscRing.Handler {
             Thread.onSpinWait();
         }
         Thread.yield();
+    }
+
+    /**
+     * Waits for the slot at the head of the ring to be published. A producer that has claimed it is
+     * normally microseconds from publishing, so spin at first. But if a producer was cut off between
+     * claiming the slot and publishing it (e.g. a StackOverflowError in log()), the slot never
+     * arrives, so after many passes back off to a timed poll rather than burn a core. The poll
+     * leaves PARKED as AWAKE, so it is only a poll: no producer unparks the worker and no wake-up can
+     * be lost. The slot is never reused, so a merely slow producer that later publishes is still safe.
+     */
+    private void awaitPublish() {
+        if (++stalledPasses <= STALL_SPINS) {
+            spinThenYield();
+        } else {
+            LockSupport.parkNanos(this, STUCK_SLOT_POLL_NANOS);
+        }
+    }
+
+    /** Recovers from an unexpected error without ever letting the worker loop exit. */
+    private void recover(Throwable t) {
+        try {
+            reportError("unexpected error in the worker thread", t);
+        } catch (Throwable ignored) {
+            // Even reporting failed, e.g. out of memory. The worker must still not die.
+        }
+        LockSupport.parkNanos(this, ERROR_PAUSE_NANOS);
     }
 
     private void reportError(String message, Throwable t) {

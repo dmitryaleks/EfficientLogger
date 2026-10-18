@@ -156,4 +156,13 @@ final class MpscRing {
     void setParkedState(long state) {
         LONGS.setVolatile(cells, PARKED, state);
     }
+
+    /**
+     * Tests only: claims a slot and leaves it unpublished, as if a producer were cut off between
+     * the tail claim and the publish (for example by a StackOverflowError inside {@link #offer}).
+     * The consumer must not wedge on it.
+     */
+    void claimWithoutPublishingForTest() {
+        long unused = (long) LONGS.getAndAdd(cells, TAIL, 1L);
+    }
 }

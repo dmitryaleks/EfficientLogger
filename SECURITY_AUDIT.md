@@ -80,13 +80,22 @@ below was re-run against the new jar.
 | # | Status | What changed | Probe now |
 |---|---|---|---|
 | F1 | Fixed | A raw CR or LF in a message is written as a space. Other C0 controls except tab, C1 controls, U+2028 and U+2029 become `\uXXXX` escapes. | The forged line stays on the first line, and escape codes are written as text |
+| F7 | Fixed | The worker now backs off to a timed poll on a slot a cut-off `log()` call never published, instead of spinning a core, and `close()` gives up after the queue stops draining for 2 s instead of waiting forever, with a warning. The worker loop can no longer be exited by an error, and a worker that does stop closes the logger. | A simulated cut-off producer no longer pegs a core, and `close()` finishes |
+| F13 | Fixed (with F7) | The worker's error handling can no longer throw its way out of the loop, and if a worker thread ever stops while the logger is open, admission is closed and a warning is emitted. | Covered by the F7 tests and the existing error-path tests |
 | F4 | Fixed | `log()` rejects an ID that can't fit in a file name with one length comparison, before queueing or locking. It is counted in `droppedInvalidId` and warned about once. Invalid IDs are no longer copied into a file name first, and those kept as entries are at most 255 chars. | The 50-million-char ID is rejected at once |
 | F5 | Fixed | `~` is no longer allowed in a file name. | `VERYLO~1` is rejected; the other ID's file is untouched |
 | F6 | Partly fixed | A file name can't start with `-`. An ID can still name an unrelated file with the same prefix and suffix, so keep the directory for this logger's files. | The `tar` chain's ID is rejected, and `tar` runs nothing |
 | F11 | Fixed | File names can't contain control, invisible formatting (category Cf) or line and paragraph separator characters, so valid paths print safely in warnings. `quote()` escapes the same characters. | |
 
-The other findings are still open. The new checks cost one async worker about 7% of its peak
-throughput (see the README); sync mode was unchanged.
+The other findings are still open. The message and ID checks (F1, F4, F5, F6, F11) cost one async
+worker about 7% of its peak throughput (see the README); the worker-recovery changes (F7, F13) are
+off the hot path and cost it nothing. Sync mode was unchanged throughout.
+
+One residual remains for F7: a slot a cut-off `log()` call never published still blocks its own
+ring while the logger runs, so that ring's later messages pile up and are dropped (counted and,
+once, warned), until the logger is closed. The worker no longer spins or hangs, and other workers
+are unaffected; reclaiming the blocked slot safely would need a larger redesign, because a merely
+slow producer (for example paused at a GC safepoint) could still publish into it.
 
 ## Threat model
 

@@ -503,6 +503,54 @@ class AsyncThreadsTest {
                 "queue recovered; dropped 5 messages (5 in total)"), warnings);
     }
 
+    // ---- a log() call cut off by a fatal error (audit F7) ----
+
+    @Test
+    void aSlotLeftUnpublishedDoesNotWedgeOrBurnTheWorker() throws Exception {
+        // A producer cut off between claiming a ring slot and publishing it leaves the slot null
+        // forever. The worker can't drain past it, but it must not spin on a core, and close must
+        // still finish instead of hanging.
+        AsyncLogger logger = start(builder().flushIntervalMillis(60_000), nullSinks());
+        logger.worker(0).ring.claimWithoutPublishingForTest();
+        assertTrue(logger.log("a", json(1)), "queued behind the unpublished slot, so never drained");
+
+        Thread worker = logger.thread(0);
+        await(() -> worker.getState() == Thread.State.WAITING || worker.getState() == Thread.State.TIMED_WAITING,
+                "the worker to back off from the stuck slot");
+        ThreadMXBean mx = ManagementFactory.getThreadMXBean();
+        if (mx.isThreadCpuTimeSupported() && mx.isThreadCpuTimeEnabled()) {
+            long before = mx.getThreadCpuTime(worker.getId());
+            LockSupport.parkNanos(MILLISECONDS.toNanos(500)); // a measuring window, not a wait for a result
+            long used = mx.getThreadCpuTime(worker.getId()) - before;
+            assertTrue(used < MILLISECONDS.toNanos(250), "the stuck worker used " + used / 1_000_000 + " ms of CPU in 500 ms");
+        }
+
+        assertTrue(logger.close(WAIT), "close finishes once the queue stops draining, rather than hanging");
+        worker.join(WAIT.toMillis());
+        assertFalse(worker.isAlive());
+        assertEquals(List.of("close stopped waiting with messages still queued; a log() call was probably cut off"
+                + " by a fatal error such as StackOverflowError, so its message never arrived"), warnings);
+        assertEquals(List.of(), lines("a"), "the message behind the stuck slot was never written");
+    }
+
+    @Test
+    void anAdmittedMessageThatNeverReachesARingDoesNotHangClose() throws Exception {
+        // A producer cut off after being admitted but before claiming a ring slot leaves the queue
+        // size permanently above zero, with nothing in any ring to drain.
+        AsyncLogger logger = start(builder());
+        assertTrue(logger.log("a", json(1)));
+        assertTrue(logger.flush(WAIT));
+        assertEquals(1, logger.worker(0).files.written());
+
+        assertTrue(logger.admission().tryAcquire(5) > 0, "simulate an admitted-but-unpublished message");
+        assertEquals(1, logger.stats().queuedMessages(), "it shows as still queued");
+
+        assertTrue(logger.close(WAIT), "close finishes within the grace instead of waiting forever");
+        assertEquals(List.of("close stopped waiting with messages still queued; a log() call was probably cut off"
+                + " by a fatal error such as StackOverflowError, so its message never arrived"), warnings);
+        assertEquals(List.of(json(1)), lines("a"));
+    }
+
     // ---- waking the worker ----
 
     /**

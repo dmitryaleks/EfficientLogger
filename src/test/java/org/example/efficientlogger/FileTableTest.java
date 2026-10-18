@@ -137,6 +137,35 @@ class FileTableTest {
         assertEquals(3, t.written());
     }
 
+    /** A record that ends exactly at the end of the buffer leaves no room for the next, even an empty one. */
+    @Test
+    void handlesABufferFilledToTheLastByte() {
+        for (String separator : List.of("\n", "\r\n")) {
+            for (String next : List.of("", "{}")) {
+                sinks = new FakeSinks(DIR);
+                FileTable t = table(64, separator, 1024 + FileTable.EXTRA_ENTRIES);
+                String full = "x".repeat(64 - separator.length()); // with its separator, fills the buffer
+                String half = "y".repeat(32 - separator.length());
+                t.append("a", full, 0);
+                t.append("a", next, 1);
+                t.flushDirty(2);
+                t.append("a", half, 3);
+                t.append("a", half, 4); // full again
+                t.append("a", next, 5);
+                t.flushDirty(6);
+
+                String expected = full + separator + next + separator + half + separator + half + separator
+                        + next + separator;
+                assertEquals(expected, sinks.content(file("a")), "separator " + separator.length() + ", next \"" + next + "\"");
+                assertEquals(5, t.written());
+                for (FakeSinks.Write w : sinks.writes) {
+                    assertTrue(w.text().endsWith(separator), "partial record written: " + w.text());
+                }
+                t.closeAll(7);
+            }
+        }
+    }
+
     // ---- opening files ----
 
     @Test

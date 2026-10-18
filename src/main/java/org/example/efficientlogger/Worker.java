@@ -37,6 +37,7 @@ final class Worker implements Runnable, MpscRing.Handler {
     private final int batchSize;
     private final long flushIntervalNanos;
     private final boolean eager;
+    private final Runnable beforeBatch; // a test hook; null in production
 
     private long batchNanos; // time of the current batch, for append()
     private long releasable; // admission to release once the current batch's slots are free
@@ -48,7 +49,7 @@ final class Worker implements Runnable, MpscRing.Handler {
     private volatile boolean terminated;
 
     Worker(MpscRing ring, FileTable files, Admission admission, OverflowTracker tracker, Warnings warnings,
-            LongSupplier clock, int batchSize, long flushIntervalNanos, boolean eager) {
+            LongSupplier clock, int batchSize, long flushIntervalNanos, boolean eager, Runnable beforeBatch) {
         this.ring = ring;
         this.files = files;
         this.admission = admission;
@@ -58,6 +59,7 @@ final class Worker implements Runnable, MpscRing.Handler {
         this.batchSize = batchSize;
         this.flushIntervalNanos = flushIntervalNanos;
         this.eager = eager;
+        this.beforeBatch = beforeBatch;
     }
 
     @Override
@@ -104,6 +106,9 @@ final class Worker implements Runnable, MpscRing.Handler {
      * @return the number of messages taken from the ring
      */
     int runOnce() {
+        if (beforeBatch != null) {
+            beforeBatch.run();
+        }
         long now = clock.getAsLong();
         int n = drainBatch(now);
         if (n > 0) {

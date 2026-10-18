@@ -2,11 +2,12 @@ package org.example.efficientlogger;
 
 import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Asynchronous mode: {@code log} admits the message against the queue limits and puts it in the
@@ -29,8 +30,9 @@ final class AsyncLogger implements EfficientLogger {
     private final Duration closeTimeout;
     private final AtomicLong tooLarge = new AtomicLong();
     private final AtomicLong rejectedClosed = new AtomicLong();
-    private final Thread shutdownHook;
-    private final AtomicBoolean shutdownHookRemoved = new AtomicBoolean();
+    private final AtomicInteger running; // worker threads that haven't finished
+    private final CountDownLatch finished; // counted down as each worker thread finishes
+    private final AtomicReference<Thread> shutdownHook = new AtomicReference<>(); // null once removed
 
     AsyncLogger(Config config, TestHooks hooks) {
         int number = LOGGER_NUMBERS.incrementAndGet();
@@ -49,18 +51,21 @@ final class AsyncLogger implements EfficientLogger {
         for (int i = 0; i < n; i++) {
             rings[i] = new MpscRing(config.ringCapacity, startIndex, config.wakeCount, config.wakeChars);
             FileTable files = new FileTable(config.fileNamePattern, config.lineSeparator, config.fileBufferBytes,
-                    config.maxOpenFiles + FileTable.EXTRA_ENTRIES, hooks.sinks, budget, warnings);
+                    config.maxFileEntries, hooks.sinks, budget, warnings);
             workers[i] = new Worker(rings[i], files, admission, tracker, warnings, hooks.nanoClock, batchSize,
-                    config.flushIntervalNanos, config.eagerWakeup);
+                    config.flushIntervalNanos, config.eagerWakeup, hooks.beforeBatch);
         }
 
+        running = new AtomicInteger(n);
+        finished = new CountDownLatch(n);
         if (!hooks.startThreads) {
             threads = null;
-            shutdownHook = null;
             return;
         }
         threads = startThreads(config.threadFactory != null ? config.threadFactory : defaultThreadFactory(number));
-        shutdownHook = config.registerShutdownHook ? registerShutdownHook(number) : null;
+        if (config.registerShutdownHook) {
+            registerShutdownHook(number);
+        }
     }
 
     @Override
@@ -144,7 +149,6 @@ final class AsyncLogger implements EfficientLogger {
     @Override
     public boolean close(Duration timeout) {
         long timeoutNanos = saturatedNanos(timeout);
-        long start = System.nanoTime();
         admission.close(); // from here on log() returns false; idempotent
         if (threads == null) {
             return allTerminated();
@@ -152,35 +156,24 @@ final class AsyncLogger implements EfficientLogger {
         for (MpscRing ring : rings) {
             ring.wakeConsumer();
         }
-        boolean finished = true;
-        boolean fromWorker = false;
-        for (Thread t : threads) {
-            if (t == Thread.currentThread()) {
-                fromWorker = true; // e.g. from a warning handler: it finishes after returning
-                finished = false;
-                continue;
-            }
-            long remaining = timeoutNanos - (System.nanoTime() - start);
-            try {
-                if (remaining > 0) {
-                    TimeUnit.NANOSECONDS.timedJoin(t, remaining);
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                finished = false;
-                break;
-            }
-            if (t.isAlive()) {
-                finished = false;
-            }
+        if (isWorkerThread()) {
+            // E.g. from a warning handler. The drain needs this very thread, so don't wait for it:
+            // it carries on once the handler returns.
+            return false;
         }
-        removeShutdownHook();
-        if (!finished && !fromWorker) {
-            warnings.emit("close didn't finish within " + TimeUnit.NANOSECONDS.toMillis(timeoutNanos) + " ms; "
-                    + Admission.messages(admission.get()) + " messages are still queued and will be written in the"
-                    + " background", null);
+        boolean done;
+        try {
+            done = finished.await(timeoutNanos, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
         }
-        return finished;
+        if (!done) {
+            warnings.emit("close didn't finish within " + TimeUnit.NANOSECONDS.toMillis(timeoutNanos)
+                    + " ms; the remaining " + messages(Admission.messages(admission.get()))
+                    + " will be written in the background", null);
+        }
+        return done;
     }
 
     @Override
@@ -197,14 +190,48 @@ final class AsyncLogger implements EfficientLogger {
         return workers.length;
     }
 
+    /** For tests: worker thread i, or null when the workers run by hand. */
+    Thread thread(int i) {
+        return threads == null ? null : threads[i];
+    }
+
+    /** For tests that play the part of a producer step by step. */
+    Admission admission() {
+        return admission;
+    }
+
+    /** For tests: true once close has started. */
+    boolean closing() {
+        return Admission.isClosed(admission.get());
+    }
+
+    /** For tests: the registered shutdown hook, or null if there is none (any more). */
+    Thread shutdownHook() {
+        return shutdownHook.get();
+    }
+
     // ---- threads ----
+
+    /** What a worker thread runs. The last one to finish removes the shutdown hook, which is no longer needed. */
+    private Runnable task(Worker worker) {
+        return () -> {
+            try {
+                worker.run();
+            } finally {
+                if (running.decrementAndGet() == 0) {
+                    removeShutdownHook();
+                }
+                finished.countDown();
+            }
+        };
+    }
 
     private Thread[] startThreads(ThreadFactory factory) {
         Thread[] created = new Thread[workers.length];
         int started = 0;
         try {
             for (int i = 0; i < workers.length; i++) {
-                Thread t = factory.newThread(workers[i]);
+                Thread t = factory.newThread(task(workers[i]));
                 if (t == null) {
                     throw new IllegalStateException("threadFactory returned null");
                 }
@@ -240,20 +267,21 @@ final class AsyncLogger implements EfficientLogger {
         };
     }
 
-    private Thread registerShutdownHook(int loggerNumber) {
+    private void registerShutdownHook(int loggerNumber) {
         Thread hook = new Thread(() -> close(), "efficient-logger-" + loggerNumber + "-shutdown");
         try {
             Runtime.getRuntime().addShutdownHook(hook);
-            return hook;
+            shutdownHook.set(hook);
         } catch (IllegalStateException e) {
-            return null; // the JVM is already shutting down
+            // the JVM is already shutting down
         }
     }
 
     private void removeShutdownHook() {
-        if (shutdownHook != null && shutdownHookRemoved.compareAndSet(false, true)) {
+        Thread hook = shutdownHook.getAndSet(null);
+        if (hook != null) {
             try {
-                Runtime.getRuntime().removeShutdownHook(shutdownHook);
+                Runtime.getRuntime().removeShutdownHook(hook);
             } catch (IllegalStateException e) {
                 // the JVM is shutting down, possibly running this very hook
             }
@@ -276,6 +304,10 @@ final class AsyncLogger implements EfficientLogger {
             }
         }
         return true;
+    }
+
+    private static String messages(long n) {
+        return n == 1 ? "1 message" : n + " messages";
     }
 
     private static long saturatedNanos(Duration timeout) {

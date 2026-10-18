@@ -93,9 +93,14 @@ final class FileTable {
         }
         int start = f.pos;
         int limit = b.length - separator.length;
-        long r = Utf8.encode(json, 0, b, start, limit);
-        if (Utf8.nextChar(r) != json.length()) {
-            // Doesn't fit: write out the complete records before it, then encode it from offset 0.
+        long r = 0;
+        boolean fits = false;
+        if (start <= limit) { // past it, the buffer is too full for even an empty record
+            r = Utf8.encode(json, 0, b, start, limit);
+            fits = Utf8.nextChar(r) == json.length();
+        }
+        if (!fits) {
+            // Write out the complete records before it, then encode it from offset 0.
             f.pos = start;
             if (start > 0 && !writeOut(f, now)) {
                 add(LOST_IO_ERROR, 1);

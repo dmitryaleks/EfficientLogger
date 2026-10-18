@@ -1,6 +1,6 @@
 # EfficientLogger — Implementation Plan
 
-> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M6 done. Sync mode is usable through `EfficientLogger.builder(...).synchronous().build()`. Async mode is fully written and passes its by-hand tests, but public `build()` still rejects it until M7's multi-threaded tests pass. Next: M7.
+> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M7 done. Both modes are usable: `EfficientLogger.builder(...).build()` gives the async logger (the default), and `.synchronous().build()` the sync one. Next: M8.
 
 ## 1. Context
 Today the user writes multiple JSON log files through log4j, appending across restarts.
@@ -195,6 +195,16 @@ On Windows `parkNanos` is about 16 ms granular. Don't use microsecond parks for 
   - Start the threads only after construction finishes.
   - If a thread start fails, set CLOSED, join the threads already started, and rethrow.
 - **Shutdown hook:** calls `close(closeTimeout)`.
+- **As built in M7:**
+  - **No STATE CAS.** Setting CLOSED is idempotent. Every caller waits on one `CountDownLatch` that each worker thread counts down when it finishes, so concurrent `close` calls all return true once the queue is drained. Waiting on the latch rather than joining threads means a custom `threadFactory` can't make `close` hang.
+  - **From a worker thread** (e.g. a warning handler), `close` sets CLOSED, wakes the workers and returns false at once. Waiting there would stall until the timeout, because the drain needs that very thread.
+  - **The last worker to finish removes the shutdown hook.** A `close` that times out keeps it, so a JVM exit still drains what is left.
+  - **Messages.** On timeout: "close didn't finish within X ms; the remaining N messages will be written in the background". When interrupted, `close` and `flush` return false, keep the interrupt flag and warn nothing.
+  - **Test seams:** `TestHooks.beforeBatch` (runs before every batch; tests block in it to hold a worker) and the accessors `AsyncLogger.thread(i)`, `closing()`, `admission()` and `shutdownHook()`.
+  - **Bugs the threaded tests found:**
+    1. A record ending exactly at the end of a file buffer left the next append starting past the encoder's limit. With assertions on, that tripped an assert. Without them, an empty message threw `ArrayIndexOutOfBoundsException`.
+    2. `maxOpenFiles + EXTRA_ENTRIES` overflowed `int` for very large `maxOpenFiles`. It is now `Config.maxFileEntries`, capped at `Integer.MAX_VALUE`.
+  - **Checking the checks.** With the worker's pre-sleep re-check removed, both lost-wakeup tests fail within 50 messages. With workers stopping at an empty ring instead of waiting for in-flight messages, `closeWaitsForAMessageAdmittedButNotYetQueued` fails deterministically; the close-race stress test alone didn't catch that.
 
 ### 3.6 File I/O (shared by both modes): `FileTable`, `FileState`, `Sink`, `FileNamePattern`
 - **Sink.** `new FileOutputStream(path.toFile(), true)` behind a `Sink`/`SinkFactory` seam, so tests can inject faults.
@@ -268,7 +278,7 @@ On Windows `parkNanos` is about 16 ms granular. Don't use microsecond parks for 
 | `FileTable`, `FileState`, `FileNamePattern`, `OpenFileBudget` | File management |
 | `Sink`, `SinkFactory`, `FileOutputStreamSink` | I/O seam |
 | `Utf8`, `Warnings` | Encoding; safe handler calls + rate limiting |
-| `TestHooks` | Package-private: `startThreads`, `beforeBatch` gate, `nanoClock`, `sinkFactory`, `batchSize`, `spinIterations`, `ringStartIndex` |
+| `TestHooks` | Package-private: `startThreads`, `beforeBatch` gate, `nanoClock`, `sinks`, `batchSize`, `ringStartIndex` |
 
 ---
 

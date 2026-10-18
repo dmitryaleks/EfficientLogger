@@ -65,6 +65,14 @@ class ConfigTest {
     }
 
     @Test
+    void theFileEntryCapIsMaxOpenFilesPlusRoomForEntriesWithoutAFile() {
+        assertEquals(1024 + FileTable.EXTRA_ENTRIES, builder().buildConfig().maxFileEntries);
+        assertEquals(Integer.MAX_VALUE, builder().maxOpenFiles(Integer.MAX_VALUE - 1).buildConfig().maxFileEntries,
+                "doesn't overflow");
+        assertEquals(Integer.MAX_VALUE, builder().maxOpenFiles(Integer.MAX_VALUE).buildConfig().maxFileEntries);
+    }
+
+    @Test
     void syncDefaults() {
         Config c = builder().synchronous().buildConfig();
 

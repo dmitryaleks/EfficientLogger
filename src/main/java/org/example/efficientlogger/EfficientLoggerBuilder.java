@@ -177,10 +177,6 @@ public final class EfficientLoggerBuilder {
      * @throws UncheckedIOException if the directory can't be created
      */
     public EfficientLogger build() {
-        if (!synchronous) {
-            // Built and unit-tested (M6); switched on once the multi-threaded tests pass (M7).
-            throw new UnsupportedOperationException("asynchronous mode isn't available yet; use synchronous()");
-        }
         return build(new TestHooks());
     }
 

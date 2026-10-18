@@ -47,7 +47,9 @@ public interface EfficientLogger extends AutoCloseable {
      * Waits until every message accepted before this call has been handed to the OS. This is not
      * an fsync. In synchronous mode it returns true at once, because {@code log} already wrote.
      *
-     * @return false if the timeout passed first
+     * @return false if the timeout passed first, the calling thread was interrupted (the interrupt
+     *     flag stays set), or the caller is the logger's own thread, e.g. in a warning handler, which
+     *     can't wait for itself
      */
     boolean flush(Duration timeout);
 
@@ -65,10 +67,15 @@ public interface EfficientLogger extends AutoCloseable {
 
     /**
      * Stops accepting messages, writes everything already accepted, and closes the files. Later
-     * {@code log} calls return false. Safe to call more than once, and from several threads. In
-     * synchronous mode it waits for writes in progress, and the timeout doesn't apply.
+     * {@code log} calls return false. Safe to call more than once, and from several threads.
      *
-     * @return true if everything was written and closed within the timeout
+     * <p>If the timeout passes first, a warning is reported and the rest is still written in the
+     * background. Called from the logger's own thread, e.g. in a warning handler, it starts closing
+     * and returns false at once. In synchronous mode it waits for writes in progress, and the
+     * timeout doesn't apply.
+     *
+     * @return true if everything was written and closed within the timeout. False if not yet, or if
+     *     the calling thread was interrupted (the interrupt flag stays set)
      */
     boolean close(Duration timeout);
 

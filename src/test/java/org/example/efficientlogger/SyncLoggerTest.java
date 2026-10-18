@@ -118,6 +118,14 @@ class SyncLoggerTest {
         }
     }
 
+    @Test
+    void worksWithTheLargestMaxOpenFiles() throws IOException {
+        try (EfficientLogger logger = builder().maxOpenFiles(Integer.MAX_VALUE).build()) {
+            assertTrue(logger.log("a", "{}"));
+        }
+        assertEquals("{}\n", read("a"));
+    }
+
     // ---- the directory ----
 
     @Test
@@ -135,11 +143,6 @@ class SyncLoggerTest {
         UncheckedIOException e = assertThrows(UncheckedIOException.class,
                 () -> EfficientLogger.builder(notADirectory, "{id}.json").synchronous().build());
         assertTrue(e.getMessage().startsWith("can't create directory"), e.getMessage());
-    }
-
-    @Test
-    void asyncModeIsNotAvailableYet() {
-        assertThrows(UnsupportedOperationException.class, () -> EfficientLogger.builder(dir, "{id}.json").build());
     }
 
     // ---- drops and closing ----

@@ -41,7 +41,7 @@ final class SyncLogger implements EfficientLogger {
         stripes = new Stripe[config.syncStripes];
         for (int i = 0; i < stripes.length; i++) {
             stripes[i] = new Stripe(new FileTable(config.fileNamePattern, config.lineSeparator,
-                    config.fileBufferBytes, config.maxOpenFiles + FileTable.EXTRA_ENTRIES, hooks.sinks,
+                    config.fileBufferBytes, config.maxFileEntries, hooks.sinks,
                     budget, warnings));
         }
     }

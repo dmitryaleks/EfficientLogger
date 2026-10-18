@@ -14,4 +14,6 @@ final class TestHooks {
     long ringStartIndex = 0;
     /** Async: overrides the batch size when positive. */
     int batchSize = 0;
+    /** Async: if set, each worker runs it before every batch; tests block in it to hold a worker. */
+    Runnable beforeBatch = null;
 }

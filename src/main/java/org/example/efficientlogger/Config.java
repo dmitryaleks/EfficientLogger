@@ -34,6 +34,7 @@ final class Config {
     final boolean synchronous;
     final int fileBufferBytes;
     final int maxOpenFiles;
+    final int maxFileEntries; // per FileTable: maxOpenFiles plus room for entries that hold no file
     final byte[] lineSeparator; // don't modify
     final WarningHandler warningHandler;
     final Duration closeTimeout;
@@ -73,6 +74,7 @@ final class Config {
         synchronous = b.synchronous;
         fileBufferBytes = orDefault(b.fileBufferBytes, DEFAULT_FILE_BUFFER_BYTES);
         maxOpenFiles = orDefault(b.maxOpenFiles, DEFAULT_MAX_OPEN_FILES);
+        maxFileEntries = (int) Math.min(Integer.MAX_VALUE, (long) maxOpenFiles + FileTable.EXTRA_ENTRIES);
         lineSeparator = (b.lineSeparator != null ? b.lineSeparator : "\n").getBytes(StandardCharsets.US_ASCII);
         warningHandler = b.warningHandler != null ? b.warningHandler : WarningHandler.stderr();
         closeTimeout = b.closeTimeout != null ? b.closeTimeout : DEFAULT_CLOSE_TIMEOUT;

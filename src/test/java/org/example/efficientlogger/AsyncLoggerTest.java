@@ -28,6 +28,7 @@ class AsyncLoggerTest {
     private final List<String> warnings = new ArrayList<>();
     private int batchSize; // 0: the logger's own
     private long ringStartIndex;
+    private int shardSeed; // 0: route by the bare hash, so worker assignment is predictable
 
     private EfficientLoggerBuilder builder() {
         return EfficientLogger.builder(dir, "{id}.json")
@@ -42,6 +43,7 @@ class AsyncLoggerTest {
         hooks.nanoClock = () -> now[0];
         hooks.batchSize = batchSize;
         hooks.ringStartIndex = ringStartIndex;
+        hooks.shardSeed = shardSeed;
         return (AsyncLogger) b.build(hooks);
     }
 
@@ -145,6 +147,22 @@ class AsyncLoggerTest {
         }
         assertEquals(json(1) + "\n" + json(2) + "\n" + json(3) + "\n", content("foo"), "case variants share one file");
         assertEquals(json(4) + "\n" + json(5) + "\n", content("café"), "Unicode forms share one file");
+    }
+
+    @Test
+    void theShardSeedDecidesWhichWorkerAnIdGoesTo() {
+        // The per-logger seed, not the bare hash, picks the worker, so an attacker who controls IDs
+        // can't craft them to all pile on one worker without knowing the seed.
+        for (int seed : new int[] {0, 0x51ED2A17, -987654321}) {
+            shardSeed = seed;
+            AsyncLogger logger = manual(builder().workerThreads(4));
+            assertTrue(logger.log("tenant", json(1)));
+            int expected = Hashing.index("tenant".hashCode() ^ seed, 4);
+            for (int w = 0; w < logger.workerCount(); w++) {
+                long queued = logger.worker(w).ring.tail(); // ringStartIndex is 0
+                assertEquals(w == expected ? 1 : 0, queued, "seed " + seed + ", worker " + w);
+            }
+        }
     }
 
     @Test

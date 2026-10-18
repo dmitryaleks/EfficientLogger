@@ -28,6 +28,7 @@ final class AsyncLogger implements EfficientLogger {
     private final long maxChars;
     private final int maxIdLength;
     private final boolean normalizeIds;
+    private final int shardSeed;
     private final long startIndex;
     private final Duration closeTimeout;
     private final AtomicLong rejectedClosed = new AtomicLong();
@@ -53,6 +54,7 @@ final class AsyncLogger implements EfficientLogger {
             warnings.emit("filePermissions is set but this file system has no POSIX permissions;"
                     + " new files follow the directory's access rules instead", null);
         }
+        shardSeed = hooks.shardSeed;
         startIndex = hooks.ringStartIndex;
         closeTimeout = config.closeTimeout;
 
@@ -104,7 +106,7 @@ final class AsyncLogger implements EfficientLogger {
             }
             return false;
         }
-        MpscRing ring = rings[Hashing.index(id.hashCode(), rings.length)];
+        MpscRing ring = rings[Hashing.index(id.hashCode() ^ shardSeed, rings.length)];
         long admitted = admission.tryAcquire(len);
         if (admitted <= 0) {
             if (admitted == Admission.REJECTED_FULL) {

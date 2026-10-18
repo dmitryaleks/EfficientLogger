@@ -365,6 +365,7 @@ class SyncLoggerTest {
         CountDownLatch release = new CountDownLatch(1);
         Path slowFile = dir.toAbsolutePath().normalize().resolve("events-slow.json");
         TestHooks hooks = new TestHooks();
+        hooks.shardSeed = 0; // so the stripe prediction above holds
         hooks.sinks = new BlockingSinks(slowFile, writing, release);
 
         Thread slowWriter;

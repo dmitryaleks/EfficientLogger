@@ -32,6 +32,7 @@ final class SyncLogger implements EfficientLogger {
     private final LongSupplier clock;
     private final int maxIdLength;
     private final boolean normalizeIds;
+    private final int shardSeed;
     private final AtomicLong rejectedClosed = new AtomicLong();
     private volatile boolean closed;
 
@@ -39,6 +40,7 @@ final class SyncLogger implements EfficientLogger {
         warnings = new Warnings(config.warningHandler, config.maxIdLength);
         maxIdLength = config.maxIdLength;
         normalizeIds = config.normalizeIds;
+        shardSeed = hooks.shardSeed;
         String exposed = hooks.sinks.directoryExposedReason(config.directory);
         if (exposed != null) {
             warnings.emit(exposed, null);
@@ -76,7 +78,7 @@ final class SyncLogger implements EfficientLogger {
             rejectedClosed.incrementAndGet();
             return false;
         }
-        Stripe s = stripes[Hashing.index(id.hashCode(), stripes.length)];
+        Stripe s = stripes[Hashing.index(id.hashCode() ^ shardSeed, stripes.length)];
         boolean written;
         List<Warnings.Pending> pending;
         synchronized (s) {

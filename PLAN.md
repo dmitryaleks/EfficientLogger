@@ -1,6 +1,6 @@
 # EfficientLogger — Implementation Plan
 
-> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M9 done. Both modes are usable: `EfficientLogger.builder(...).build()` gives the async logger (the default), and `.synchronous().build()` the sync one. Tests show `log()` allocates nothing, whether it queues, drops, writes (sync) or is called after close, and neither does the async worker. Next: M10 (optional: benchmarks and a README).
+> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M10 done. Both modes are usable: `EfficientLogger.builder(...).build()` gives the async logger (the default), and `.synchronous().build()` the sync one. Tests show `log()` allocates nothing, whether it queues, drops, writes (sync) or is called after close, and neither does the async worker. README.md has usage and benchmark results.
 
 ## 1. Context
 Today the user writes multiple JSON log files through log4j, appending across restarts.
@@ -412,3 +412,22 @@ On Windows `parkNanos` is about 16 ms granular. Don't use microsecond parks for 
 2. Run the stress suites repeatedly to shake out flakes, for example `.\gradlew.bat test --tests "*Ring*" --tests "*Close*" --tests "*Wakeup*" --rerun-tasks` five times.
 3. The shutdown-hook child-JVM test is the real-process end-to-end check. It covers append mode, files left without `close()`, and draining at JVM exit.
 4. Optional (M10): `.\gradlew.bat jmh` with `-prof gc`. Confirm `gc.alloc.rate.norm ≈ 0 B/op` for `log()`, and compare throughput and latency against the baselines.
+
+### As built in M10
+- **`LoggerBenchmark`** (`src/jmh`, plugin `me.champeau.jmh` 0.7.2, JMH 1.37):
+  - **Loggers:** EfficientLogger async with 1 worker and with 4, EfficientLogger sync, a locked `BufferedWriter` per file, log4j2 async loggers, and `none` (the harness alone).
+  - **Benchmarks:**
+    - `throughput1/4/8` call `log()` flat out, with `accepted`/`dropped` counters, because the async logger drops rather than blocks.
+    - `paced1/4` measure per-call latency (`SampleTime`) after about 0.7 µs of `Blackhole.consumeCPU` work.
+  - **Output:** the null device by default, so the write calls are real but the disk isn't measured; `-p output=disk` for real files.
+- **The log4j2 baseline is built in code:** a logger and an `OutputStreamAppender` per ID. log4j2's `FileAppender` can't write to the Windows null device: it resolves the path to `\\.\NUL` and then fails to create the "directory" `\\.`. The first full run reported log4j2 numbers in that broken state. To catch that kind of thing, a run now fails if log4j2 reports any warning or error, or if EfficientLogger loses a message.
+  - `OutputStreamAppender` never closes the stream it is given, so the benchmark closes them itself.
+  - The benchmark jar is marked `Multi-Release`, which log4j-core needs.
+- **A bug in the benchmark itself:** a per-thread `int` counter overflowed at billions of calls a second. It now cycles its indexes instead.
+- **Results** (Windows 11, Ryzen AI 7 PRO 350, JDK 17.0.12; the full tables are in README.md):
+  - One async worker writes about 10 M messages/s, and 4 workers 27–46 M/s, with 0 B allocated per message.
+  - At about 1.3 M messages/s per thread, the async logger adds at most 0.3 µs at p99.
+  - The `BufferedWriter` baseline reaches 27–35 M/s but holds lines in memory until a buffer fills.
+  - Sync mode manages about 3 M/s, one OS write per message.
+  - log4j2 manages 0.4–0.5 M/s flat out and stalls for milliseconds at the paced rate. That's most likely its `parkNanos(1)` backoff on a full ring buffer, which Windows turns into at least a millisecond. It hasn't been run on Linux.
+- **The jmh plugin** uses a Groovy property syntax that Gradle 10 will drop. Gradle reports it only when the jmh tasks run, not for `build`.

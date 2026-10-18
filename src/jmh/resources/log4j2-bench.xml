@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Nothing here: LoggerBenchmark adds a logger and an appender per id in code. -->
+<Configuration status="warn">
+  <Loggers>
+    <Root level="off"/>
+  </Loggers>
+</Configuration>

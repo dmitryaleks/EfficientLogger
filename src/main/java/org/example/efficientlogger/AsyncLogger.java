@@ -13,6 +13,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * Asynchronous mode: {@code log} admits the message against the queue limits and puts it in the
  * ring of the worker that owns its ID. That is one CAS, one atomic add, two reference stores and one
  * volatile read, with no allocation and no locks. Everything else happens on the workers.
+ *
+ * <p>Built in two steps: the constructor creates everything, the worker threads included, without
+ * starting them, and {@link #start} starts them once construction is complete, so no worker can
+ * ever observe a half-built logger.
  */
 final class AsyncLogger implements EfficientLogger {
 
@@ -21,6 +25,8 @@ final class AsyncLogger implements EfficientLogger {
     private final MpscRing[] rings;
     private final Worker[] workers;
     private final Thread[] threads; // null when tests run the workers by hand
+    private final boolean registerShutdownHook;
+    private final int loggerNumber;
     private final Admission admission;
     private final OverflowTracker tracker;
     private final Warnings warnings;
@@ -74,14 +80,46 @@ final class AsyncLogger implements EfficientLogger {
 
         running = new AtomicInteger(n);
         finished = new CountDownLatch(n);
-        if (!hooks.startThreads) {
-            threads = null;
-            return;
+        loggerNumber = number;
+        registerShutdownHook = config.registerShutdownHook;
+        threads = hooks.startThreads
+                ? createThreads(config.threadFactory != null ? config.threadFactory : defaultThreadFactory(number))
+                : null;
+    }
+
+    /**
+     * Starts the workers and registers the shutdown hook. The builder calls this once construction
+     * has finished; the constructor itself hands {@code this} to nothing that runs.
+     *
+     * @return this
+     */
+    AsyncLogger start() {
+        if (threads == null) {
+            return this; // tests run the workers by hand
         }
-        threads = startThreads(config.threadFactory != null ? config.threadFactory : defaultThreadFactory(number));
-        if (config.registerShutdownHook) {
-            registerShutdownHook(number);
+        int started = 0;
+        try {
+            for (; started < threads.length; started++) {
+                threads[started].start();
+            }
+        } catch (RuntimeException | Error e) {
+            // Don't leave the started workers running: they stop at once, since nothing is queued.
+            admission.close();
+            for (int i = 0; i < started; i++) {
+                rings[i].wakeConsumer();
+                try {
+                    threads[i].join(TimeUnit.SECONDS.toMillis(10));
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            throw e;
         }
+        if (registerShutdownHook) {
+            registerShutdownHook(loggerNumber);
+        }
+        return this;
     }
 
     @Override
@@ -319,36 +357,18 @@ final class AsyncLogger implements EfficientLogger {
                 + " and abandoned()", null);
     }
 
-    private Thread[] startThreads(ThreadFactory factory) {
+    /** Creates the worker threads without starting them; {@link #start} does that. */
+    private Thread[] createThreads(ThreadFactory factory) {
         Thread[] created = new Thread[workers.length];
-        int started = 0;
-        try {
-            for (int i = 0; i < workers.length; i++) {
-                Thread t = factory.newThread(task(workers[i]));
-                if (t == null) {
-                    throw new IllegalStateException("threadFactory returned null");
-                }
-                created[i] = t;
-                rings[i].attachConsumer(t);
+        for (int i = 0; i < workers.length; i++) {
+            Thread t = factory.newThread(task(workers[i]));
+            if (t == null) {
+                throw new IllegalStateException("threadFactory returned null");
             }
-            for (; started < created.length; started++) {
-                created[started].start();
-            }
-            return created;
-        } catch (RuntimeException | Error e) {
-            // Don't leave the started workers running: they stop at once, since nothing is queued.
-            admission.close();
-            for (int i = 0; i < started; i++) {
-                rings[i].wakeConsumer();
-                try {
-                    created[i].join(TimeUnit.SECONDS.toMillis(10));
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-            throw e;
+            created[i] = t;
+            rings[i].attachConsumer(t);
         }
+        return created;
     }
 
     private static ThreadFactory defaultThreadFactory(int loggerNumber) {

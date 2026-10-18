@@ -2,6 +2,8 @@
 <verification-metadata xmlns="https://schema.gradle.org/dependency-verification" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://schema.gradle.org/dependency-verification https://schema.gradle.org/dependency-verification/dependency-verification-1.3.xsd">
    <configuration>
       <verify-metadata>true</verify-metadata>
+      <!-- Checksums only, by choice: every plugin and dependency is pinned by SHA-256 below, which a
+           tampered download fails; checking signatures too would mean keeping the publishers' keys here. -->
       <verify-signatures>false</verify-signatures>
    </configuration>
    <components>

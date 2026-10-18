@@ -1,4 +1,3 @@
-plugins {
-    id("org.gradle.toolchains.foojay-resolver-convention") version "0.8.0"
-}
+// No toolchain resolver plugin: the build uses a locally installed JDK 17 and never downloads one
+// (gradle.properties turns toolchain auto-download off), so there is one plugin less to trust.
 rootProject.name = "EfficientLogger"

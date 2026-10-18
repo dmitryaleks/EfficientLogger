@@ -88,17 +88,75 @@ class FileOutputStreamSinkTest {
     }
 
     @Test
-    void flagsADirectoryExposedToOtherUsers() throws IOException {
+    void flagsADirectoryWritableByItsGroupOrByOthers() throws IOException {
         assumeTrue(posix(), "directory modes need a POSIX file system");
-        Path safe = Files.createDirectory(dir.resolve("safe"));
-        Files.setPosixFilePermissions(safe, PosixFilePermissions.fromString("rwx------"));
-        assertNull(FILES.directoryExposedReason(safe), "a private directory is fine");
+        assumeTrue(FILES.directoryExposedReason(dir) == null, "the temporary directory's parents are themselves exposed");
 
-        Path exposed = Files.createDirectory(dir.resolve("exposed"));
-        Files.setPosixFilePermissions(exposed, PosixFilePermissions.fromString("rwxrwxrwx"));
-        String reason = FILES.directoryExposedReason(exposed);
-        assertNotNull(reason, "a world-writable directory should be flagged");
-        assertTrue(reason.contains("writable by other users"), reason);
+        assertNull(FILES.directoryExposedReason(directory("safe", "rwx------")), "a private directory is fine");
+        assertNull(FILES.directoryExposedReason(directory("readable", "rwxr-xr-x")), "readable isn't writable");
+        assertReason(directory("group", "rwxrwx---"), "writable by its group and not sticky");
+        assertReason(directory("others", "rwxr-xrwx"), "writable by other users and not sticky");
+        assertReason(directory("everyone", "rwxrwxrwx"), "writable by its group and other users and not sticky");
+
+        Path sticky = directory("sticky", "rwxrwxrwx");
+        Files.setAttribute(sticky, "unix:mode", 01777);
+        assertNull(FILES.directoryExposedReason(sticky), "world-writable with the sticky bit, like /tmp, isn't flagged");
+
+        Path inside = Files.createDirectory(directory("parent", "rwxrwx---").resolve("logs"));
+        assertReason(inside, "writable by its group", "a parent counts: it can be swapped out from under the logger");
+    }
+
+    /** With these permissions set exactly: setPosixFilePermissions isn't subject to the umask. */
+    private Path directory(String name, String permissions) throws IOException {
+        Path d = Files.createDirectory(dir.resolve(name));
+        Files.setPosixFilePermissions(d, PosixFilePermissions.fromString(permissions));
+        return d;
+    }
+
+    private static void assertReason(Path directory, String expected) {
+        assertReason(directory, expected, "");
+    }
+
+    private static void assertReason(Path directory, String expected, String why) {
+        String reason = FILES.directoryExposedReason(directory);
+        assertNotNull(reason, directory + " should be flagged. " + why);
+        assertTrue(reason.contains(expected), reason);
+    }
+
+    /** Java reports an unreadable file like a missing one; the two must not be confused (review Q1). */
+    @Test
+    void refusesAFileItCannotRead() throws IOException {
+        assumeTrue(posix(), "file modes need a POSIX file system");
+        Path file = Files.writeString(dir.resolve("a.json"), "abc"); // no final newline: the repair would be needed
+        Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("-w-------"));
+        assumeTrue(!Files.isReadable(file), "running as root, which can read anything");
+        try {
+            IOException e = assertThrows(IOException.class, () -> FILES.lastByte(file));
+            assertTrue(e.getMessage().startsWith("can't read " + file), e.getMessage());
+        } finally {
+            Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
+        }
+    }
+
+    /**
+     * Creating a file with permissions must never chmod through a symlink: the permissions go on at
+     * creation, with no chmod afterwards that a swapped-in link could redirect (review Q2).
+     */
+    @Test
+    void withPermissionsRefusesASymlinkAndLeavesItsTargetAlone() throws IOException {
+        assumeTrue(posix(), "symbolic links need a POSIX file system");
+        Path target = Files.writeString(dir.resolve("target"), "secret\n");
+        Files.setPosixFilePermissions(target, PosixFilePermissions.fromString("rw-rw-r--"));
+        Path link = dir.resolve("a.json");
+        Files.createSymbolicLink(link, target);
+        SinkFactory factory = FileOutputStreamSink.withPermissions(PosixFilePermissions.fromString("rw-------"));
+
+        assertThrows(IOException.class, () -> factory.lastByte(link));
+        assertThrows(IOException.class, () -> factory.open(link));
+
+        assertEquals("rw-rw-r--", PosixFilePermissions.toString(Files.getPosixFilePermissions(target)),
+                "the target's permissions are untouched");
+        assertEquals("secret\n", Files.readString(target, UTF_8), "and so is its content");
     }
 
     @Test

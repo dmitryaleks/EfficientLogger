@@ -42,9 +42,9 @@ All set on the builder; each setter checks its argument at once.
 | `closeTimeout(Duration)` | 10 s | How long `close()` waits for the queue to drain. |
 | `registerShutdownHook(boolean)` | true | Close the logger at JVM exit, so queued messages are written. Async only. |
 | `threadFactory(ThreadFactory)` | daemon threads | Default names: `efficient-logger-<n>-worker-<i>`. Async only. |
-| `warningHandler(WarningHandler)` | stderr | Receives the logger's own warnings. |
+| `warningHandler(WarningHandler)` | stderr | Receives the logger's own warnings. Must be thread-safe and must not block. |
 | `lineSeparator(String)` | `"\n"` | `"\n"` or `"\r\n"`. |
-| `filePermissions(Set<PosixFilePermission>)` | umask | POSIX permissions for new files, e.g. `rw-------`; the directory gets those plus execute. Existing files keep theirs. No effect off POSIX (e.g. Windows). |
+| `filePermissions(Set<PosixFilePermission>)` | umask | POSIX permissions for new files, e.g. `rw-------`; the directory gets those plus execute. The umask can still remove bits, never add any. Existing files keep theirs. No effect off POSIX (e.g. Windows). |
 | `normalizeIds()` | off | Canonicalize each ID (Unicode NFC, then lower-case) so IDs differing only by case or form share one file and worker. For case-insensitive file systems; costs an allocation per `log`. |
 | `syncStripes(int)` | 16 | Power of two, 1 to 256: independent locks in sync mode. Sync only. |
 
@@ -104,7 +104,8 @@ Combining an async-only option with `synchronous()`, or `syncStripes` without it
   retried. A missing directory is created again. Error warnings are limited to one every
   10 seconds, and the number held back is reported at close.
 - **Warnings** go to the `WarningHandler`, never to the caller as exceptions. A handler may call
-  `log()`, `flush()` or `close()`.
+  `log()`, `flush()` or `close()`. It must be thread-safe: with several workers, or several threads
+  logging in sync mode, it is called from more than one thread at once.
 - **`stats()`** returns counters: accepted, written, dropped (queue full, too large, invalid ID),
   lost to I/O errors, abandoned at close, rejected after close, queued, and open files. Once a
   logger is closed, `accepted == written + droppedInvalidId + lostIoError + abandoned`, and
@@ -245,12 +246,12 @@ the disk.
   anything that isn't a regular file, so a symlink, FIFO or device left at a file's path by
   another user can't redirect the writes or block a thread; those messages are dropped and
   retried like any I/O error. At build it also warns if the directory, or a parent, is writable
-  by other users without the sticky bit. A regular file could still be swapped for a symlink in
+  by its group or by other users without the sticky bit. A regular file could still be swapped for a symlink in
   the instant between the check and the open, so a private directory is the real safeguard.
 - **`filePermissions(...)` restricts new files.** Without it, new files and the directory follow
   the process umask, so they are usually world-readable. Pass POSIX permissions such as
-  `rw-------` to keep logs private to the owner; the directory then gets `rwx------`. Existing
-  files keep their own permissions.
+  `rw-------` to keep logs private to the owner; the directory then gets `rwx------` (less
+  anything the umask removes). Existing files keep their own permissions.
 - **Deleting a file or directory the logger has open** makes later lines to that file
   disappear until it is reopened, while `stats()` still counts them as written. (Windows
   doesn't allow deleting open files.)

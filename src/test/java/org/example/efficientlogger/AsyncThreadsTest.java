@@ -5,6 +5,7 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -745,12 +746,19 @@ class AsyncThreadsTest {
     void aSleepingWorkerIsWokenOnceAQuarterOfTheQueueIsUsed() {
         AsyncLogger logger = start(builder().maxQueuedMessages(64).flushIntervalMillis(60_000), nullSinks());
         Worker worker = logger.worker(0);
+        Thread thread = logger.thread(0);
         for (int round = 0; round < 500; round++) {
-            spinUntil(() -> worker.ring.parkedState() == MpscRing.TIMED, "the worker to sleep");
+            // Wait until the worker is really blocked in its timed park, not just about to be. If the
+            // previous round's wake-up landed while the worker was between announcing TIMED and
+            // parking, it skipped that park and the unpark permit is still pending; the next park
+            // then returns at once (the thread never blocks), and the state flips for an instant.
+            spinUntil(() -> worker.ring.parkedState() == MpscRing.TIMED && thread.getState() == Thread.State.TIMED_WAITING,
+                    "the worker to sleep");
             for (int i = 0; i < 15; i++) {
                 assertTrue(logger.log("a", "{}"));
             }
             assertEquals(MpscRing.TIMED, worker.ring.parkedState(), "woken with 15 messages queued");
+            assertEquals(Thread.State.TIMED_WAITING, thread.getState(), "woken with 15 messages queued");
             assertTrue(logger.log("a", "{}"));
             long expected = 16L * (round + 1);
             spinUntil(() -> worker.files.written() == expected, "the 16th message to wake the worker");
@@ -807,6 +815,32 @@ class AsyncThreadsTest {
         Thread first = created.get(0);
         first.join(WAIT.toMillis());
         assertFalse(first.isAlive(), "the worker that started is still running");
+    }
+
+    /**
+     * The logger is built in two steps: the constructor creates the threads without starting them,
+     * and start() runs once construction is complete, so no worker can see a half-built logger
+     * (review Q3). What a factory can see of that: every thread it made earlier is still NEW.
+     */
+    @Test
+    void workerThreadsAreAllCreatedBeforeAnyIsStarted() {
+        List<Thread> created = Collections.synchronizedList(new ArrayList<>());
+        ThreadFactory factory = r -> {
+            for (Thread earlier : created) {
+                assertEquals(Thread.State.NEW, earlier.getState(), earlier.getName() + " was started before all were created");
+            }
+            Thread t = new Thread(r, "two-step-worker-" + created.size());
+            t.setDaemon(true);
+            created.add(t);
+            return t;
+        };
+        AsyncLogger logger = start(builder().workerThreads(3).threadFactory(factory));
+        assertEquals(3, created.size());
+        for (Thread t : created) {
+            assertNotEquals(Thread.State.NEW, t.getState(), t.getName() + " was never started");
+        }
+        assertTrue(logger.log("a", json(1)));
+        assertTrue(logger.flush(WAIT));
     }
 
     @Test

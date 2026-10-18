@@ -166,11 +166,12 @@ public final class EfficientLoggerBuilder {
     }
 
     /**
-     * Creates new log files, and the directory if it makes it, with these POSIX permissions instead
-     * of the ones the process umask allows, so they aren't readable by other users by default. For
-     * example {@code PosixFilePermissions.fromString("rw-------")}; the directory then gets
-     * {@code rwx------}. Existing files and directories keep their own permissions. Has no effect on
-     * a file system without POSIX permissions, such as on Windows, where new files follow the
+     * Creates new log files, and the directory if it makes it, with these POSIX permissions, so they
+     * aren't readable by other users by default. For example
+     * {@code PosixFilePermissions.fromString("rw-------")}; the directory then gets {@code rwx------}.
+     * The process umask can still remove bits from these, never add any, so the result is no less
+     * private than asked. Existing files and directories keep their own permissions. Has no effect
+     * on a file system without POSIX permissions, such as on Windows, where new files follow the
      * directory's access rules.
      */
     public EfficientLoggerBuilder filePermissions(Set<PosixFilePermission> permissions) {
@@ -237,7 +238,7 @@ public final class EfficientLoggerBuilder {
         } catch (IOException e) {
             throw new UncheckedIOException("can't create directory " + config.directory, e);
         }
-        return config.synchronous ? new SyncLogger(config, hooks) : new AsyncLogger(config, hooks);
+        return config.synchronous ? new SyncLogger(config, hooks) : new AsyncLogger(config, hooks).start();
     }
 
     /** Validates the options and resolves defaults. */

@@ -35,7 +35,10 @@ final class FileOutputStreamSink implements Sink {
     /** Creates files and directories with the process umask, as before. */
     static final SinkFactory FACTORY = new Factory(null);
 
-    /** Creates new files with {@code filePermissions}, and new directories with those plus execute. */
+    /**
+     * Creates new files with {@code filePermissions}, and new directories with those plus execute,
+     * less whatever the process umask removes.
+     */
     static SinkFactory withPermissions(Set<PosixFilePermission> filePermissions) {
         return new Factory(filePermissions);
     }
@@ -47,6 +50,7 @@ final class FileOutputStreamSink implements Sink {
 
     private static final class Factory implements SinkFactory {
 
+        private static final int GROUP_WRITE = 0020;
         private static final int OTHERS_WRITE = 0002;
         private static final int STICKY = 01000;
 
@@ -67,8 +71,10 @@ final class FileOutputStreamSink implements Sink {
         public Sink open(Path path) throws IOException {
             if (filePerms != null) {
                 try {
+                    // The file gets these permissions less whatever the umask removes. No chmod
+                    // afterwards to make them exact: it would follow a symlink swapped in meanwhile
+                    // (Java has no fchmod), and the umask can only make the file more private.
                     Files.createFile(path, PosixFilePermissions.asFileAttribute(filePerms));
-                    Files.setPosixFilePermissions(path, filePerms); // exact, whatever the umask
                 } catch (FileAlreadyExistsException e) {
                     // keep an existing file's own permissions
                 }
@@ -105,7 +111,13 @@ final class FileOutputStreamSink implements Sink {
                 file.seek(length - 1);
                 return file.read();
             } catch (FileNotFoundException e) {
-                return MISSING; // removed since the stat; opening it will report any real problem
+                // Java reports "permission denied" this way too. The stat just found the file, so
+                // unless it has gone since, it exists and can't be read: say so, rather than treat it
+                // as new, which would skip the line repair and charge maxFiles for an existing file.
+                if (Files.notExists(path, LinkOption.NOFOLLOW_LINKS)) {
+                    return MISSING; // removed since the stat; opening it will report any real problem
+                }
+                throw new IOException("can't read " + path + " to see how its last line ended: " + e.getMessage(), e);
             }
         }
 
@@ -115,8 +127,7 @@ final class FileOutputStreamSink implements Sink {
                 return false; // an existing directory keeps its own permissions
             }
             if (dirPerms != null) {
-                Files.createDirectories(dir, PosixFilePermissions.asFileAttribute(dirPerms));
-                Files.setPosixFilePermissions(dir, dirPerms); // exact, whatever the umask
+                Files.createDirectories(dir, PosixFilePermissions.asFileAttribute(dirPerms)); // less the umask, as for files
             } else {
                 Files.createDirectories(dir);
             }
@@ -125,8 +136,9 @@ final class FileOutputStreamSink implements Sink {
 
         @Override
         public String directoryExposedReason(Path directory) {
-            // POSIX only: warn if the directory, or any parent, is writable by other users without
-            // the sticky bit, so another user could redirect or read the logs.
+            // POSIX only: warn if the directory, or any parent, is writable by its group or by other
+            // users without the sticky bit, since anyone with that access could plant a symlink or
+            // FIFO at a file's path, swap the directory itself, or read the logs.
             for (Path p = directory; p != null; p = p.getParent()) {
                 int mode;
                 try {
@@ -135,9 +147,13 @@ final class FileOutputStreamSink implements Sink {
                     // not a POSIX file system (UnsupportedOperationException), or the path can't be read
                     return null;
                 }
-                if ((mode & OTHERS_WRITE) != 0 && (mode & STICKY) == 0) {
-                    return "the log directory path " + p + " is writable by other users and not sticky;"
-                            + " another user could redirect or read the logs. Restrict it to the service's own user.";
+                int writable = mode & (GROUP_WRITE | OTHERS_WRITE);
+                if (writable != 0 && (mode & STICKY) == 0) {
+                    String who = writable == GROUP_WRITE ? "its group"
+                            : writable == OTHERS_WRITE ? "other users"
+                            : "its group and other users";
+                    return "the log directory path " + p + " is writable by " + who + " and not sticky; anyone with"
+                            + " that access could redirect or read the logs. Restrict it to the service's own user.";
                 }
             }
             return null;

@@ -157,8 +157,15 @@ final class AsyncLogger implements EfficientLogger {
     public LoggerStats stats() {
         long tooLongIds = warnings.tooLongIds(); // counted as accepted and dropped for an invalid id
         long accepted = tooLongIds;
-        for (MpscRing ring : rings) {
-            accepted += ring.tail() - startIndex;
+        long abandoned = 0;
+        for (int i = 0; i < rings.length; i++) {
+            long tail = rings[i].tail(); // read once, so accepted and abandoned agree on a late publish
+            accepted += tail - startIndex;
+            if (workers[i].terminated()) {
+                // Claimed but never consumed: the worker gave up on them (terminated is volatile,
+                // so its final head is visible here).
+                abandoned += tail - rings[i].head();
+            }
         }
         long written = 0;
         long invalidId = tooLongIds;
@@ -171,8 +178,8 @@ final class AsyncLogger implements EfficientLogger {
         long oversize = warnings.oversizeMessages();
         long queueFull = tracker.drops();
         long word = admission.get();
-        return new LoggerStats(accepted, written, queueFull, oversize, invalidId, lostIoError, rejectedClosed.get(),
-                Admission.messages(word), Admission.chars(word), budget.open());
+        return new LoggerStats(accepted, written, queueFull, oversize, invalidId, lostIoError, abandoned,
+                rejectedClosed.get(), Admission.messages(word), Admission.chars(word), budget.open());
     }
 
     @Override
@@ -193,7 +200,7 @@ final class AsyncLogger implements EfficientLogger {
         long timeoutNanos = saturatedNanos(timeout);
         admission.close(); // from here on log() returns false; idempotent
         if (threads == null) {
-            return allTerminated();
+            return allTerminated() && nothingLeft();
         }
         for (MpscRing ring : rings) {
             ring.wakeConsumer();
@@ -216,8 +223,16 @@ final class AsyncLogger implements EfficientLogger {
                     : "will be written in the background";
             warnings.emit("close didn't finish within " + TimeUnit.NANOSECONDS.toMillis(timeoutNanos)
                     + " ms; the remaining " + messages(Admission.messages(admission.get())) + " " + fate, null);
+            return false;
         }
-        return done;
+        // The workers give up on a queue that stops draining (see Worker), so "finished" doesn't
+        // mean "everything written": say so, as the javadoc promises.
+        return nothingLeft();
+    }
+
+    /** True if every admitted message has been consumed. Only meaningful once the workers have finished. */
+    private boolean nothingLeft() {
+        return Admission.messages(admission.get()) == 0;
     }
 
     /** For tests that run the workers by hand. */
@@ -251,7 +266,10 @@ final class AsyncLogger implements EfficientLogger {
 
     // ---- threads ----
 
-    /** What a worker thread runs. The last one to finish removes the shutdown hook, which is no longer needed. */
+    /**
+     * What a worker thread runs. The last one to finish removes the shutdown hook, which is no
+     * longer needed, and reports any messages the workers gave up on, before close() is released.
+     */
     private Runnable task(Worker worker) {
         return () -> {
             try {
@@ -266,10 +284,29 @@ final class AsyncLogger implements EfficientLogger {
             } finally {
                 if (running.decrementAndGet() == 0) {
                     removeShutdownHook();
+                    reportLeftBehind();
                 }
                 finished.countDown();
             }
         };
+    }
+
+    /**
+     * Once every worker has finished: the admitted messages that were never consumed. The workers
+     * only stop with some left when the queue made no progress for {@link Worker#STUCK_CLOSE_NANOS},
+     * which a {@code log()} call cut off (or stalled) between admission and publishing causes.
+     */
+    private void reportLeftBehind() {
+        long left = Admission.messages(admission.get());
+        if (left == 0) {
+            return;
+        }
+        boolean one = left == 1;
+        warnings.emit("close stopped waiting: " + messages(left) + (one ? " was" : " were") + " still queued after "
+                + TimeUnit.NANOSECONDS.toSeconds(Worker.STUCK_CLOSE_NANOS) + " s without progress, because a log()"
+                + " call was cut off (for example by a StackOverflowError) or stalled between being admitted and"
+                + " queueing its message. " + (one ? "It" : "They") + " won't be written; see stats().queuedMessages()"
+                + " and abandoned()", null);
     }
 
     private Thread[] startThreads(ThreadFactory factory) {

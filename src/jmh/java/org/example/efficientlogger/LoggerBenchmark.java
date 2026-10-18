@@ -76,8 +76,7 @@ public class LoggerBenchmark {
     static final int ID_COUNT = 50;
     static final int PACE_TOKENS = 500; // Blackhole.consumeCPU tokens between paced calls
 
-    private static final Path NULL_DEVICE =
-            Paths.get(System.getProperty("os.name").startsWith("Windows") ? "NUL" : "/dev/null");
+    private static final Path NULL_DEVICE = NullDeviceSinks.NULL_DEVICE;
     private static final String[] IDS = new String[ID_COUNT];
     private static final String[] MESSAGES = new String[64];
 
@@ -227,7 +226,7 @@ public class LoggerBenchmark {
     private Target efficient(boolean synchronous, int workers, boolean nullDevice) {
         TestHooks hooks = new TestHooks();
         if (nullDevice) {
-            hooks.sinks = NULL_SINKS;
+            hooks.sinks = new NullDeviceSinks();
         }
         EfficientLoggerBuilder b = EfficientLogger.builder(dir, "{id}.json")
                 .warningHandler((message, cause) -> {}); // drops are counted by Outcome instead
@@ -253,24 +252,6 @@ public class LoggerBenchmark {
             }
         };
     }
-
-    /** EfficientLogger's real file sink, but every file is the null device. */
-    private static final SinkFactory NULL_SINKS = new SinkFactory() {
-        @Override
-        public Sink open(Path path) throws IOException {
-            return FileOutputStreamSink.FACTORY.open(NULL_DEVICE);
-        }
-
-        @Override
-        public int lastByte(Path path) {
-            return -1;
-        }
-
-        @Override
-        public boolean createDirectoryIfMissing(Path directory) {
-            return false;
-        }
-    };
 
     /** The straightforward way: a BufferedWriter per file, each locked while a line is written. */
     static final class SynchronizedWriters implements Target {

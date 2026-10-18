@@ -16,7 +16,10 @@ import java.util.function.LongSupplier;
  * mode. See {@link MpscRing} for the wake-up protocol.
  *
  * <p>After close, it keeps going until every admitted message, logger-wide, has been consumed,
- * then writes out and closes its files.
+ * then writes out and closes its files. If the queue makes no progress for
+ * {@link #STUCK_CLOSE_NANOS} (a {@code log} call cut off, or stalled, between being admitted and
+ * publishing), it gives up instead, so close can finish; the last worker to finish reports what
+ * was left (see {@code AsyncLogger}).
  *
  * <p>Tests can drive it by hand with {@link #runOnce} and {@link #finish} instead of a thread.
  */
@@ -94,13 +97,14 @@ final class Worker implements Runnable, MpscRing.Handler {
                         // The queue won't reach zero if a log() call was cut off between being
                         // admitted and publishing its message (e.g. a StackOverflowError). Once the
                         // size has stopped falling for a while, give up so close can't wait forever.
+                        // The last worker to finish reports what was left, so a worker whose own
+                        // ring is simply empty while a sibling is stalled doesn't raise a false alarm.
                         long now = clock.getAsLong();
                         if (!closing || count != closeCount) {
                             closing = true;
                             closeCount = count;
                             closeStableNanos = now;
                         } else if (now - closeStableNanos >= STUCK_CLOSE_NANOS) {
-                            warnings.reportIncompleteClose();
                             break;
                         }
                         if (n == 0) {
@@ -230,13 +234,22 @@ final class Worker implements Runnable, MpscRing.Handler {
         }
     }
 
-    /** Writes out every message logged before the request, then signals the requester. */
+    /**
+     * Writes out every message logged before the request, then signals the requester.
+     *
+     * <p>If the ring can't be drained that far because its head slot was claimed but not yet
+     * published (a producer between claiming and publishing: normally for microseconds, but for
+     * good if its {@code log()} call was cut off), this returns with the request still pending
+     * rather than spin here. The main loop waits for the slot with back-off, or gives up at close,
+     * and comes back to the request. Spinning here instead once wedged the worker for the life of
+     * the process after such a cut-off, with {@code close()} unable to finish.
+     */
     private void serveFlush() {
         long request = flushRequested.get();
         long target = ring.tail(); // read after the request, so it covers every log() that came before flush()
         while (ring.head() - target < 0) {
             if (drainBatch(clock.getAsLong()) == 0) {
-                spinThenYield(); // a producer is publishing a message we must include
+                return; // the head slot isn't published yet
             }
         }
         files.flushDirty(clock.getAsLong());

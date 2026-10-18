@@ -280,15 +280,20 @@ final class FileTable {
             }
         }
         Sink sink = null;
+        boolean reserved = false; // a maxFiles unit taken for the file this call creates
         try {
             int last = sinks.lastByte(f.path);
-            if (last < 0 && !fileBudget.tryCreate()) {
-                // The file doesn't exist yet and the logger is at its maxFiles limit: don't create
-                // another. Reopening a file that already exists (last >= 0) is always allowed.
-                budget.release();
-                f.state = FileState.CAPPED;
-                reportMaxFilesReached();
-                return;
+            if (last == SinkFactory.MISSING) {
+                if (!fileBudget.tryCreate()) {
+                    // The file doesn't exist yet and the logger is at its maxFiles limit: don't
+                    // create another. Reopening a file that already exists, even an empty one, is
+                    // always allowed.
+                    budget.release();
+                    f.state = FileState.CAPPED;
+                    reportMaxFilesReached();
+                    return;
+                }
+                reserved = true;
             }
             sink = openSink(f.path, now);
             if (last >= 0 && last != '\n') {
@@ -301,6 +306,13 @@ final class FileTable {
         } catch (IOException | RuntimeException e) { // see writeRaw
             if (sink != null) {
                 closeQuietly(sink);
+            }
+            if (reserved) {
+                // No file was created, so the unit goes back; otherwise every failed open of a new
+                // file during an outage would use up the cap for good. (Should the open have
+                // created the file and then failed, the retry finds it EMPTY and isn't charged, so
+                // the cap can be exceeded by that one file.)
+                fileBudget.release();
             }
             budget.release();
             f.state = FileState.FAILED;

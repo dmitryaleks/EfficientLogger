@@ -400,6 +400,51 @@ class FileTableTest {
         assertTrue(warnings(t).isEmpty(), "warned only once");
     }
 
+    /**
+     * Every failed open of a new file used to keep its maxFiles unit, and the retry a second later
+     * took another, so an outage could cap a long-running logger for good (review R3).
+     */
+    @Test
+    void aFailedOpenGivesItsMaxFilesReservationBack() {
+        fileBudget = new FileCreationBudget(2);
+        FileTable t = table(8192);
+        sinks.failNextOpen(file("a"), new IOException("denied"));
+        t.append("a", "{}", 0); // reserves a unit, then the open fails: the unit must come back
+        t.append("b", "{}", 0); // the first unit
+        assertEquals(1, t.lostIoError());
+
+        t.append("a", "{}", 1000 * MS); // the retry creates a: the second and last unit
+        t.append("c", "{}", 1000 * MS); // over the cap
+        t.flushDirty(1000 * MS);
+
+        assertEquals("{}\n", sinks.content(file("a")));
+        assertEquals("{}\n", sinks.content(file("b")));
+        assertNull(sinks.content(file("c")));
+        assertEquals(2, t.written());
+        assertEquals(1, t.droppedInvalidId(), "only c is capped");
+        List<String> w = warnings(t);
+        assertEquals(2, w.size(), w.toString());
+        assertTrue(w.get(0).startsWith("can't open " + file("a")), w.get(0));
+        assertTrue(w.get(1).contains("maxFiles"), w.get(1));
+    }
+
+    /** An existing file that happens to be empty is not a new file (review R3). */
+    @Test
+    void anExistingEmptyFileDoesNotCountAgainstMaxFiles() {
+        sinks.preset(file("a"), ""); // left by an earlier run that wrote nothing
+        fileBudget = new FileCreationBudget(1);
+        FileTable t = table(8192);
+        t.append("a", "{}", 0); // reopens the empty file: no unit used
+        t.append("b", "{}", 0); // the one new file
+        t.append("c", "{}", 0); // capped
+        t.flushDirty(0);
+
+        assertEquals("{}\n", sinks.content(file("a")));
+        assertEquals("{}\n", sinks.content(file("b")));
+        assertNull(sinks.content(file("c")));
+        assertEquals(1, t.droppedInvalidId());
+    }
+
     @Test
     void reopeningAnExistingFileDoesNotCountAgainstMaxFiles() {
         sinks.preset(file("a"), "{\"old\":1}\n"); // a already exists on disk

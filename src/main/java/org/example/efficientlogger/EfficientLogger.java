@@ -79,8 +79,16 @@ public interface EfficientLogger extends AutoCloseable {
      * and returns false at once. In synchronous mode it waits for writes in progress, and the
      * timeout doesn't apply.
      *
-     * @return true if everything was written and closed within the timeout. False if not yet, or if
-     *     the calling thread was interrupted (the interrupt flag stays set)
+     * <p>One thing can stop the queue from draining: a {@code log} call cut off by an error such as
+     * {@code StackOverflowError} between being admitted and queueing its message, or stalled there.
+     * Once the queue has made no progress for 2 seconds, the workers give up on what is left, warn,
+     * and close the files. Those messages are not written; they show in
+     * {@link LoggerStats#queuedMessages()} and, for the ones that had reached a queue,
+     * {@link LoggerStats#abandoned()}.
+     *
+     * @return true if everything was written and closed within the timeout. False if not yet, if
+     *     the calling thread was interrupted (the interrupt flag stays set), or if the workers gave
+     *     up on messages as described above
      */
     boolean close(Duration timeout);
 

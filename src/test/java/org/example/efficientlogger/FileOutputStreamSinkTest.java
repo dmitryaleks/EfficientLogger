@@ -30,7 +30,7 @@ class FileOutputStreamSinkTest {
     @Test
     void createsTheFileThenAppends() throws IOException {
         Path file = dir.resolve("a.json");
-        assertEquals(-1, FILES.lastByte(file), "missing");
+        assertEquals(SinkFactory.MISSING, FILES.lastByte(file));
 
         write(file, "ab\n");
         assertEquals('\n', FILES.lastByte(file));
@@ -41,9 +41,11 @@ class FileOutputStreamSinkTest {
     }
 
     @Test
-    void lastByteOfAnEmptyFileIsMinusOne() throws IOException {
+    void tellsAnEmptyFileFromAMissingOne() throws IOException {
         Path file = Files.createFile(dir.resolve("empty.json"));
-        assertEquals(-1, FILES.lastByte(file));
+        assertEquals(SinkFactory.EMPTY, FILES.lastByte(file));
+        Files.delete(file);
+        assertEquals(SinkFactory.MISSING, FILES.lastByte(file));
     }
 
     @Test

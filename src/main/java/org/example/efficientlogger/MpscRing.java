@@ -143,7 +143,10 @@ final class MpscRing {
         return (long) LONGS.getVolatile(cells, TAIL);
     }
 
-    /** Consumer only. */
+    /**
+     * Positions consumed so far. Consumer only while it runs; once it has stopped (and published
+     * that with a volatile write), other threads may read it too.
+     */
     long head() {
         return cells[HEAD];
     }
@@ -161,8 +164,17 @@ final class MpscRing {
      * Tests only: claims a slot and leaves it unpublished, as if a producer were cut off between
      * the tail claim and the publish (for example by a StackOverflowError inside {@link #offer}).
      * The consumer must not wedge on it.
+     *
+     * @return the claimed position, for {@link #publishForTest}
      */
-    void claimWithoutPublishingForTest() {
-        long unused = (long) LONGS.getAndAdd(cells, TAIL, 1L);
+    long claimWithoutPublishingForTest() {
+        return (long) LONGS.getAndAdd(cells, TAIL, 1L);
+    }
+
+    /** Tests only: publishes into a slot claimed with {@link #claimWithoutPublishingForTest}, as a slow producer would. */
+    void publishForTest(long position, String id, String json) {
+        int i = ((int) position & mask) << 1;
+        slots[i] = id;
+        SLOTS.setRelease(slots, i + 1, (Object) json);
     }
 }

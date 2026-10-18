@@ -185,7 +185,7 @@ On Windows `parkNanos` is about 16 ms granular. Don't use microsecond parks for 
   5. Remove the shutdown hook unless we are in it, so it can't leak the logger. Catch `IllegalStateException`.
   6. On timeout, warn "N still queued" and return false. The daemon workers keep draining.
 - **Workers alone** drain, flush and close their files. `close()` never touches FileTables; doing so would be a data race.
-- **Guarantee:** lines on disk == the number of `log()` calls that returned true (unless close timed out).
+- **Guarantee:** lines on disk == the number of `log()` calls that returned true (unless close timed out, or gave up: see the last "as built" note below).
 - **`flush`**
   - Per worker: a volatile `flushReq`/`flushDone` ticket pair plus a monitor. This is a cold path, so allocation is fine.
   - The caller increments `flushReq` and unparks the worker.
@@ -205,6 +205,7 @@ On Windows `parkNanos` is about 16 ms granular. Don't use microsecond parks for 
     1. A record ending exactly at the end of a file buffer left the next append starting past the encoder's limit. With assertions on, that tripped an assert. Without them, an empty message threw `ArrayIndexOutOfBoundsException`.
     2. `maxOpenFiles + EXTRA_ENTRIES` overflowed `int` for very large `maxOpenFiles`. It is now `Config.maxFileEntries`, capped at `Integer.MAX_VALUE`.
   - **Checking the checks.** With the worker's pre-sleep re-check removed, both lost-wakeup tests fail within 50 messages. With workers stopping at an empty ring instead of waiting for in-flight messages, `closeWaitsForAMessageAdmittedButNotYetQueued` fails deterministically; the close-race stress test alone didn't catch that.
+  - **Giving up at close (audit F7; review R1, R2).** A `log()` cut off (or stalled) between admission and publishing leaves the queue unable to drain. After close, a worker that sees the logger-wide queue make no progress for 2 s stops, so `close()` can't hang; `serveFlush` returns to the loop instead of spinning on such a slot, so a `flush()` can't wedge the worker either. The last worker to finish reports what was left, `close()` returns false, and `stats()` shows it as `queuedMessages` and, for messages that had reached a ring, `abandoned`, so `accepted == written + droppedInvalidId + lostIoError + abandoned` holds after close.
 
 ### 3.6 File I/O (shared by both modes): `FileTable`, `FileState`, `Sink`, `FileNamePattern`
 - **Sink.** `new FileOutputStream(path.toFile(), true)` behind a `Sink`/`SinkFactory` seam, so tests can inject faults.

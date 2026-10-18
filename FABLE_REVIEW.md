@@ -68,6 +68,19 @@ worth knowing. "Verified" means reproduced here against the compiled classes.
 | Q3 | `this` escapes the `AsyncLogger` constructor to the worker threads | Info | By reading |
 | Q4 | Repository hygiene: tracked IDE files, Kotlin leftovers, resolver plugin, signatures off | Info | Yes |
 
+### Status since the review
+
+R1 to R4 were fixed in the commit after this review's, with tests. Each probe was re-run against
+the new classes; the full build passes (386 tests, 5 skipped as POSIX-only; both allocation
+suites; no compiler warnings).
+
+| # | Status | What changed | Probe now |
+|---|---|---|---|
+| R1 | Fixed | `Worker.serveFlush` returns to the main loop when the head slot isn't published, leaving the request pending, instead of spinning; the loop's back-off and the close give-up then apply, and the request is served once the slot is published. Tests: `AsyncThreadsTest.aFlushBehindAnUnpublishedSlotTimesOutAndTheWorkerStillBacksOff` (real threads, CPU measured), `AsyncLoggerTest.aFlushRequestBehindAnUnpublishedSlotDoesNotStopTheWorkerLoop` (deterministic, including the slow producer publishing late and the flush then completing). | `flush(2 s)` false; worker `TIMED_WAITING`, 0 ms CPU in 1 s; `close(6 s)` false after 2.0 s; worker terminated |
+| R2 | Fixed | `close()` returns false when messages were left behind (`AsyncLogger.nothingLeft`). `LoggerStats` gained `abandoned`: slots claimed but never consumed, read once the worker has stopped, so `accepted == written + droppedInvalidId + lostIoError + abandoned` holds after close even when a stalled producer publishes late. The warning is emitted once, by the last worker to finish, with the exact count, and no longer asserts a fatal error; a sibling that merely stalled finishes with nothing left, so R8's false alarm is gone too. The 2 s give-up stays. README, the `close` and `LoggerStats` javadoc and `PLAN.md` §3.5 now describe it (D1). Test: `AsyncThreadsTest.closeGivesUpOnALogCallThatNeverArrivesAndReportsIt`; the two F7 tests now assert the new return value, warning and accounting. | `close(10 s)` false after 2.0 s; after the late publish `accepted=2, written=1, abandoned=1, queuedMessages=1`, and the identity holds |
+| R3 | Fixed | A failed open gives its `maxFiles` unit back (`FileCreationBudget.release`). `SinkFactory.lastByte` now distinguishes `MISSING` from `EMPTY`, so an existing empty file isn't charged. Tests: `FileTableTest.aFailedOpenGivesItsMaxFilesReservationBack`, `anExistingEmptyFileDoesNotCountAgainstMaxFiles`, `FileOutputStreamSinkTest.tellsAnEmptyFileFromAMissingOne`. | with `maxFiles(2)` and one failed open, `a` is created on the retry: files `[a.json, b.json]` |
+| R4 | Fixed | The benchmark's sink is now `NullDeviceSinks` (in `src/jmh`), which opens the null device itself instead of through the production factory. `NullDeviceSinksTest` opens it, and builds a logger on it in both modes to check that nothing is lost; for that, `test` compiles the benchmark sources (`testImplementation(sourceSets["jmh"].output)`). The README's figures weren't re-measured. | `gradlew jmhJar` then `throughput1` with `-p impl=efficient-async,efficient-sync -p output=null` (1 s warm-up, 1 s measured) completes with no "messages were lost" error: 10.8 M accepted/s async, 3.2 M/s sync, in line with the README |
+
 ## Correctness and robustness
 
 ### R1. `flush()` with an unpublished slot spins the worker forever and makes `close()` unable to finish (Medium)

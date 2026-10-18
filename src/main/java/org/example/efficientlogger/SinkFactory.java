@@ -6,6 +6,11 @@ import java.nio.file.Path;
 /** The logger's only contact with the file system, so tests can replace it. */
 interface SinkFactory {
 
+    /** {@link #lastByte} result: the file doesn't exist, so opening it will create it. */
+    int MISSING = -1;
+    /** {@link #lastByte} result: the file exists but is empty. */
+    int EMPTY = -2;
+
     /**
      * Opens {@code path} for appending, creating the file if needed. Must refuse anything that is
      * not a regular file (a symlink, FIFO, device or directory), so a file planted at the path
@@ -14,8 +19,9 @@ interface SinkFactory {
     Sink open(Path path) throws IOException;
 
     /**
-     * The last byte of {@code path} (0-255), or -1 if the file is empty or doesn't exist. Must
-     * refuse, rather than read, anything that is not a regular file.
+     * The last byte of {@code path} (0-255), {@link #EMPTY} if the file is empty, or
+     * {@link #MISSING} if it doesn't exist. Must refuse, rather than read, anything that is not a
+     * regular file.
      */
     int lastByte(Path path) throws IOException;
 

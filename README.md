@@ -70,7 +70,11 @@ Combining an async-only option with `synchronous()`, or `syncStripes` without it
   a warning handler, it starts closing and returns false at once. After `close()` returns true,
   the lines on disk are exactly the `log()` calls that returned true, less any that `stats()`
   counts as lost to an invalid ID or an I/O error (in async mode those are found after `log()`
-  has returned).
+  has returned). One thing can stop the queue from draining: a `log()` call cut off by an error
+  such as `StackOverflowError` between being admitted and queueing its message, or stalled there.
+  Once the queue has made no progress for 2 seconds, the workers give up on what is left, warn,
+  and close the files; `close()` then returns false, and the messages left behind are counted in
+  `stats()` as `queuedMessages` and, for those that had reached a queue, `abandoned`.
 - **IDs must make portable, safe file names.** The whole name must fit in 255 characters and
   bytes; `log()` rejects a longer ID at once, before queueing it. The name can't:
   - be empty, `.` or `..`, or a Windows device name such as `CON` or `NUL`
@@ -99,8 +103,9 @@ Combining an async-only option with `synchronous()`, or `syncStripes` without it
 - **Warnings** go to the `WarningHandler`, never to the caller as exceptions. A handler may call
   `log()`, `flush()` or `close()`.
 - **`stats()`** returns counters: accepted, written, dropped (queue full, too large, invalid ID),
-  lost to I/O errors, rejected after close, queued, and open files. Once a logger is closed,
-  `accepted == written + droppedInvalidId + lostIoError`.
+  lost to I/O errors, abandoned at close, rejected after close, queued, and open files. Once a
+  logger is closed, `accepted == written + droppedInvalidId + lostIoError + abandoned`, and
+  `abandoned` is 0 unless `close()` gave up as described above.
 
 ## Allocation and threads
 
@@ -263,8 +268,9 @@ the disk.
 ```
 
 `build` runs the unit, integration and stress tests, then the allocation tests in two separate
-JVMs (`allocationTest` and `allocationTestNoEA`). It passes on Windows 11 and on Ubuntu 24.04
-(WSL 2). It needs a JDK 17 installed locally: the build won't download one (see below), and the
+JVMs (`allocationTest` and `allocationTestNoEA`). The tests also check the benchmark's null-device
+sink against the library's file checks, so `test` compiles the benchmark sources too. It passes on
+Windows 11 and on Ubuntu 24.04 (WSL 2). It needs a JDK 17 installed locally: the build won't download one (see below), and the
 Gradle wrapper and every dependency are pinned by checksum (`gradle/wrapper/gradle-wrapper.properties`
 and `gradle/verification-metadata.xml`), so a tampered download fails the build. The library is
 `build/libs/EfficientLogger-1.0-SNAPSHOT.jar`, with no dependencies. Benchmarks run separately:

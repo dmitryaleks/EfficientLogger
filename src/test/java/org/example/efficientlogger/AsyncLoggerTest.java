@@ -311,6 +311,36 @@ class AsyncLoggerTest {
         assertEquals(100, logger.stats().queuedChars());
     }
 
+    // ---- flush ----
+
+    /**
+     * Serving a flush request used to spin until the ring reached the request's target, so one
+     * slot claimed but never published (a log() cut off between the claim and the publish) kept
+     * the worker inside it for good (review R1). It must give up and come back to the request.
+     */
+    @Test
+    void aFlushRequestBehindAnUnpublishedSlotDoesNotStopTheWorkerLoop() throws InterruptedException {
+        AsyncLogger logger = manual(builder().flushIntervalMillis(0));
+        Worker w = logger.worker(0);
+        assertTrue(logger.log("a", json(1)));
+        assertTrue(logger.admission().tryAcquire(json(2).length()) > 0); // a log() cut off: admitted, claimed...
+        long stuck = w.ring.claimWithoutPublishingForTest(); // ...but never published
+        assertTrue(logger.log("a", json(3)));
+        long ticket = w.requestFlush();
+
+        assertEquals(1, w.runOnce(), "takes the message before the slot and stops at it");
+        assertEquals(json(1) + "\n", content("a"), "which is still written out");
+        assertEquals(0, w.runOnce(), "returns rather than spinning on the slot");
+        assertFalse(w.awaitFlush(ticket, System.nanoTime()), "the flush is still pending");
+        assertEquals(2, logger.stats().queuedMessages());
+
+        w.ring.publishForTest(stuck, "a", json(2)); // the producer was only slow after all
+        assertEquals(2, w.runOnce(), "the flush is then served");
+        assertTrue(w.awaitFlush(ticket, System.nanoTime()));
+        assertEquals(json(1) + "\n" + json(2) + "\n" + json(3) + "\n", content("a"));
+        assertEquals(0, logger.stats().queuedMessages());
+    }
+
     // ---- closing ----
 
     @Test

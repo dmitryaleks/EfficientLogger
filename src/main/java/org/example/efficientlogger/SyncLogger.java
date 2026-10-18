@@ -121,7 +121,7 @@ final class SyncLogger implements EfficientLogger {
             invalidId += s.files.droppedInvalidId();
             lostIoError += s.files.lostIoError();
         }
-        return new LoggerStats(written + invalidId + lostIoError, written, 0, 0, invalidId, lostIoError,
+        return new LoggerStats(written + invalidId + lostIoError, written, 0, 0, invalidId, lostIoError, 0,
                 rejectedClosed.get(), 0, 0, budget.open());
     }
 

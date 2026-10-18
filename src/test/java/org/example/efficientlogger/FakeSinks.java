@@ -122,8 +122,11 @@ final class FakeSinks implements SinkFactory {
             throw new IOException("refusing to use " + path + ": not a regular file");
         }
         ByteArrayOutputStream content = contents.get(path);
-        if (content == null || content.size() == 0) {
-            return -1;
+        if (content == null) {
+            return MISSING;
+        }
+        if (content.size() == 0) {
+            return EMPTY;
         }
         byte[] bytes = content.toByteArray();
         return bytes[bytes.length - 1] & 0xFF;

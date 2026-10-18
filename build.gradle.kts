@@ -20,6 +20,10 @@ dependencies {
     testImplementation(platform("org.junit:junit-bom:5.13.4"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    // The benchmark's null-device sink bypasses the library's regular-file check on purpose, so a
+    // test (NullDeviceSinksTest) checks that a logger on it loses nothing; otherwise the benchmark
+    // could silently measure a logger that drops every message, as it once did.
+    testImplementation(sourceSets["jmh"].output)
 
     // Benchmarks only (src/jmh): log4j2 async loggers as a baseline.
     "jmhImplementation"("org.apache.logging.log4j:log4j-core:2.24.3")

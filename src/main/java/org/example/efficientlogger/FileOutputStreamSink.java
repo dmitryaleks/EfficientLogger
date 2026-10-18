@@ -92,20 +92,20 @@ final class FileOutputStreamSink implements Sink {
             try {
                 attrs = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
             } catch (NoSuchFileException e) {
-                return -1; // missing; it will be created
+                return MISSING; // it will be created
             }
             if (!attrs.isRegularFile()) {
                 throw new IOException("refusing to use " + path + ": not a regular file");
             }
             long length = attrs.size();
             if (length == 0) {
-                return -1;
+                return EMPTY;
             }
             try (RandomAccessFile file = new RandomAccessFile(path.toFile(), "r")) {
                 file.seek(length - 1);
                 return file.read();
             } catch (FileNotFoundException e) {
-                return -1; // removed since the stat; opening it will report any real problem
+                return MISSING; // removed since the stat; opening it will report any real problem
             }
         }
 

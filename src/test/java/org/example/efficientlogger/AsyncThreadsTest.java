@@ -522,52 +522,116 @@ class AsyncThreadsTest {
                 "queue recovered; dropped 5 messages (5 in total)"), warnings);
     }
 
-    // ---- a log() call cut off by a fatal error (audit F7) ----
+    // ---- a log() call cut off by a fatal error (audit F7; review R1, R2) ----
 
     @Test
     void aSlotLeftUnpublishedDoesNotWedgeOrBurnTheWorker() throws Exception {
         // A producer cut off between claiming a ring slot and publishing it leaves the slot null
         // forever. The worker can't drain past it, but it must not spin on a core, and close must
-        // still finish instead of hanging.
+        // still finish instead of hanging, and then say that not everything was written.
         AsyncLogger logger = start(builder().flushIntervalMillis(60_000), nullSinks());
-        logger.worker(0).ring.claimWithoutPublishingForTest();
+        cutOffLog(logger);
         assertTrue(logger.log("a", json(1)), "queued behind the unpublished slot, so never drained");
 
         Thread worker = logger.thread(0);
         await(() -> worker.getState() == Thread.State.WAITING || worker.getState() == Thread.State.TIMED_WAITING,
                 "the worker to back off from the stuck slot");
-        ThreadMXBean mx = ManagementFactory.getThreadMXBean();
-        if (mx.isThreadCpuTimeSupported() && mx.isThreadCpuTimeEnabled()) {
-            long before = mx.getThreadCpuTime(worker.getId());
-            LockSupport.parkNanos(MILLISECONDS.toNanos(500)); // a measuring window, not a wait for a result
-            long used = mx.getThreadCpuTime(worker.getId()) - before;
-            assertTrue(used < MILLISECONDS.toNanos(250), "the stuck worker used " + used / 1_000_000 + " ms of CPU in 500 ms");
-        }
+        assertLittleCpu(worker, "the stuck worker");
 
-        assertTrue(logger.close(WAIT), "close finishes once the queue stops draining, rather than hanging");
+        assertFalse(logger.close(WAIT), "close finishes once the queue stops draining, and reports what it gave up on");
         worker.join(WAIT.toMillis());
         assertFalse(worker.isAlive());
-        assertEquals(List.of("close stopped waiting with messages still queued; a log() call was probably cut off"
-                + " by a fatal error such as StackOverflowError, so its message never arrived"), warnings);
+        assertEquals(List.of(leftBehind(2)), warnings);
         assertEquals(List.of(), lines("a"), "the message behind the stuck slot was never written");
+        assertAccounted(logger.stats(), 2, 0, 2, 2);
     }
 
+    /**
+     * Serving a flush request used to spin on the unpublished slot forever: flush() timed out as
+     * it should, but the worker burned a core for good, and close() could never finish, not even
+     * by giving up, because the worker never got back to the loop that gives up (review R1).
+     */
     @Test
-    void anAdmittedMessageThatNeverReachesARingDoesNotHangClose() throws Exception {
-        // A producer cut off after being admitted but before claiming a ring slot leaves the queue
-        // size permanently above zero, with nothing in any ring to drain.
+    void aFlushBehindAnUnpublishedSlotTimesOutAndTheWorkerStillBacksOff() throws Exception {
+        AsyncLogger logger = start(builder().flushIntervalMillis(60_000), nullSinks());
+        cutOffLog(logger);
+        assertTrue(logger.log("a", json(1)));
+        assertFalse(logger.flush(Duration.ofMillis(300)), "the message behind the stuck slot can't be flushed");
+
+        Thread worker = logger.thread(0);
+        await(() -> worker.getState() == Thread.State.WAITING || worker.getState() == Thread.State.TIMED_WAITING,
+                "the worker to back off from the stuck slot after the flush request");
+        assertLittleCpu(worker, "the worker with a pending flush");
+
+        assertFalse(logger.close(WAIT), "close gives up on the stuck queue rather than hang");
+        worker.join(WAIT.toMillis());
+        assertFalse(worker.isAlive());
+        assertEquals(List.of(leftBehind(2)), warnings);
+        assertAccounted(logger.stats(), 2, 0, 2, 2);
+    }
+
+    /**
+     * A producer cut off after being admitted but before claiming a ring slot leaves the queue
+     * size above zero with nothing in any ring to drain. close() gives up after 2 s, says so, and
+     * returns false. If that producer was merely stalled and resumes, its log() returns true, but
+     * no worker is left to write the message: it is counted as abandoned, not lost silently
+     * (review R2).
+     */
+    @Test
+    void closeGivesUpOnALogCallThatNeverArrivesAndReportsIt() throws Exception {
         AsyncLogger logger = start(builder());
         assertTrue(logger.log("a", json(1)));
         assertTrue(logger.flush(WAIT));
-        assertEquals(1, logger.worker(0).files.written());
-
-        assertTrue(logger.admission().tryAcquire(5) > 0, "simulate an admitted-but-unpublished message");
+        String late = json(2);
+        long admitted = logger.admission().tryAcquire(late.length()); // the first half of log(); the caller now stalls
+        assertTrue(admitted > 0);
         assertEquals(1, logger.stats().queuedMessages(), "it shows as still queued");
 
-        assertTrue(logger.close(WAIT), "close finishes within the grace instead of waiting forever");
-        assertEquals(List.of("close stopped waiting with messages still queued; a log() call was probably cut off"
-                + " by a fatal error such as StackOverflowError, so its message never arrived"), warnings);
+        long start = System.nanoTime();
+        assertFalse(logger.close(WAIT), "close finishes within the grace instead of waiting forever, and says not"
+                + " everything was written");
+        assertTrue(System.nanoTime() - start < WAIT.toNanos() / 2, "close gave up well before its timeout");
+        assertEquals(List.of(leftBehind(1)), warnings);
+        assertAccounted(logger.stats(), 1, 1, 0, 1);
+
+        logger.worker(0).ring.offer("a", late, admitted); // the stalled caller resumes: the second half of log()
+        assertAccounted(logger.stats(), 2, 1, 1, 1);
         assertEquals(List.of(json(1)), lines("a"));
+        assertFalse(logger.close(Duration.ZERO), "a later close still says so");
+        assertEquals(1, warnings.size(), "and doesn't warn again");
+    }
+
+    /** What log() does before publishing: admission, then the slot claim. Cut off before the publish. */
+    private static void cutOffLog(AsyncLogger logger) {
+        assertTrue(logger.admission().tryAcquire(json(0).length()) > 0);
+        logger.worker(0).ring.claimWithoutPublishingForTest();
+    }
+
+    /** The warning the last worker emits when it finishes with messages still queued. */
+    private static String leftBehind(int n) {
+        return "close stopped waiting: " + (n == 1 ? "1 message was" : n + " messages were") + " still queued after 2 s"
+                + " without progress, because a log() call was cut off (for example by a StackOverflowError) or stalled"
+                + " between being admitted and queueing its message. " + (n == 1 ? "It" : "They")
+                + " won't be written; see stats().queuedMessages() and abandoned()";
+    }
+
+    private static void assertAccounted(LoggerStats s, long accepted, long written, long abandoned, long queued) {
+        assertEquals(accepted, s.accepted(), s::toString);
+        assertEquals(written, s.written(), s::toString);
+        assertEquals(abandoned, s.abandoned(), s::toString);
+        assertEquals(queued, s.queuedMessages(), s::toString);
+        assertEquals(s.accepted(), s.written() + s.droppedInvalidId() + s.lostIoError() + s.abandoned(), s::toString);
+    }
+
+    /** The thread must be waiting, not polling hard: at most half a core over half a second. */
+    private static void assertLittleCpu(Thread thread, String what) {
+        ThreadMXBean mx = ManagementFactory.getThreadMXBean();
+        if (mx.isThreadCpuTimeSupported() && mx.isThreadCpuTimeEnabled()) {
+            long before = mx.getThreadCpuTime(thread.getId());
+            LockSupport.parkNanos(MILLISECONDS.toNanos(500)); // a measuring window, not a wait for a result
+            long used = mx.getThreadCpuTime(thread.getId()) - before;
+            assertTrue(used < MILLISECONDS.toNanos(250), what + " used " + used / 1_000_000 + " ms of CPU in 500 ms");
+        }
     }
 
     // ---- waking the worker ----
@@ -904,7 +968,7 @@ class AsyncThreadsTest {
 
         @Override
         public int lastByte(Path path) {
-            return -1;
+            return MISSING;
         }
 
         @Override

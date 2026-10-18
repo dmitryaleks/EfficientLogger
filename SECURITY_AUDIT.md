@@ -87,6 +87,7 @@ below was re-run against the new jar.
 | F3 | Mostly fixed | New `maxFiles(int)` option caps how many new files the logger creates; beyond it, messages for IDs without a file are dropped and counted, with one warning. Reopening an existing file doesn't count, so a bounded ID set never trips it. The docs now tell callers to use IDs from a bounded set. | With `maxFiles(2)`, a third distinct ID's file is never created; re-logging an existing ID is unaffected |
 | F9 | Fixed | New `normalizeIds()` option canonicalizes each ID (Unicode NFC then lower-case) before routing and naming, so IDs a case- or normalization-insensitive file system treats as one name share a file and a worker instead of racing across workers. The docs explain the disclosure risk and the option. Off by default (unchanged behaviour, no hot-path allocation). | With `normalizeIds()`, `Foo`/`FOO`/`foo` and the NFC/NFD forms of `café` each land in one file in order |
 | F18 | Fixed | The ID-to-worker/stripe mapping now mixes in a per-logger random seed, so IDs from untrusted input can't be crafted to all land on one worker or one sync lock without knowing the seed. The seed is chosen at build; a given ID still always maps to the same worker for that logger. One XOR on the hot path, no allocation. | With different seeds the same ID routes to different workers; a disabled-seed build fails the routing test |
+| F16 | Fixed | A `close()` that times out inside the shutdown hook now warns the messages "won't be written: the JVM is exiting" rather than "will be written in the background", which is false there. A direct close keeps the background wording. | Running the hook's body against a stalled worker emits the exit wording |
 | F7 | Fixed | The worker now backs off to a timed poll on a slot a cut-off `log()` call never published, instead of spinning a core, and `close()` gives up after the queue stops draining for 2 s instead of waiting forever, with a warning. The worker loop can no longer be exited by an error, and a worker that does stop closes the logger. | A simulated cut-off producer no longer pegs a core, and `close()` finishes |
 | F13 | Fixed (with F7) | The worker's error handling can no longer throw its way out of the loop, and if a worker thread ever stops while the logger is open, admission is closed and a warning is emitted. | Covered by the F7 tests and the existing error-path tests |
 | F4 | Fixed | `log()` rejects an ID that can't fit in a file name with one length comparison, before queueing or locking. It is counted in `droppedInvalidId` and warned about once. Invalid IDs are no longer copied into a file name first, and those kept as entries are at most 255 chars. | The 50-million-char ID is rejected at once |
@@ -590,7 +591,16 @@ neither feature, and the library jar doesn't include log4j. Bump it to 2.25.4 or
 so scanners stay quiet. JUnit 5.13.4 is past the fix for CVE-2025-53103 (fixed in 5.13.2). The
 Disruptor and JMH weren't checked in depth.
 
-### F16. A timed-out close in the shutdown hook promises writes that won't happen — Info
+### F16. A timed-out close in the shutdown hook promises writes that won't happen — Info (fixed)
+
+**Fixed:** when `close()` is called from the shutdown hook and times out, the warning now says
+"the remaining N messages won't be written: the JVM is exiting" instead of "will be written in the
+background", since the JVM halts once the hooks return. A direct `close()` that times out still
+says "will be written in the background", because its daemon workers do keep draining. Verified by
+running the hook's body against a stalled worker.
+
+Original finding:
+
 
 `AsyncLogger.close` (`AsyncLogger.java:171-175`) warns that "the remaining N messages will be
 written in the background". When it is called from the shutdown hook

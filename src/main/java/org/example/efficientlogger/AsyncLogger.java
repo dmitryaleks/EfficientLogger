@@ -177,6 +177,19 @@ final class AsyncLogger implements EfficientLogger {
 
     @Override
     public boolean close(Duration timeout) {
+        return close(timeout, false);
+    }
+
+    @Override
+    public void close() {
+        close(closeTimeout, false);
+    }
+
+    /**
+     * @param jvmExiting true when called from the shutdown hook: a timeout then means the messages
+     *     are lost, because the JVM halts once the hooks return, rather than written in the background
+     */
+    private boolean close(Duration timeout, boolean jvmExiting) {
         long timeoutNanos = saturatedNanos(timeout);
         admission.close(); // from here on log() returns false; idempotent
         if (threads == null) {
@@ -198,16 +211,13 @@ final class AsyncLogger implements EfficientLogger {
             return false;
         }
         if (!done) {
+            String fate = jvmExiting
+                    ? "won't be written: the JVM is exiting"
+                    : "will be written in the background";
             warnings.emit("close didn't finish within " + TimeUnit.NANOSECONDS.toMillis(timeoutNanos)
-                    + " ms; the remaining " + messages(Admission.messages(admission.get()))
-                    + " will be written in the background", null);
+                    + " ms; the remaining " + messages(Admission.messages(admission.get())) + " " + fate, null);
         }
         return done;
-    }
-
-    @Override
-    public void close() {
-        close(closeTimeout);
     }
 
     /** For tests that run the workers by hand. */
@@ -304,7 +314,7 @@ final class AsyncLogger implements EfficientLogger {
     }
 
     private void registerShutdownHook(int loggerNumber) {
-        Thread hook = new Thread(() -> close(), "efficient-logger-" + loggerNumber + "-shutdown");
+        Thread hook = new Thread(() -> close(closeTimeout, true), "efficient-logger-" + loggerNumber + "-shutdown");
         try {
             Runtime.getRuntime().addShutdownHook(hook);
             shutdownHook.set(hook);

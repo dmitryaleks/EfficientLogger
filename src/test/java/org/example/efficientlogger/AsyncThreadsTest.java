@@ -223,6 +223,25 @@ class AsyncThreadsTest {
         assertNull(logger.shutdownHook());
     }
 
+    @Test
+    void theShutdownHookSaysMessagesAreLostIfItTimesOut() throws Exception {
+        Gate gate = gate(1);
+        AsyncLogger logger = startGated(builder().closeTimeout(Duration.ofMillis(200)), gate);
+        for (int i = 0; i < 10; i++) {
+            logger.log("a", json(i));
+        }
+        Thread hook = logger.shutdownHook();
+        assertNotNull(hook);
+        hook.run(); // the hook's body, on this thread: the JVM-is-exiting close path, which times out
+
+        assertEquals(List.of("close didn't finish within 200 ms; the remaining 10 messages won't be written:"
+                + " the JVM is exiting"), warnings);
+
+        gate.open(); // let the test clean up normally
+        assertTrue(logger.close(WAIT));
+        assertEquals(jsons(0, 10), lines("a"));
+    }
+
     /**
      * Producers keep logging while the logger is closed. The lines on disk must be exactly the
      * messages whose {@code log} returned true: none lost, none extra, each ID's lines in order.

@@ -78,6 +78,11 @@ final class MpscRing {
         consumer = thread;
     }
 
+    /** Wakes the consumer whatever its state, e.g. for close or flush. */
+    void wakeConsumer() {
+        LockSupport.unpark(consumer);
+    }
+
     /**
      * Publishes a message. Call only after {@link Admission#tryAcquire} admitted it, and pass the
      * admission word it returned; that decides whether a TIMED consumer is worth waking. Nothing

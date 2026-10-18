@@ -1,6 +1,6 @@
 # EfficientLogger — Implementation Plan
 
-> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M5 done: sync mode is usable through `EfficientLogger.builder(...).synchronous().build()`, and the async queue core (`Admission`, `MpscRing`) is built and stress-tested. Until M6, `build()` without `synchronous()` throws `UnsupportedOperationException`. Next: M6 (`Worker`, `AsyncLogger`, `OverflowTracker`).
+> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M6 done. Sync mode is usable through `EfficientLogger.builder(...).synchronous().build()`. Async mode is fully written and passes its by-hand tests, but public `build()` still rejects it until M7's multi-threaded tests pass. Next: M7.
 
 ## 1. Context
 Today the user writes multiple JSON log files through log4j, appending across restarts.
@@ -310,8 +310,8 @@ On Windows `parkNanos` is about 16 ms granular. Don't use microsecond parks for 
 | M3 | `Sink`, `FileState`, `FileTable` (single-threaded) | Fake sink and fake clock: open, newline repair, append, flush, LRU, budget, errors, buffer pool |
 | M4 | `SyncLogger` + public facade | Sync integration tests pass. **First usable release.** |
 | M5 | `Admission`, `MpscRing` | Ring/admission concurrency and stress tests (no files) |
-| M6 | `Worker`, `AsyncLogger`, `OverflowTracker` in manual-step mode (no threads) | Deterministic drain, deadline, episode and close-drain tests |
-| M7 | Real threads: idle protocol, `flush`, `close`, shutdown hook, interrupt resilience | Lost-wakeup and close-linearizability stress tests |
+| M6 | `Worker`, `AsyncLogger`, `OverflowTracker`, all code including the thread loop, idle protocol, `flush`, `close` and shutdown hook. Tests drive the workers by hand (`startThreads=false`). | Deterministic drain, deadline, episode and close-drain tests |
+| M7 | Real threads: tests for the idle protocol, `flush`, `close`, shutdown hook and interrupt resilience. Then public `build()` accepts async mode. | Lost-wakeup and close-linearizability stress tests |
 | M8 | I/O error paths end to end | Rate limiting, EMFILE, deleted directory |
 | M9 | Allocation tests | `allocationTest` and `allocationTestNoEA` pass |
 | M10 (optional) | JMH (`me.champeau.jmh`): 1/4/8 producers, `-prof gc`, compared with a synchronized BufferedWriter per file, optionally log4j2 async + RoutingAppender; README | Benchmark report |

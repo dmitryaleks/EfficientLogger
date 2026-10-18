@@ -1,0 +1,361 @@
+package org.example.efficientlogger;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import org.junit.jupiter.api.Test;
+
+/**
+ * Async mode with the workers run by hand on a fake clock: every step is deterministic. The same
+ * code under real threads is tested in AsyncThreadsTest.
+ */
+class AsyncLoggerTest {
+
+    private static final long MS = 1_000_000L;
+
+    private final Path dir = Paths.get("fake-async-logs").toAbsolutePath().normalize();
+    private final FakeSinks sinks = new FakeSinks(dir);
+    private final long[] now = {0};
+    private final List<String> warnings = new ArrayList<>();
+    private int batchSize; // 0: the logger's own
+    private long ringStartIndex;
+
+    private EfficientLoggerBuilder builder() {
+        return EfficientLogger.builder(dir, "{id}.json")
+                .warningHandler((message, cause) -> warnings.add(cause == null ? message : message + " | " + cause.getMessage()));
+    }
+
+    /** An async logger whose workers run only when the test calls them. */
+    private AsyncLogger manual(EfficientLoggerBuilder b) {
+        TestHooks hooks = new TestHooks();
+        hooks.startThreads = false;
+        hooks.sinks = sinks;
+        hooks.nanoClock = () -> now[0];
+        hooks.batchSize = batchSize;
+        hooks.ringStartIndex = ringStartIndex;
+        return (AsyncLogger) b.build(hooks);
+    }
+
+    /** What the worker threads do after close: drain until nothing admitted is left, then finish. */
+    private static void drainAndFinish(AsyncLogger logger) {
+        while (!logger.worker(0).closedAndDrained()) {
+            for (int i = 0; i < logger.workerCount(); i++) {
+                logger.worker(i).runOnce();
+            }
+        }
+        for (int i = 0; i < logger.workerCount(); i++) {
+            logger.worker(i).finish();
+        }
+    }
+
+    private String content(String id) {
+        return sinks.content(dir.resolve(id + ".json"));
+    }
+
+    private static String json(int n) {
+        return "{\"n\":" + n + "}";
+    }
+
+    // ---- queueing and writing ----
+
+    @Test
+    void logQueuesAndTheWorkerWritesOnceTheFlushIntervalHasPassed() {
+        AsyncLogger logger = manual(builder());
+        assertTrue(logger.log("a", json(1)));
+        assertTrue(logger.log("a", json(2)));
+        assertTrue(logger.log("b", json(3)));
+        assertTrue(sinks.writes.isEmpty(), "log() only queues");
+        LoggerStats s = logger.stats();
+        assertEquals(3, s.accepted());
+        assertEquals(3, s.queuedMessages());
+        assertEquals(21, s.queuedChars());
+
+        Worker w = logger.worker(0);
+        assertEquals(3, w.runOnce());
+        assertEquals(0, logger.stats().queuedMessages());
+        assertTrue(sinks.writes.isEmpty(), "buffered until the oldest record has waited 100 ms");
+
+        now[0] = 99 * MS;
+        w.runOnce();
+        assertTrue(sinks.writes.isEmpty());
+
+        now[0] = 100 * MS;
+        assertEquals(0, w.runOnce());
+        assertEquals(json(1) + "\n" + json(2) + "\n", content("a"));
+        assertEquals(json(3) + "\n", content("b"));
+        assertEquals(3, logger.stats().written());
+    }
+
+    @Test
+    void aZeroFlushIntervalWritesAfterEveryBatch() {
+        AsyncLogger logger = manual(builder().flushIntervalMillis(0));
+        logger.log("a", json(1));
+        logger.worker(0).runOnce();
+        assertEquals(json(1) + "\n", content("a"));
+    }
+
+    @Test
+    void eachIdIsWrittenByOneWorker() {
+        AsyncLogger logger = manual(builder().workerThreads(3).flushIntervalMillis(0));
+        for (int i = 0; i < 30; i++) {
+            logger.log("id" + i, json(i));
+        }
+
+        logger.worker(1).runOnce();
+        for (int i = 0; i < 30; i++) {
+            boolean ownedByWorker1 = Hashing.index(("id" + i).hashCode(), 3) == 1;
+            if (ownedByWorker1) {
+                assertEquals(json(i) + "\n", content("id" + i));
+            } else {
+                assertNull(content("id" + i), "id" + i + " belongs to another worker");
+            }
+        }
+
+        logger.worker(0).runOnce();
+        logger.worker(2).runOnce();
+        for (int i = 0; i < 30; i++) {
+            assertEquals(json(i) + "\n", content("id" + i));
+        }
+    }
+
+    @Test
+    void batchesAreAQuarterOfTheQueueUpTo256() {
+        AsyncLogger logger = manual(builder().maxQueuedMessages(1000));
+        for (int i = 0; i < 600; i++) {
+            logger.log("a", json(i));
+        }
+        Worker w = logger.worker(0);
+        assertEquals(250, w.runOnce());
+        assertEquals(250, w.runOnce());
+        assertEquals(100, w.runOnce());
+        assertEquals(0, w.runOnce());
+    }
+
+    @Test
+    void positionsPastIntMaxValueWork() {
+        ringStartIndex = (1L << 31) - 3;
+        AsyncLogger logger = manual(builder().maxQueuedMessages(8).flushIntervalMillis(0));
+        StringBuilder expected = new StringBuilder();
+        for (int i = 0; i < 20; i++) {
+            assertTrue(logger.log("a", json(i)));
+            expected.append(json(i)).append('\n');
+            logger.worker(0).runOnce();
+        }
+        assertEquals(expected.toString(), content("a"));
+        assertEquals(20, logger.stats().accepted());
+    }
+
+    @Test
+    void nullArgumentsThrowBeforeAnythingChanges() {
+        AsyncLogger logger = manual(builder());
+        assertThrows(NullPointerException.class, () -> logger.log(null, "{}"));
+        assertThrows(NullPointerException.class, () -> logger.log("a", null));
+        LoggerStats s = logger.stats();
+        assertEquals(0, s.accepted());
+        assertEquals(0, s.queuedMessages());
+        assertEquals(0, logger.droppedCount());
+    }
+
+    // ---- the queue limits ----
+
+    @Test
+    void dropsWhenFullAndWarnsOncePerEpisode() {
+        AsyncLogger logger = manual(builder().maxQueuedMessages(8)); // batches of 2; half empty at 4
+        Worker w = logger.worker(0);
+        assertEquals(8, logCounting(logger, 10));
+        assertEquals(2, logger.droppedCount());
+        assertEquals(2, logger.stats().droppedQueueFull());
+        assertTrue(warnings.isEmpty(), "producers never warn");
+
+        w.runOnce(); // 6 queued
+        assertEquals(1, warnings.size(), warnings.toString());
+        assertTrue(warnings.get(0).startsWith("queue full (maxQueuedMessages=8, maxQueuedChars=16777216)"), warnings.get(0));
+
+        w.runOnce(); // 4 queued: half empty
+        assertEquals("queue recovered; dropped 2 messages (2 in total)", warnings.get(1));
+
+        // A second episode.
+        assertEquals(4, logCounting(logger, 6));
+        w.runOnce();
+        assertEquals(3, warnings.size(), warnings.toString());
+        assertTrue(warnings.get(2).startsWith("queue full"), warnings.get(2));
+        w.runOnce();
+        assertEquals("queue recovered; dropped 2 messages (4 in total)", warnings.get(3));
+
+        while (w.runOnce() > 0) {
+            // drain the rest
+        }
+        assertEquals(4, warnings.size(), warnings.toString());
+    }
+
+    @Test
+    void dropsWhileStillAboveHalfAddNoWarnings() {
+        batchSize = 2;
+        AsyncLogger logger = manual(builder().maxQueuedMessages(64)); // half empty at 32
+        Worker w = logger.worker(0);
+        assertEquals(64, logCounting(logger, 70));
+        w.runOnce(); // 62 queued: the episode starts
+        assertEquals(1, warnings.size(), warnings.toString());
+
+        assertEquals(2, logCounting(logger, 5)); // 3 more dropped, 9 in all
+        while (logger.stats().queuedMessages() > 34) {
+            w.runOnce();
+        }
+        assertEquals(1, warnings.size(), "no warnings while above half: " + warnings);
+
+        w.runOnce(); // 32 queued
+        assertEquals("queue recovered; dropped 9 messages (9 in total)", warnings.get(1));
+    }
+
+    @Test
+    void aMessageLongerThanMaxQueuedCharsIsDropped() {
+        AsyncLogger logger = manual(builder().maxQueuedChars(100));
+        assertFalse(logger.log("a", "x".repeat(101)));
+        assertTrue(logger.log("a", "x".repeat(100)));
+        LoggerStats s = logger.stats();
+        assertEquals(1, s.droppedTooLarge());
+        assertEquals(0, s.droppedQueueFull());
+        assertEquals(1, logger.droppedCount());
+
+        logger.worker(0).runOnce();
+        logger.worker(0).runOnce();
+        assertEquals(2, warnings.size(), warnings.toString());
+        assertEquals("queue recovered; dropped 1 message (1 in total)", warnings.get(1));
+    }
+
+    @Test
+    void theCharLimitCoversTheWholeQueue() {
+        AsyncLogger logger = manual(builder().maxQueuedChars(100).workerThreads(2));
+        String thirty = "x".repeat(30);
+        assertTrue(logger.log("a", thirty));
+        assertTrue(logger.log("b", thirty));
+        assertTrue(logger.log("c", thirty));
+        assertFalse(logger.log("d", thirty));
+        assertTrue(logger.log("d", "x".repeat(10)));
+        assertEquals(100, logger.stats().queuedChars());
+    }
+
+    // ---- closing ----
+
+    @Test
+    void closeStopsAcceptingAndTheWorkerDrainsEverything() {
+        AsyncLogger logger = manual(builder());
+        StringBuilder expected = new StringBuilder();
+        for (int i = 0; i < 5; i++) {
+            logger.log("a", json(i));
+            expected.append(json(i)).append('\n');
+        }
+
+        assertFalse(logger.close(Duration.ZERO), "the workers haven't finished yet");
+        assertFalse(logger.log("a", json(99)));
+        assertEquals(1, logger.stats().rejectedClosed());
+        assertEquals(0, logger.droppedCount(), "rejected after close isn't a drop");
+
+        drainAndFinish(logger);
+
+        assertEquals(expected.toString(), content("a"));
+        assertEquals(0, sinks.openNow);
+        assertTrue(logger.worker(0).terminated());
+        assertTrue(logger.close(Duration.ZERO), "finished now");
+        assertTrue(warnings.isEmpty(), warnings.toString());
+    }
+
+    @Test
+    void afterCloseEachWorkerWaitsUntilAllAreDrained() {
+        AsyncLogger logger = manual(builder().workerThreads(3));
+        for (int i = 0; i < 30; i++) {
+            logger.log("id" + i, json(i));
+        }
+        logger.close(Duration.ZERO);
+
+        while (logger.worker(0).runOnce() > 0) {
+            // drain worker 0's own ring
+        }
+        assertFalse(logger.worker(0).closedAndDrained(), "the other workers still hold messages");
+
+        drainAndFinish(logger);
+        for (int i = 0; i < 30; i++) {
+            assertEquals(json(i) + "\n", content("id" + i));
+        }
+    }
+
+    @Test
+    void dropsNotYetReportedAtCloseAreReported() {
+        batchSize = 8;
+        AsyncLogger logger = manual(builder().maxQueuedMessages(8));
+        assertEquals(8, logCounting(logger, 10));
+        logger.close(Duration.ZERO);
+
+        drainAndFinish(logger); // one batch takes all 8, so the episode's recovery check never runs
+
+        assertEquals(2, warnings.size(), warnings.toString());
+        assertTrue(warnings.get(0).startsWith("queue full"), warnings.get(0));
+        assertEquals("dropped 2 messages before close (2 in total)", warnings.get(1));
+    }
+
+    // ---- errors ----
+
+    @Test
+    void statsAddUpOnceDrained() {
+        AsyncLogger logger = manual(builder().flushIntervalMillis(0));
+        sinks.failNextWrite(dir.resolve("b.json"), new IOException("disk full"));
+        assertTrue(logger.log("a", json(1)));
+        assertTrue(logger.log("b", json(2)));
+        assertTrue(logger.log("bad/id", json(3)), "accepted now, dropped by the worker");
+        assertTrue(logger.log("a", json(4)));
+        logger.close(Duration.ZERO);
+        drainAndFinish(logger);
+
+        LoggerStats s = logger.stats();
+        assertEquals(4, s.accepted());
+        assertEquals(2, s.written());
+        assertEquals(1, s.droppedInvalidId());
+        assertEquals(1, s.lostIoError());
+        assertEquals(s.accepted(), s.written() + s.droppedInvalidId() + s.lostIoError());
+        assertEquals(0, s.queuedMessages());
+        assertEquals(0, s.openFiles());
+    }
+
+    @Test
+    void anUnexpectedErrorDropsOnlyThatMessage() {
+        // A 64-byte buffer holds one of these records, so the second one forces a write, which fails.
+        AsyncLogger logger = manual(builder().fileBufferBytes(64));
+        sinks.failNextWrite(dir.resolve("a.json"), new IllegalStateException("bug"));
+        logger.log("a", record(1));
+        logger.log("a", record(2));
+        logger.log("a", record(3));
+        logger.worker(0).runOnce();
+
+        assertEquals(List.of("unexpected error writing a message for id \"a\"; it was dropped | bug"), warnings);
+
+        logger.close(Duration.ZERO);
+        drainAndFinish(logger);
+        assertEquals(record(1) + "\n" + record(3) + "\n", content("a"));
+        assertEquals(2, logger.stats().written());
+        assertEquals(1, logger.stats().lostIoError());
+    }
+
+    private static String record(int n) {
+        return "{\"n\":" + n + ",\"pad\":\"" + "x".repeat(36) + "\"}"; // 50 chars
+    }
+
+    /** Logs {@code n} messages to "a" and returns how many were accepted. */
+    private static int logCounting(AsyncLogger logger, int n) {
+        int accepted = 0;
+        for (int i = 0; i < n; i++) {
+            if (logger.log("a", json(i))) {
+                accepted++;
+            }
+        }
+        return accepted;
+    }
+}

@@ -22,7 +22,7 @@ final class FakeSinks implements SinkFactory {
     private final Map<Path, ByteArrayOutputStream> contents = new HashMap<>();
     private final Set<Path> directories = new HashSet<>();
     private final Map<Path, ArrayDeque<IOException>> openFailures = new HashMap<>();
-    private final Map<Path, ArrayDeque<IOException>> writeFailures = new HashMap<>();
+    private final Map<Path, ArrayDeque<Exception>> writeFailures = new HashMap<>();
 
     final List<Write> writes = new ArrayList<>();
     int opens;
@@ -55,7 +55,11 @@ final class FakeSinks implements SinkFactory {
         openFailures.computeIfAbsent(path, p -> new ArrayDeque<>()).add(e);
     }
 
-    void failNextWrite(Path path, IOException e) {
+    /** The next write to {@code path} throws {@code e}: an IOException, or an unchecked exception. */
+    void failNextWrite(Path path, Exception e) {
+        if (!(e instanceof IOException) && !(e instanceof RuntimeException)) {
+            throw new IllegalArgumentException("a write can only throw IOException or unchecked exceptions");
+        }
         writeFailures.computeIfAbsent(path, p -> new ArrayDeque<>()).add(e);
     }
 
@@ -93,8 +97,8 @@ final class FakeSinks implements SinkFactory {
         return directories.add(dir);
     }
 
-    private static IOException poll(Map<Path, ArrayDeque<IOException>> failures, Path path) {
-        ArrayDeque<IOException> queue = failures.get(path);
+    private static <E extends Exception> E poll(Map<Path, ArrayDeque<E>> failures, Path path) {
+        ArrayDeque<E> queue = failures.get(path);
         return queue == null ? null : queue.poll();
     }
 
@@ -111,9 +115,12 @@ final class FakeSinks implements SinkFactory {
             if (closed) {
                 throw new AssertionError("write after close: " + path);
             }
-            IOException failure = poll(writeFailures, path);
+            Exception failure = poll(writeFailures, path);
+            if (failure instanceof IOException) {
+                throw (IOException) failure;
+            }
             if (failure != null) {
-                throw failure;
+                throw (RuntimeException) failure;
             }
             contents.get(path).write(b, off, len);
             writes.add(new Write(path, new String(b, off, len, UTF_8), len));

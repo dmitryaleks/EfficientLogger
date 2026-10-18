@@ -10,7 +10,7 @@ package org.example.efficientlogger;
  * @param droppedTooLarge dropped because the message alone was longer than maxQueuedChars
  * @param droppedInvalidId dropped because the id can't be used in a file name
  * @param lostIoError lost to I/O errors, including messages dropped while a failed file waits
- *     to be retried
+ *     to be retried (and, should one ever happen, to unexpected internal errors)
  * @param rejectedClosed {@code log} calls made after close
  * @param queuedMessages waiting in the queue
  * @param queuedChars total length, in chars, of the messages waiting in the queue

@@ -205,6 +205,11 @@ final class FileTable {
         return (long) LONGS.getOpaque(counters, LOST_IO_ERROR);
     }
 
+    /** Counts records the owner lost to an unexpected error. */
+    void countLost(long records) {
+        add(LOST_IO_ERROR, records);
+    }
+
     /** Records dropped because their ID can't be a file name. */
     long droppedInvalidId() {
         return (long) LONGS.getOpaque(counters, DROPPED_INVALID_ID);

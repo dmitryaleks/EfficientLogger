@@ -177,20 +177,21 @@ public final class EfficientLoggerBuilder {
      * @throws UncheckedIOException if the directory can't be created
      */
     public EfficientLogger build() {
+        if (!synchronous) {
+            // Built and unit-tested (M6); switched on once the multi-threaded tests pass (M7).
+            throw new UnsupportedOperationException("asynchronous mode isn't available yet; use synchronous()");
+        }
         return build(new TestHooks());
     }
 
     EfficientLogger build(TestHooks hooks) {
         Config config = buildConfig();
-        if (!config.synchronous) {
-            throw new UnsupportedOperationException("asynchronous mode isn't implemented yet; use synchronous()");
-        }
         try {
             hooks.sinks.createDirectoryIfMissing(config.directory);
         } catch (IOException e) {
             throw new UncheckedIOException("can't create directory " + config.directory, e);
         }
-        return new SyncLogger(config, hooks);
+        return config.synchronous ? new SyncLogger(config, hooks) : new AsyncLogger(config, hooks);
     }
 
     /** Validates the options and resolves defaults. */

@@ -43,6 +43,7 @@ final class Config {
     final WarningHandler warningHandler;
     final Duration closeTimeout;
     final Set<PosixFilePermission> filePermissions; // null: use the umask
+    final boolean normalizeIds; // NFC + lower-case each id before use
 
     // Async mode (defaults in sync mode)
     final int workerThreads;
@@ -86,6 +87,7 @@ final class Config {
         warningHandler = b.warningHandler != null ? b.warningHandler : WarningHandler.stderr();
         closeTimeout = b.closeTimeout != null ? b.closeTimeout : DEFAULT_CLOSE_TIMEOUT;
         filePermissions = b.filePermissions;
+        normalizeIds = b.normalizeIds;
 
         workerThreads = orDefault(b.workerThreads, DEFAULT_WORKER_THREADS);
         maxQueuedMessages = orDefault(b.maxQueuedMessages, DEFAULT_MAX_QUEUED_MESSAGES);

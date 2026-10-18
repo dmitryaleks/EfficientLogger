@@ -40,6 +40,7 @@ public final class EfficientLoggerBuilder {
     String lineSeparator;
     Integer syncStripes;
     Set<PosixFilePermission> filePermissions;
+    boolean normalizeIds;
 
     EfficientLoggerBuilder(Path directory, String fileNamePattern) {
         this.directory = Objects.requireNonNull(directory, "directory");
@@ -177,6 +178,19 @@ public final class EfficientLoggerBuilder {
         EnumSet<PosixFilePermission> copy = EnumSet.noneOf(PosixFilePermission.class);
         copy.addAll(permissions); // throws NullPointerException on a null element
         this.filePermissions = copy;
+        return this;
+    }
+
+    /**
+     * Canonicalizes each ID before use, by Unicode NFC normalization then lower-casing, so IDs that
+     * differ only by case or Unicode form share one file and one worker. Off by default. Turn it on
+     * for a case-insensitive or normalization-insensitive file system (Windows, macOS), where such
+     * IDs already share a file on disk: it stops two of them being written concurrently from
+     * different workers with interleaved lines. It costs an allocation per {@code log} call, and
+     * merges IDs that differ only by case (so {@code "Foo"} and {@code "foo"} become one file).
+     */
+    public EfficientLoggerBuilder normalizeIds() {
+        this.normalizeIds = true;
         return this;
     }
 

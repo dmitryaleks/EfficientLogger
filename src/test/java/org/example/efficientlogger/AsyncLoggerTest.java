@@ -128,6 +128,26 @@ class AsyncLoggerTest {
     }
 
     @Test
+    void normalizeIdsMergesCaseAndUnicodeFormsIntoOneFileAndWorker() {
+        // Three workers: case/form variants canonicalize to the same string, so they shard to one
+        // worker and one file instead of racing across workers. (The content check is portable; a
+        // check that "Foo.json" is absent is not, since Path equality is case-insensitive on Windows.)
+        AsyncLogger logger = manual(builder().workerThreads(3).normalizeIds().flushIntervalMillis(0));
+        assertTrue(logger.log("Foo", json(1)));
+        assertTrue(logger.log("FOO", json(2)));
+        assertTrue(logger.log("foo", json(3)));
+        // café with é as one code point (NFC) and as e + combining accent (NFD) canonicalize together.
+        assertTrue(logger.log("café", json(4)));
+        assertTrue(logger.log("café", json(5)));
+
+        for (int i = 0; i < logger.workerCount(); i++) {
+            logger.worker(i).runOnce();
+        }
+        assertEquals(json(1) + "\n" + json(2) + "\n" + json(3) + "\n", content("foo"), "case variants share one file");
+        assertEquals(json(4) + "\n" + json(5) + "\n", content("café"), "Unicode forms share one file");
+    }
+
+    @Test
     void batchesAreAQuarterOfTheQueueUpTo256() {
         AsyncLogger logger = manual(builder().maxQueuedMessages(1000));
         for (int i = 0; i < 600; i++) {

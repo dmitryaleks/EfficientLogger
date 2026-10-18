@@ -27,6 +27,7 @@ final class AsyncLogger implements EfficientLogger {
     private final OpenFileBudget budget;
     private final long maxChars;
     private final int maxIdLength;
+    private final boolean normalizeIds;
     private final long startIndex;
     private final Duration closeTimeout;
     private final AtomicLong rejectedClosed = new AtomicLong();
@@ -43,6 +44,7 @@ final class AsyncLogger implements EfficientLogger {
         tracker = new OverflowTracker(admission, config, warnings);
         maxChars = config.maxQueuedChars;
         maxIdLength = config.maxIdLength;
+        normalizeIds = config.normalizeIds;
         String exposed = hooks.sinks.directoryExposedReason(config.directory);
         if (exposed != null) {
             warnings.emit(exposed, null);
@@ -82,6 +84,9 @@ final class AsyncLogger implements EfficientLogger {
     public boolean log(String id, String json) {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(json, "json");
+        if (normalizeIds) {
+            id = FileNamePattern.normalize(id); // route and name by the canonical form
+        }
         if (id.length() > maxIdLength) {
             // It can't fit in a file name. Rejecting it here keeps a huge ID out of the queue,
             // where maxQueuedChars doesn't count it.

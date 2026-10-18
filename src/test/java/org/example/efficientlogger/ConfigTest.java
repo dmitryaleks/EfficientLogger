@@ -56,6 +56,7 @@ class ConfigTest {
         assertNull(c.threadFactory);
         assertNotNull(c.warningHandler);
         assertArrayEquals(new byte[] {'\n'}, c.lineSeparator);
+        assertFalse(c.normalizeIds);
 
         assertEquals(65_536, c.ringCapacity);
         assertEquals(256, c.batchSize);
@@ -101,6 +102,7 @@ class ConfigTest {
                 .threadFactory(factory)
                 .warningHandler(handler)
                 .lineSeparator("\r\n")
+                .normalizeIds()
                 .buildConfig();
 
         assertEquals(4, c.workerThreads);
@@ -116,6 +118,7 @@ class ConfigTest {
         assertSame(factory, c.threadFactory);
         assertSame(handler, c.warningHandler);
         assertArrayEquals(new byte[] {'\r', '\n'}, c.lineSeparator);
+        assertTrue(c.normalizeIds);
         assertEquals(4, builder().synchronous().syncStripes(4).buildConfig().syncStripes);
     }
 

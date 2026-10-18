@@ -2,6 +2,8 @@ package org.example.efficientlogger;
 
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
+import java.text.Normalizer;
+import java.util.Locale;
 
 /**
  * A file-name pattern with exactly one {@code {id}} placeholder, and the rules for which IDs it
@@ -66,6 +68,15 @@ final class FileNamePattern {
     /** The longest ID that can fit in a file name: any longer one is invalid. */
     int maxIdLength() {
         return MAX_NAME_LENGTH - prefix.length() - suffix.length();
+    }
+
+    /**
+     * A canonical form of {@code id}: NFC-normalized, then lower-cased. IDs that a case-insensitive
+     * or normalization-insensitive file system would treat as one name map to the same canonical
+     * form, so they share a file and a worker on purpose rather than by accident. Allocates.
+     */
+    static String normalize(String id) {
+        return Normalizer.normalize(id, Normalizer.Form.NFC).toLowerCase(Locale.ROOT);
     }
 
     /** The file name for {@code id}. Allocates. */

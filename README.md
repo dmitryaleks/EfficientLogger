@@ -45,6 +45,7 @@ All set on the builder; each setter checks its argument at once.
 | `warningHandler(WarningHandler)` | stderr | Receives the logger's own warnings. |
 | `lineSeparator(String)` | `"\n"` | `"\n"` or `"\r\n"`. |
 | `filePermissions(Set<PosixFilePermission>)` | umask | POSIX permissions for new files, e.g. `rw-------`; the directory gets those plus execute. Existing files keep theirs. No effect off POSIX (e.g. Windows). |
+| `normalizeIds()` | off | Canonicalize each ID (Unicode NFC, then lower-case) so IDs differing only by case or form share one file and worker. For case-insensitive file systems; costs an allocation per `log`. |
 | `syncStripes(int)` | 16 | Power of two, 1 to 256: independent locks in sync mode. Sync only. |
 
 Combining an async-only option with `synchronous()`, or `syncStripes` without it, throws
@@ -80,9 +81,14 @@ Combining an async-only option with `synchronous()`, or `syncStripes` without it
 
   `~` is excluded because Windows 8.3 short names contain one, so an ID such as `VERYLO~1` could
   otherwise write into another ID's file. Messages for invalid IDs are dropped and counted, with
-  a warning per ID for the first 100. On a case-insensitive file system, `Foo` and `foo` share a
-  file. Their relative order isn't guaranteed, and a message larger than the buffer can be split
-  around the other ID's lines.
+  a warning per ID for the first 100.
+- **Case- and Unicode-insensitive file systems merge IDs.** On Windows (NTFS) and macOS (APFS),
+  IDs that differ only by case, and on APFS also by Unicode form, name the same file. Because the
+  logger routes by the ID as written, two such IDs can go to different workers and interleave in
+  that one file — a cross-tenant disclosure if the IDs are tenants. Lines then have no defined
+  order, and a message larger than the buffer can be split around the other ID's lines. Turn on
+  `normalizeIds()` (or canonicalize IDs yourself) on these systems, so such IDs map to one file
+  and one worker; be aware it also merges IDs that differ only by case.
 - **Use IDs from a bounded set.** Each distinct ID is a separate file, so IDs taken straight from
   untrusted input (a user ID, a header) let a caller fill the disk or the directory with files, and
   once more IDs are active than `maxOpenFiles` the logger opens and closes a file per message, which

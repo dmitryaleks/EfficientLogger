@@ -17,7 +17,10 @@ Files are opened in append mode, so a restarted process carries on where the las
 - **Asynchronous (the default).** `log()` puts the message in a bounded in-memory queue and
   returns. One worker thread (or more, with `workerThreads(n)`) writes the queue out. When the
   queue is full, `log()` drops the message and returns false instead of waiting. You get one
-  warning when dropping starts and one when the queue recovers, with the count.
+  warning when dropping starts and one when the queue recovers, with the count; these are
+  rate-limited to one every 10 seconds, so a queue that keeps overflowing can't flood the handler.
+  A message by itself larger than `maxQueuedChars` is dropped as too large (counted separately in
+  `stats()`), with its own one-time warning, not a "queue full" one.
 - **Synchronous**, with `.synchronous()`. `log()` writes the message to the file before it
   returns, on the calling thread, with no queue and no extra threads.
 

@@ -20,8 +20,11 @@ final class Warnings {
     private final AtomicBoolean thrashReported = new AtomicBoolean();
     private final AtomicLong tooLongIds = new AtomicLong();
     private final AtomicBoolean tooLongIdsReported = new AtomicBoolean();
+    private final AtomicLong oversizeMessages = new AtomicLong();
+    private final AtomicBoolean oversizeReported = new AtomicBoolean();
     private final AtomicBoolean incompleteCloseReported = new AtomicBoolean();
     private final int maxIdLength;
+    private final long maxQueuedChars;
 
     // Guarded by this.
     private boolean ioErrorReported;
@@ -29,12 +32,38 @@ final class Warnings {
     private long suppressedIoErrors;
 
     Warnings(WarningHandler handler) {
-        this(handler, FileNamePattern.MAX_NAME_LENGTH);
+        this(handler, FileNamePattern.MAX_NAME_LENGTH, 0);
     }
 
     Warnings(WarningHandler handler, int maxIdLength) {
+        this(handler, maxIdLength, 0);
+    }
+
+    Warnings(WarningHandler handler, int maxIdLength, long maxQueuedChars) {
         this.handler = handler;
         this.maxIdLength = maxIdLength;
+        this.maxQueuedChars = maxQueuedChars;
+    }
+
+    /**
+     * Counts a message dropped because it alone was longer than maxQueuedChars. Any thread; no I/O.
+     * True for the first one, so the caller can make sure {@link #reportOversizeMessages} runs soon.
+     */
+    boolean countOversizeMessage() {
+        return oversizeMessages.getAndIncrement() == 0;
+    }
+
+    /** Messages dropped so far because they were larger than the queue's char limit. */
+    long oversizeMessages() {
+        return oversizeMessages.get();
+    }
+
+    /** Reports, once per logger, that messages too large for the queue are being dropped. Cheap otherwise. */
+    void reportOversizeMessages() {
+        if (oversizeMessages.get() != 0 && !oversizeReported.get() && oversizeReported.compareAndSet(false, true)) {
+            emit("dropping messages longer than maxQueuedChars=" + maxQueuedChars + " chars (further ones"
+                    + " are only counted, in stats().droppedTooLarge())", null);
+        }
     }
 
     /**

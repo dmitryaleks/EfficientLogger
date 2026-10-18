@@ -183,7 +183,8 @@ class AsyncLoggerTest {
         w.runOnce(); // 4 queued: half empty
         assertEquals("queue recovered; dropped 2 messages (2 in total)", warnings.get(1));
 
-        // A second episode.
+        // A second episode, after the rate-limit interval so it is reported again.
+        now[0] = 20_000 * MS;
         assertEquals(4, logCounting(logger, 6));
         w.runOnce();
         assertEquals(3, warnings.size(), warnings.toString());
@@ -195,6 +196,33 @@ class AsyncLoggerTest {
             // drain the rest
         }
         assertEquals(4, warnings.size(), warnings.toString());
+    }
+
+    @Test
+    void overflowWarningsAreRateLimited() {
+        batchSize = 8;
+        AsyncLogger logger = manual(builder().maxQueuedMessages(8)); // half empty at 4
+        Worker w = logger.worker(0);
+
+        assertEquals(8, logCounting(logger, 12)); // episode 1 at t=0: 4 dropped
+        w.runOnce(); // drains 8; the episode's start is reported
+        w.runOnce(); // queue empty: its end is reported
+        assertEquals(2, warnings.size(), warnings.toString());
+        assertTrue(warnings.get(0).startsWith("queue full"), warnings.get(0));
+        assertEquals("queue recovered; dropped 4 messages (4 in total)", warnings.get(1));
+
+        assertEquals(8, logCounting(logger, 12)); // episode 2, still at t=0: 4 more dropped
+        w.runOnce();
+        w.runOnce();
+        assertEquals(2, warnings.size(), "a second episode within the interval is silent: " + warnings);
+
+        now[0] = 11_000 * MS; // past the interval
+        assertEquals(8, logCounting(logger, 12)); // 4 more dropped, 12 in all
+        w.runOnce();
+        w.runOnce();
+        assertEquals(3, warnings.size(), warnings.toString());
+        assertEquals("queue recovered; dropped 8 messages (12 in total)", warnings.get(2),
+                "the folded drops surface once reporting resumes");
     }
 
     @Test
@@ -217,19 +245,20 @@ class AsyncLoggerTest {
     }
 
     @Test
-    void aMessageLongerThanMaxQueuedCharsIsDropped() {
+    void aMessageLongerThanMaxQueuedCharsIsDroppedWithoutAFullQueueWarning() {
         AsyncLogger logger = manual(builder().maxQueuedChars(100));
         assertFalse(logger.log("a", "x".repeat(101)));
+        assertFalse(logger.log("a", "x".repeat(500)));
         assertTrue(logger.log("a", "x".repeat(100)));
         LoggerStats s = logger.stats();
-        assertEquals(1, s.droppedTooLarge());
-        assertEquals(0, s.droppedQueueFull());
-        assertEquals(1, logger.droppedCount());
+        assertEquals(2, s.droppedTooLarge());
+        assertEquals(0, s.droppedQueueFull(), "a too-large message is not a full queue");
+        assertEquals(2, logger.droppedCount());
 
         logger.worker(0).runOnce();
-        logger.worker(0).runOnce();
-        assertEquals(2, warnings.size(), warnings.toString());
-        assertEquals("queue recovered; dropped 1 message (1 in total)", warnings.get(1));
+        // Its own warning, once, with no bogus "queue full"/"recovered" pair.
+        assertEquals(List.of("dropping messages longer than maxQueuedChars=100 chars"
+                + " (further ones are only counted, in stats().droppedTooLarge())"), warnings);
     }
 
     @Test

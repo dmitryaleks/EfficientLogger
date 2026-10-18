@@ -5,8 +5,11 @@ import java.io.PrintStream;
 /**
  * Receives the logger's own warnings, such as dropped messages, invalid IDs and I/O errors.
  *
- * <p>It is called from a worker thread, or in synchronous mode from the logging thread after
- * its lock is released. Keep it quick. Anything it throws is ignored.
+ * <p>It is called inline from a worker thread, or in synchronous mode from the logging thread
+ * after its lock is released, so it must return promptly and must not block. A handler that
+ * blocks (for example writing to a pipe nobody reads) stalls that thread, and in async mode holds
+ * up writing. The logger rate-limits its own warnings, so a handler is called at most occasionally.
+ * Anything it throws is ignored.
  */
 @FunctionalInterface
 public interface WarningHandler {

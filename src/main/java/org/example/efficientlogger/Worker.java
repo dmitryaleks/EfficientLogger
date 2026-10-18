@@ -145,8 +145,9 @@ final class Worker implements Runnable, MpscRing.Handler {
         if (files.dirtyCount() != 0 && now - files.firstDirtyNanos() >= flushIntervalNanos) {
             files.flushDirty(now);
         }
-        tracker.check();
+        tracker.check(now);
         warnings.reportTooLongIds();
+        warnings.reportOversizeMessages();
         warnings.emitAll(files.takeWarnings());
         return n;
     }
@@ -157,6 +158,7 @@ final class Worker implements Runnable, MpscRing.Handler {
             files.closeAll(clock.getAsLong());
             tracker.finalReport();
             warnings.reportTooLongIds();
+            warnings.reportOversizeMessages();
             warnings.emitAll(files.takeWarnings());
             warnings.reportSuppressedIoErrors(); // each worker does; the last to finish catches the rest
         } finally {
@@ -249,7 +251,7 @@ final class Worker implements Runnable, MpscRing.Handler {
     private void idle() {
         files.flushDirty(clock.getAsLong());
         warnings.emitAll(files.takeWarnings());
-        tracker.check();
+        tracker.check(clock.getAsLong());
 
         long mode = eager || emptyTimedWakeups >= DEEP_SLEEP_AFTER ? MpscRing.DEEP : MpscRing.TIMED;
         ring.setParkedState(mode); // then re-check what a producer may have done meanwhile (Dekker)

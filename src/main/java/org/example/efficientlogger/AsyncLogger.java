@@ -29,7 +29,6 @@ final class AsyncLogger implements EfficientLogger {
     private final int maxIdLength;
     private final long startIndex;
     private final Duration closeTimeout;
-    private final AtomicLong tooLarge = new AtomicLong();
     private final AtomicLong rejectedClosed = new AtomicLong();
     private final AtomicInteger running; // worker threads that haven't finished
     private final CountDownLatch finished; // counted down as each worker thread finishes
@@ -37,7 +36,7 @@ final class AsyncLogger implements EfficientLogger {
 
     AsyncLogger(Config config, TestHooks hooks) {
         int number = LOGGER_NUMBERS.incrementAndGet();
-        warnings = new Warnings(config.warningHandler, config.maxIdLength);
+        warnings = new Warnings(config.warningHandler, config.maxIdLength, config.maxQueuedChars);
         budget = new OpenFileBudget(config.maxOpenFiles);
         admission = new Admission(config.maxQueuedMessages, config.maxQueuedChars);
         tracker = new OverflowTracker(admission, config, warnings);
@@ -88,8 +87,11 @@ final class AsyncLogger implements EfficientLogger {
         }
         int len = json.length();
         if (len > maxChars) {
-            tracker.recordDrop(); // before tooLarge, so stats() never sees more too-large than drops
-            tooLarge.incrementAndGet();
+            // Too large for the queue. Not a full queue, so it doesn't feed overflow episodes; it
+            // has its own warning, which a worker emits so the caller does no I/O.
+            if (warnings.countOversizeMessage()) {
+                rings[0].wakeConsumer();
+            }
             return false;
         }
         MpscRing ring = rings[Hashing.index(id.hashCode(), rings.length)];
@@ -136,7 +138,7 @@ final class AsyncLogger implements EfficientLogger {
 
     @Override
     public long droppedCount() {
-        return tracker.drops();
+        return tracker.drops() + warnings.oversizeMessages();
     }
 
     @Override
@@ -154,10 +156,10 @@ final class AsyncLogger implements EfficientLogger {
             invalidId += w.files.droppedInvalidId();
             lostIoError += w.files.lostIoError();
         }
-        long large = tooLarge.get(); // before drops(): see log()
-        long drops = tracker.drops();
+        long oversize = warnings.oversizeMessages();
+        long queueFull = tracker.drops();
         long word = admission.get();
-        return new LoggerStats(accepted, written, drops - large, large, invalidId, lostIoError, rejectedClosed.get(),
+        return new LoggerStats(accepted, written, queueFull, oversize, invalidId, lostIoError, rejectedClosed.get(),
                 Admission.messages(word), Admission.chars(word), budget.open());
     }
 

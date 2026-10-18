@@ -43,6 +43,22 @@ class WarningsTest {
     }
 
     @Test
+    void oversizeMessagesAreCountedAndReportedOnce() {
+        List<String> seen = new ArrayList<>();
+        Warnings w = new Warnings((message, cause) -> seen.add(message), 255, 100);
+        w.reportOversizeMessages(); // nothing counted yet
+        assertTrue(seen.isEmpty());
+
+        assertTrue(w.countOversizeMessage(), "true for the first");
+        assertFalse(w.countOversizeMessage());
+        assertEquals(2, w.oversizeMessages());
+        w.reportOversizeMessages();
+        w.reportOversizeMessages(); // again: still once
+        assertEquals(List.of("dropping messages longer than maxQueuedChars=100 chars"
+                + " (further ones are only counted, in stats().droppedTooLarge())"), seen);
+    }
+
+    @Test
     void thrashIsReportedOnce() {
         Warnings w = new Warnings((message, cause) -> {});
         assertTrue(w.admitThrashReport());

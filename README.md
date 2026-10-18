@@ -143,15 +143,14 @@ PRO 350, running Windows 11 with JDK 17.0.12, and Ubuntu 24.04 under WSL 2 with
 Temurin 17.0.20.1. JMH is 1.37. Each figure comes from one fork, with 2 × 1 s of warm-up and
 3 × 1 s of measurement, so read the differences in orders of magnitude, not in percent.
 
-The Windows figures were measured on 2026-10-19 against the current code, after the security
-audit and the code review. The Linux figures are older: they predate the line-break and ID
-checks described under "What to expect" and the keyed routing hash, and WSL had no JDK when the
-Windows figures were redone. Measured back to back when they were added, the checks cost one
+All figures were measured on 2026-10-19 against the current code, after the security audit and
+the code review, so they include the line-break and ID checks described under "What to expect"
+and the keyed routing hash. Measured back to back when they were added, the checks cost one
 worker about 7% of its peak throughput, about 10 ns per 85-character message, which is within
-the run-to-run noise of the table below; sync mode was unchanged. The keyed routing hash costs
+the run-to-run noise of the tables below; sync mode was unchanged. The keyed routing hash costs
 the caller about 0.7 ns per ID character: with these 7-character IDs, one thread calling flat
-out went from about 135 to 75 million calls a second (mostly drops), while the paced latency
-and the written rate, which the worker bounds, were unchanged.
+out went from about 115 to 135 million calls a second to 75 to 80 million (mostly drops), while
+the paced latency and the written rate, which the worker bounds, were unchanged.
 
 **Throughput, threads calling `log()` flat out.** The figures are messages written per second.
 The async EfficientLogger drops messages instead of making callers wait, so for it the calls
@@ -160,15 +159,15 @@ per second are shown too.
 | Logger | OS | 1 thread | 4 threads | 8 threads | Heap per message |
 |---|---|---|---|---|---|
 | EfficientLogger async, 1 worker | Windows | 12.3 M (74.8 M calls) | 9.9 M (54.2 M calls) | 7.5 M (52.6 M calls) | 0 |
-| | Linux | 18.2 M (114.3 M calls) | 15.2 M (59.5 M calls) | 12.1 M (49.3 M calls) | 0 |
+| | Linux | 17.8 M (79.0 M calls) | 14.6 M (50.6 M calls) | 11.5 M (52.7 M calls) | 0 |
 | EfficientLogger async, 4 workers | Windows | 39.8 M | 24.2 M (27.0 M calls) | 21.2 M (40.2 M calls) | 0 |
-| | Linux | 39.0 M | 28.0 M (28.1 M calls) | 30.6 M (31.3 M calls) | 0 |
+| | Linux | 36.9 M | 29.4 M | 33.9 M | 0 |
 | EfficientLogger sync | Windows | 3.0 M | 3.2 M | 2.9 M | 0 |
-| | Linux | 4.9 M | 10.0 M | 4.0 M | 0 |
+| | Linux | 4.8 M | 10.0 M | 4.0 M | 0 |
 | `BufferedWriter` per file | Windows | 27.0 M | 33.6 M | 35.9 M | 0.6 B |
-| | Linux | 27.1 M | 47.8 M | 43.5 M | 0.6 B |
+| | Linux | 27.0 M | 52.9 M | 49.0 M | 0.6 B |
 | log4j2 async loggers | Windows | 0.40 M | 0.59 M | 0.56 M | 0 |
-| | Linux | 4.6 M | 4.4 M | 4.6 M | 0 |
+| | Linux | 4.7 M | 4.9 M | 4.6 M | 0 |
 
 **Latency at a steady rate.** Each thread does about 0.7 µs of other work between calls, so
 it logs about 1.3 million messages a second. The figures are microseconds per call, including
@@ -194,28 +193,28 @@ On Linux (WSL 2):
 
 | Logger | Threads | p50 | p99 | p99.9 | p99.99 |
 |---|---|---|---|---|---|
-| (the work alone) | 1 | 0.7 | 0.8 | 16.1 | 54.1 |
-| EfficientLogger async | 1 | 0.8 | 1.0 | 22.5 | 59.6 |
-| EfficientLogger sync | 1 | 1.0 | 1.2 | 16.0 | 51.5 |
-| `BufferedWriter` per file | 1 | 0.8 | 2.4 | 16.1 | 44.3 |
-| log4j2 async loggers | 1 | 0.9 | 3.8 | 43.4 | 101.2 |
-| (the work alone) | 4 | 0.8 | 1.2 | 16.6 | 51.1 |
-| EfficientLogger async | 4 | 0.8 | 1.2 | 19.1 | 40.4 |
-| EfficientLogger async, 4 workers | 4 | 0.9 | 1.3 | 20.0 | 44.6 |
-| EfficientLogger sync | 4 | 1.0 | 3.2 | 89.5 | 234.5 |
-| `BufferedWriter` per file | 4 | 0.8 | 1.5 | 15.2 | 61.6 |
-| log4j2 async loggers | 4 | 1.0 | 2.9 | 32.7 | 207.0 |
+| (the work alone) | 1 | 0.7 | 1.2 | 21.7 | 46.9 |
+| EfficientLogger async | 1 | 0.8 | 0.9 | 20.3 | 56.5 |
+| EfficientLogger sync | 1 | 0.9 | 1.1 | 14.0 | 38.5 |
+| `BufferedWriter` per file | 1 | 0.8 | 2.3 | 25.0 | 42.0 |
+| log4j2 async loggers | 1 | 0.9 | 3.7 | 39.7 | 64.3 |
+| (the work alone) | 4 | 0.7 | 1.2 | 15.7 | 40.1 |
+| EfficientLogger async | 4 | 0.8 | 1.2 | 14.2 | 34.2 |
+| EfficientLogger async, 4 workers | 4 | 0.8 | 1.2 | 17.8 | 34.0 |
+| EfficientLogger sync | 4 | 1.0 | 3.8 | 99.0 | 241.3 |
+| `BufferedWriter` per file | 4 | 0.8 | 2.1 | 16.7 | 86.9 |
+| log4j2 async loggers | 4 | 1.0 | 3.1 | 106.5 | 249.2 |
 
 The latencies are rounded to 0.1 µs, the tick of Windows' clock. Under WSL 2, everything past
-p99 is dominated by the virtual machine: the work alone already reaches 16 µs at p99.9, so only
-differences well above that mean anything there.
+p99 is dominated by the virtual machine: the work alone already reaches 16 to 22 µs at p99.9,
+so only differences well above that mean anything there.
 
 What this shows:
 
 - **The async logger costs its callers almost nothing.** At a steady rate, it is within 0.3 µs
   of doing no logging at all at p99, on both systems, and it never waits for I/O. Dropping a
   message costs even less than queueing one.
-- **One worker writes 7 to 12 million messages a second** on Windows and 12 to 18 million on
+- **One worker writes 7 to 12 million messages a second** on Windows and 11 to 18 million on
   Linux, roughly 0.6 to 1.5 GB/s of JSON. Beyond that it drops, and warns, rather than slowing
   the callers down. With 4 workers it writes 21 to 40 million a second.
 - **The `BufferedWriter` approach has high throughput,** because each caller formats its own
@@ -232,7 +231,7 @@ What this shows:
   throughput there and its millisecond stalls at 4 × 1.3 million messages a second. On Linux,
   where that backoff is far shorter, it writes ten times as much, about 4.5 million messages a
   second, with no such stalls. That is still a quarter to a third of one EfficientLogger
-  worker, and it adds 1.7 to 3.0 µs per call at p99.
+  worker, and it adds about 2 to 3 µs per call at p99.
 
 To run it with real files instead, add `-p output=disk`. The numbers then depend mostly on
 the disk.

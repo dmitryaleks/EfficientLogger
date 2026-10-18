@@ -37,6 +37,10 @@ final class SyncLogger implements EfficientLogger {
     SyncLogger(Config config, TestHooks hooks) {
         warnings = new Warnings(config.warningHandler, config.maxIdLength);
         maxIdLength = config.maxIdLength;
+        String exposed = hooks.sinks.directoryExposedReason(config.directory);
+        if (exposed != null) {
+            warnings.emit(exposed, null);
+        }
         budget = new OpenFileBudget(config.maxOpenFiles);
         clock = hooks.nanoClock;
         closeTimeout = config.closeTimeout;

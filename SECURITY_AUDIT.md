@@ -80,6 +80,7 @@ below was re-run against the new jar.
 | # | Status | What changed | Probe now |
 |---|---|---|---|
 | F1 | Fixed | A raw CR or LF in a message is written as a space. Other C0 controls except tab, C1 controls, U+2028 and U+2029 become `\uXXXX` escapes. | The forged line stays on the first line, and escape codes are written as text |
+| F2 | Mostly fixed | Before writing, the logger refuses any path that isn't a regular file (a symlink, FIFO, device or directory), using a NOFOLLOW stat so it never opens or blocks on one; it is dropped and retried like any I/O error. At `build()`, a POSIX directory writable by other users without the sticky bit draws a warning. | A planted symlink and a directory are refused, the symlink's target is untouched, and a world-writable directory is flagged |
 | F7 | Fixed | The worker now backs off to a timed poll on a slot a cut-off `log()` call never published, instead of spinning a core, and `close()` gives up after the queue stops draining for 2 s instead of waiting forever, with a warning. The worker loop can no longer be exited by an error, and a worker that does stop closes the logger. | A simulated cut-off producer no longer pegs a core, and `close()` finishes |
 | F13 | Fixed (with F7) | The worker's error handling can no longer throw its way out of the loop, and if a worker thread ever stops while the logger is open, admission is closed and a warning is emitted. | Covered by the F7 tests and the existing error-path tests |
 | F4 | Fixed | `log()` rejects an ID that can't fit in a file name with one length comparison, before queueing or locking. It is counted in `droppedInvalidId` and warned about once. Invalid IDs are no longer copied into a file name first, and those kept as entries are at most 255 chars. | The 50-million-char ID is rejected at once |
@@ -96,6 +97,12 @@ ring while the logger runs, so that ring's later messages pile up and are droppe
 once, warned), until the logger is closed. The worker no longer spins or hangs, and other workers
 are unaffected; reclaiming the blocked slot safely would need a larger redesign, because a merely
 slow producer (for example paused at a GC safepoint) could still publish into it.
+
+Two residuals remain for F2. A regular file could in principle be swapped for a symlink in the
+instant between the stat and the open; a stat after opening narrows this, but the log directory
+should still be writable only by the service's own user (which the build-time warning encourages).
+And the directory warning is advisory and POSIX-only. Restricting the permissions of the files the
+logger creates is tracked separately as F10.
 
 ## Threat model
 

@@ -3,12 +3,17 @@ package org.example.efficientlogger;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -57,6 +62,43 @@ class FileOutputStreamSinkTest {
 
         write(nested.resolve("a.json"), "{}\n");
         assertEquals("{}\n", Files.readString(nested.resolve("a.json"), UTF_8));
+    }
+
+    @Test
+    void refusesADirectoryAtThePath() throws IOException {
+        Path path = Files.createDirectory(dir.resolve("a.json"));
+        assertThrows(IOException.class, () -> FILES.lastByte(path));
+        assertThrows(IOException.class, () -> FILES.open(path));
+    }
+
+    @Test
+    void refusesASymlinkAndLeavesItsTargetUntouched() throws IOException {
+        assumeTrue(posix(), "symbolic links need a POSIX file system");
+        Path target = Files.writeString(dir.resolve("target"), "secret\n");
+        Path link = dir.resolve("a.json");
+        Files.createSymbolicLink(link, target);
+
+        assertThrows(IOException.class, () -> FILES.lastByte(link), "must not follow the link to read");
+        assertThrows(IOException.class, () -> FILES.open(link), "must not follow the link to write");
+        assertEquals("secret\n", Files.readString(target, UTF_8), "the link's target was not touched");
+    }
+
+    @Test
+    void flagsADirectoryExposedToOtherUsers() throws IOException {
+        assumeTrue(posix(), "directory modes need a POSIX file system");
+        Path safe = Files.createDirectory(dir.resolve("safe"));
+        Files.setPosixFilePermissions(safe, PosixFilePermissions.fromString("rwx------"));
+        assertNull(FILES.directoryExposedReason(safe), "a private directory is fine");
+
+        Path exposed = Files.createDirectory(dir.resolve("exposed"));
+        Files.setPosixFilePermissions(exposed, PosixFilePermissions.fromString("rwxrwxrwx"));
+        String reason = FILES.directoryExposedReason(exposed);
+        assertNotNull(reason, "a world-writable directory should be flagged");
+        assertTrue(reason.contains("writable by other users"), reason);
+    }
+
+    private static boolean posix() {
+        return FileSystems.getDefault().supportedFileAttributeViews().contains("posix");
     }
 
     private static void write(Path file, String text) throws IOException {

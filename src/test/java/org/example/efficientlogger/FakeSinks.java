@@ -24,6 +24,9 @@ final class FakeSinks implements SinkFactory {
 
     private final Map<Path, ByteArrayOutputStream> contents = new HashMap<>();
     private final Set<Path> directories = new HashSet<>();
+    private final Set<Path> nonRegular = new HashSet<>(); // a symlink, FIFO, device... : refused
+    /** Non-null to report the log directory as exposed to other users. */
+    String directoryExposedReason;
     private final Map<Path, ArrayDeque<Failure>> openFailures = new HashMap<>();
     private final Map<Path, ArrayDeque<Failure>> writeFailures = new HashMap<>();
     private final Map<Path, ArrayDeque<Failure>> closeFailures = new HashMap<>();
@@ -39,6 +42,11 @@ final class FakeSinks implements SinkFactory {
 
     FakeSinks(Path... existingDirectories) {
         directories.addAll(List.of(existingDirectories));
+    }
+
+    /** Marks {@code path} as existing but not a regular file, so it is refused like a symlink or FIFO. */
+    void presetNonRegular(Path path) {
+        nonRegular.add(path);
     }
 
     void preset(Path path, String text) {
@@ -92,6 +100,9 @@ final class FakeSinks implements SinkFactory {
         if (failure != null) {
             throw rethrow(failure.error());
         }
+        if (nonRegular.contains(path)) {
+            throw new IOException("refusing to write to " + path + ": not a regular file");
+        }
         if (!directories.contains(path.getParent())) {
             throw new FileNotFoundException(path + " (No such file or directory)");
         }
@@ -106,7 +117,10 @@ final class FakeSinks implements SinkFactory {
     }
 
     @Override
-    public int lastByte(Path path) {
+    public int lastByte(Path path) throws IOException {
+        if (nonRegular.contains(path)) {
+            throw new IOException("refusing to use " + path + ": not a regular file");
+        }
         ByteArrayOutputStream content = contents.get(path);
         if (content == null || content.size() == 0) {
             return -1;
@@ -118,6 +132,11 @@ final class FakeSinks implements SinkFactory {
     @Override
     public boolean createDirectoryIfMissing(Path dir) {
         return directories.add(dir);
+    }
+
+    @Override
+    public String directoryExposedReason(Path directory) {
+        return directoryExposedReason;
     }
 
     private static void add(Map<Path, ArrayDeque<Failure>> failures, Path path, Throwable e, int bytesFirst) {

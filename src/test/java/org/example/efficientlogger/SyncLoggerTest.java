@@ -190,6 +190,18 @@ class SyncLoggerTest {
     }
 
     @Test
+    void warnsAtBuildWhenTheDirectoryIsExposedToOtherUsers() {
+        FakeSinks sinks = new FakeSinks(dir.toAbsolutePath().normalize());
+        sinks.directoryExposedReason = "the log directory path /x is writable by other users; restrict it";
+        TestHooks hooks = new TestHooks();
+        hooks.sinks = sinks;
+        try (EfficientLogger logger = builder().build(hooks)) {
+            assertTrue(logger.log("a", "{}"));
+        }
+        assertTrue(warnings.stream().anyMatch(w -> w.contains("writable by other users")), warnings.toString());
+    }
+
+    @Test
     void rejectsMessagesAfterClose() {
         EfficientLogger logger = builder().build();
         assertTrue(logger.log("a", "{}"));

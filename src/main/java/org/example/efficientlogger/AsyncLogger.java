@@ -43,6 +43,10 @@ final class AsyncLogger implements EfficientLogger {
         tracker = new OverflowTracker(admission, config, warnings);
         maxChars = config.maxQueuedChars;
         maxIdLength = config.maxIdLength;
+        String exposed = hooks.sinks.directoryExposedReason(config.directory);
+        if (exposed != null) {
+            warnings.emit(exposed, null);
+        }
         startIndex = hooks.ringStartIndex;
         closeTimeout = config.closeTimeout;
 

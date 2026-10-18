@@ -214,6 +214,12 @@ the disk.
   logger reopens it, normally at the next restart. With `copytruncate`, writing carries on in
   the original file without a gap, since it is open for appending. Lines written between
   logrotate's copy and its truncate are lost, as with any program that logs to a file.
+- **Keep the log directory private to the service's user.** The logger refuses to write to
+  anything that isn't a regular file, so a symlink, FIFO or device left at a file's path by
+  another user can't redirect the writes or block a thread; those messages are dropped and
+  retried like any I/O error. At build it also warns if the directory, or a parent, is writable
+  by other users without the sticky bit. A regular file could still be swapped for a symlink in
+  the instant between the check and the open, so a private directory is the real safeguard.
 - **Deleting a file or directory the logger has open** makes later lines to that file
   disappear until it is reopened, while `stats()` still counts them as written. (Windows
   doesn't allow deleting open files.)

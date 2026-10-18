@@ -3,6 +3,7 @@ package org.example.efficientlogger;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.FileNotFoundException;
@@ -373,6 +374,30 @@ class FileTableTest {
     }
 
     // ---- I/O errors ----
+
+    @Test
+    void refusesAFileThatIsNotRegular() {
+        // A symlink, FIFO or device left at the path, e.g. by another user who can write the
+        // directory, would redirect the writes or block the thread. It is refused like any I/O error.
+        FileTable t = table(8192);
+        sinks.presetNonRegular(file("a"));
+
+        t.append("a", "{\"n\":1}", 0);
+        assertEquals(1, t.lostIoError());
+        assertEquals(0, t.written());
+        assertEquals(0, budget.open(), "no handle is held for a refused file");
+        assertNull(sinks.content(file("a")), "nothing is written to the path");
+        List<String> w = warnings(t);
+        assertEquals(1, w.size(), w.toString());
+        assertTrue(w.get(0).contains("not a regular file"), w.get(0));
+
+        t.append("a", "{\"n\":2}", 999 * MS); // still backing off
+        t.append("a", "{\"n\":3}", 1000 * MS); // retry due, but still not a regular file
+        assertEquals(3, t.lostIoError());
+        assertEquals(0, t.written());
+        assertNull(sinks.content(file("a")));
+        assertTrue(warnings(t).isEmpty(), "further refusals are rate-limited");
+    }
 
     @Test
     void aFailedWriteDropsTheBufferedRecordsAndBacksOff() {

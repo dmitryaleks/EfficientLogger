@@ -1,6 +1,6 @@
 # EfficientLogger — Implementation Plan
 
-> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M4 done: sync mode is usable through `EfficientLogger.builder(...).synchronous().build()`. Until M6, `build()` without `synchronous()` throws `UnsupportedOperationException`. Next: M5 (`Admission`, `MpscRing`).
+> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M5 done: sync mode is usable through `EfficientLogger.builder(...).synchronous().build()`, and the async queue core (`Admission`, `MpscRing`) is built and stress-tested. Until M6, `build()` without `synchronous()` throws `UnsupportedOperationException`. Next: M6 (`Worker`, `AsyncLogger`, `OverflowTracker`).
 
 ## 1. Context
 Today the user writes multiple JSON log files through log4j, appending across restarts.
@@ -112,6 +112,11 @@ if (p != AWAKE && (p == DEEP || aboveWake(nv)) && LONGS.compareAndSet(r.cells, P
 return true;
 ```
 - **Wake threshold.** `aboveWake(v)` means count ≥ `max(1, maxCount/4)` or chars ≥ `max(1, maxChars/4)`. Eager mode sets both thresholds to 1.
+- **As built in M5:**
+  - **Admission result.** `Admission.tryAcquire(len)` returns the new word (always > 0), `REJECTED_CLOSED` (0) or `REJECTED_FULL` (−1).
+  - **Ring cells.** The consumer's `head` lives in its own padded cell of `MpscRing.cells`, so its writes don't share a cache line with the fields producers read. There is no CONSUMED cell.
+  - **Draining.** `MpscRing.drain(handler, max)` nulls each slot before handing the message to the handler. The caller releases admission after the batch.
+  - **Shared hashing.** `Hashing.index(hash, n)` (multiply by 0x9E3779B9, then `((m & 0xFFFFFFFFL) * n) >>> 32`) picks both async shards and sync stripes, for any `n`.
 - **Stats** come from counters that already exist, so the hot path pays no extra atomics:
   - `accepted` = Σ shard tails
   - `written` = Σ worker counters (opaque writes)

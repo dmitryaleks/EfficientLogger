@@ -46,13 +46,6 @@ final class SyncLogger implements EfficientLogger {
         }
     }
 
-    /** Which of {@code stripes} (a power of two) an ID with this hash uses. */
-    static int stripeIndex(int hash, int stripes) {
-        // Multiplying by 2^32 / golden ratio spreads similar hashes ("id-1", "id-2") over the top
-        // bits. One stripe is a special case: a shift by 32 is a shift by 0 in Java.
-        return stripes == 1 ? 0 : (hash * 0x9E3779B9) >>> (32 - Integer.numberOfTrailingZeros(stripes));
-    }
-
     @Override
     public boolean log(String id, String json) {
         Objects.requireNonNull(id, "id");
@@ -61,7 +54,7 @@ final class SyncLogger implements EfficientLogger {
             rejectedClosed.incrementAndGet();
             return false;
         }
-        Stripe s = stripes[stripeIndex(id.hashCode(), stripes.length)];
+        Stripe s = stripes[Hashing.index(id.hashCode(), stripes.length)];
         boolean written;
         List<Warnings.Pending> pending;
         synchronized (s) {

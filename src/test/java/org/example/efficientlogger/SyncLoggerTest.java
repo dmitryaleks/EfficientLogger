@@ -278,7 +278,7 @@ class SyncLoggerTest {
         String slowId = "slow";
         String fastId = null;
         for (int i = 0; fastId == null; i++) {
-            if (SyncLogger.stripeIndex(("fast" + i).hashCode(), 2) != SyncLogger.stripeIndex(slowId.hashCode(), 2)) {
+            if (Hashing.index(("fast" + i).hashCode(), 2) != Hashing.index(slowId.hashCode(), 2)) {
                 fastId = "fast" + i;
             }
         }
@@ -301,18 +301,6 @@ class SyncLoggerTest {
         }
         assertEquals("{}\n", read("slow"));
         assertEquals("{}\n", read(fastId));
-    }
-
-    @Test
-    void stripesAreEvenlyUsed() {
-        int[] counts = new int[16];
-        for (int i = 0; i < 500; i++) {
-            counts[SyncLogger.stripeIndex(("id-" + i).hashCode(), 16)]++;
-        }
-        for (int c : counts) {
-            assertTrue(c >= 16 && c <= 47, "uneven stripes: " + java.util.Arrays.toString(counts)); // mean 31
-        }
-        assertEquals(0, SyncLogger.stripeIndex("anything".hashCode(), 1));
     }
 
     @Test

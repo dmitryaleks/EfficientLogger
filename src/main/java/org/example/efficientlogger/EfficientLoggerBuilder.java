@@ -1,14 +1,16 @@
 package org.example.efficientlogger;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.ThreadFactory;
 
 /**
- * Configures a logger that appends JSON lines to one file per ID. Files live in {@code directory}
- * and are named by {@code fileNamePattern}, which contains exactly one {@code {id}}, for example
- * {@code "events-{id}.json"}.
+ * Configures an {@link EfficientLogger}; get one from {@link EfficientLogger#builder}. Files live in
+ * {@code directory} and are named by {@code fileNamePattern}, which contains exactly one
+ * {@code {id}}, for example {@code "events-{id}.json"}.
  *
  * <p>Each setter checks its own argument immediately. The pattern, the directory and combinations
  * of options are checked when the logger is built. Options marked "async only" or "sync only" can't
@@ -166,6 +168,29 @@ public final class EfficientLoggerBuilder {
         }
         this.syncStripes = stripes;
         return this;
+    }
+
+    /**
+     * Creates the logger, and its directory if that doesn't exist.
+     *
+     * @throws IllegalArgumentException if the pattern is invalid or options conflict
+     * @throws UncheckedIOException if the directory can't be created
+     */
+    public EfficientLogger build() {
+        return build(new TestHooks());
+    }
+
+    EfficientLogger build(TestHooks hooks) {
+        Config config = buildConfig();
+        if (!config.synchronous) {
+            throw new UnsupportedOperationException("asynchronous mode isn't implemented yet; use synchronous()");
+        }
+        try {
+            hooks.sinks.createDirectoryIfMissing(config.directory);
+        } catch (IOException e) {
+            throw new UncheckedIOException("can't create directory " + config.directory, e);
+        }
+        return new SyncLogger(config, hooks);
     }
 
     /** Validates the options and resolves defaults. */

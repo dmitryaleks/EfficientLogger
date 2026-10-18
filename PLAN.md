@@ -1,6 +1,6 @@
 # EfficientLogger — Implementation Plan
 
-> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0 (Java 17 build), M1 (`Utf8`), M2 (`FileNamePattern`, `Config`/builder; `build()` comes with M4) and M3 (`FileTable` and friends) done; next: M4 (`SyncLogger` + public facade).
+> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M4 done: sync mode is usable through `EfficientLogger.builder(...).synchronous().build()`. Until M6, `build()` without `synchronous()` throws `UnsupportedOperationException`. Next: M5 (`Admission`, `MpscRing`).
 
 ## 1. Context
 Today the user writes multiple JSON log files through log4j, appending across restarts.
@@ -34,7 +34,7 @@ public interface EfficientLogger extends AutoCloseable {
   static EfficientLoggerBuilder builder(Path directory, String fileNamePattern); // exactly one "{id}", e.g. "events-{id}.json"
   boolean log(String id, String json);  // false = dropped (limits / too large / closed; sync: invalid id or I/O failure). Only throws NPE on null args.
   boolean flush(Duration timeout);      // async: everything accepted before the call has reached the OS (no fsync). sync: true at once.
-  default void flush();                 // flush(closeTimeout)
+  boolean flush();                      // flush(closeTimeout)
   long droppedCount();
   LoggerStats stats();                  // snapshot record (allocates; not for the hot path)
   boolean close(Duration timeout);      // idempotent; true = drained, flushed, files closed

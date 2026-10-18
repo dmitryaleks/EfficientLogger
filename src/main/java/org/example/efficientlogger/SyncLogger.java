@@ -116,6 +116,7 @@ final class SyncLogger implements EfficientLogger {
             }
             warnings.emitAll(pending);
         }
+        warnings.reportSuppressedIoErrors();
         return true;
     }
 

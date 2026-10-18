@@ -328,14 +328,15 @@ class AsyncLoggerTest {
     @Test
     void anUnexpectedErrorDropsOnlyThatMessage() {
         // A 64-byte buffer holds one of these records, so the second one forces a write, which fails.
+        // (Exceptions from a sink are handled as I/O errors; an Error gets through to the worker.)
         AsyncLogger logger = manual(builder().fileBufferBytes(64));
-        sinks.failNextWrite(dir.resolve("a.json"), new IllegalStateException("bug"));
+        sinks.failNextWrite(dir.resolve("a.json"), new OutOfMemoryError("test"));
         logger.log("a", record(1));
         logger.log("a", record(2));
         logger.log("a", record(3));
         logger.worker(0).runOnce();
 
-        assertEquals(List.of("unexpected error writing a message for id \"a\"; it was dropped | bug"), warnings);
+        assertEquals(List.of("unexpected error writing a message for id \"a\"; it was dropped | test"), warnings);
 
         logger.close(Duration.ZERO);
         drainAndFinish(logger);

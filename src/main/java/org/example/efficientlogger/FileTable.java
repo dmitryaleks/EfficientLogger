@@ -180,7 +180,7 @@ final class FileTable {
         flushDirty(now);
         for (FileState f = lruHead; f != null; f = f.lruNext) {
             if (f.state == FileState.OPEN) {
-                IOException e = closeSink(f);
+                Exception e = closeSink(f);
                 if (e != null) {
                     reportIoError("can't close " + f.path, e, now);
                 }
@@ -288,7 +288,7 @@ final class FileTable {
             f.sink = sink;
             f.state = FileState.OPEN;
             openCount++;
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) { // see writeRaw
             if (sink != null) {
                 closeQuietly(sink);
             }
@@ -323,9 +323,11 @@ final class FileTable {
         }
     }
 
+    /** EMFILE has no exception type of its own, so this goes by the message: Unix, then Windows. */
     private static boolean isTooManyOpenFiles(IOException e) {
         String message = e.getMessage();
-        return message != null && message.contains("Too many open files");
+        return message != null
+                && (message.contains("Too many open files") || message.contains("The system cannot open the file"));
     }
 
     /** Closes and forgets our least recently used open file. False if we have none open. */
@@ -348,7 +350,7 @@ final class FileTable {
         if (f.state == FileState.OPEN) {
             flushFile(f, now); // on a write error this fails f, which closes it
             if (f.state == FileState.OPEN) {
-                IOException e = closeSink(f);
+                Exception e = closeSink(f);
                 if (e != null) {
                     reportIoError("can't close " + f.path, e, now);
                 }
@@ -379,7 +381,9 @@ final class FileTable {
         try {
             f.sink.write(b, 0, len);
             return true;
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) {
+            // A sink that throws unchecked is broken just the same. Failing the file keeps one bad
+            // file from stalling the others, and retries it later.
             fail(f, "can't write to " + f.path, e, now);
             return false;
         }
@@ -394,7 +398,7 @@ final class FileTable {
     }
 
     /** Drops f's buffered records, closes it, and backs off before reopening. */
-    private void fail(FileState f, String what, IOException e, long now) {
+    private void fail(FileState f, String what, Exception e, long now) {
         add(LOST_IO_ERROR, f.pendingRecords);
         f.pos = 0;
         f.pendingRecords = 0;
@@ -406,7 +410,7 @@ final class FileTable {
         reportIoError(what + "; dropping its messages for 1 s", e, now);
     }
 
-    private IOException closeSink(FileState f) {
+    private Exception closeSink(FileState f) {
         Sink sink = f.sink;
         f.sink = null;
         openCount--;
@@ -414,7 +418,7 @@ final class FileTable {
         try {
             sink.close();
             return null;
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) {
             return e;
         }
     }
@@ -422,7 +426,7 @@ final class FileTable {
     private static void closeQuietly(Sink sink) {
         try {
             sink.close();
-        } catch (IOException ignored) {
+        } catch (IOException | RuntimeException ignored) {
             // already reporting the error that made us close it
         }
     }
@@ -541,7 +545,7 @@ final class FileTable {
         warn(message, null);
     }
 
-    private void reportIoError(String message, IOException e, long now) {
+    private void reportIoError(String message, Exception e, long now) {
         long suppressed = warnings.admitIoErrorReport(now);
         if (suppressed < 0) {
             return;

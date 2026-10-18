@@ -1,6 +1,6 @@
 # EfficientLogger — Implementation Plan
 
-> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M7 done. Both modes are usable: `EfficientLogger.builder(...).build()` gives the async logger (the default), and `.synchronous().build()` the sync one. Next: M8.
+> **Source:** `SCOPE.md`. **Status:** plan approved 2026-10-18; M0–M8 done. Both modes are usable: `EfficientLogger.builder(...).build()` gives the async logger (the default), and `.synchronous().build()` the sync one. Next: M9.
 
 ## 1. Context
 Today the user writes multiple JSON log files through log4j, appending across restarts.
@@ -250,6 +250,12 @@ On Windows `parkNanos` is about 16 ms granular. Don't use microsecond parks for 
   - **Invalid IDs and failed files stay in the table** so their checks and backoff aren't repeated. The table is capped at `maxOpenFiles + 1024` entries, with LRU eviction.
   - **The thrash warning** fires once per logger, when a file used within the last second has to be closed to stay under the cap.
   - **Counters** (`written`, `lostIoError`, `droppedInvalidId`) are written with opaque stores, so `stats()` can read them from any thread.
+- **As built in M8:**
+  - **Unchecked exceptions from a sink count as I/O errors.** A `RuntimeException` from open, write, close or the last-byte check fails that file (buffer dropped, retry in 1 s, warning with the cause), just as an `IOException` would. Before, one escaping `flushDirty` could keep the worker's other files from being written and, at close, stop the worker before it closed them. In sync mode it would have escaped `log()`. An `Error` still goes to the worker's per-message catch.
+  - **Held-back errors are reported at close:** "N more I/O errors were not reported". Each async worker checks when it finishes; sync `close` checks once.
+  - **"Too many open files"** is recognized by the Unix message or the Windows one ("The system cannot open the file"). It goes by the English text, so a localized message isn't recognized; the open then fails and is retried in 1 s like any other.
+  - **Known limits.** On Unix, deleting the directory (or a file) while it is open makes later writes to that file disappear until it is closed and reopened, as with most loggers. Windows doesn't allow deleting open files. Recreating a deleted directory isn't reported.
+  - **Tests:** `IoErrorTest` runs each case in both modes: a full disk mid-record (the torn line is ended on reopen), an unchecked sink error, a failed close, a name taken by a directory (real files, retried a second later), a deleted directory (real files, and Unix-style while running), running out of file descriptors with nothing lost, and the logger-wide report limit including the summary at close.
 
 ### 3.7 `Utf8` (no allocation)
 `static long encode(String s, int from, byte[] dst, int pos, int limit)` returns `(nextCharIndex << 32) | newPos`. There is also `utf8Length(s)`.

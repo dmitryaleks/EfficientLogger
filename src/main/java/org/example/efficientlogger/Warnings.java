@@ -63,6 +63,21 @@ final class Warnings {
         return suppressed;
     }
 
+    /**
+     * At close: reports the I/O errors the rate limit held back since the last report, which would
+     * otherwise go unmentioned. Reports each held-back error once, however many owners call it.
+     */
+    void reportSuppressedIoErrors() {
+        long n;
+        synchronized (this) {
+            n = suppressedIoErrors;
+            suppressedIoErrors = 0;
+        }
+        if (n > 0) {
+            emit(n == 1 ? "1 more I/O error was not reported" : n + " more I/O errors were not reported", null);
+        }
+    }
+
     /** Numbers invalid-id reports 1 to 100; returns 0 once that many have been made. */
     int admitInvalidIdReport() {
         if (invalidIdReports.get() >= MAX_INVALID_ID_REPORTS) {

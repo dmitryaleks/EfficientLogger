@@ -297,6 +297,23 @@ class FileTableTest {
     }
 
     @Test
+    void recognizesWindowsRunningOutOfFileHandles() {
+        sinks.osOpenLimit = 4;
+        sinks.osOpenLimitMessage = "The system cannot open the file";
+        FileTable t = table(8192);
+        for (int i = 0; i < 5; i++) {
+            t.append("f" + i, "{}", i);
+        }
+        t.flushDirty(5);
+
+        assertEquals(0, t.lostIoError());
+        assertEquals("{}\n", sinks.content(file("f4")));
+        List<String> w = warnings(t);
+        assertEquals(1, w.size(), w.toString());
+        assertTrue(w.get(0).startsWith("too many open files; closed 2"), w.get(0));
+    }
+
+    @Test
     void limitsEntriesThatHoldNoFile() {
         FileTable t = table(8192, "\n", 3);
         for (int i = 0; i < 10; i++) {
@@ -404,6 +421,34 @@ class FileTableTest {
         w = warnings(t);
         assertEquals(1, w.size(), w.toString());
         assertTrue(w.get(0).contains("(4 more I/O errors were not reported)"), w.get(0));
+    }
+
+    /** An unchecked exception from a sink fails that file like an I/O error; it never escapes. */
+    @Test
+    void uncheckedSinkErrorsAreHandledLikeIoErrors() {
+        FileTable t = table(8192);
+        long s = 1000 * MS;
+        t.append("b", "{}", 0);
+        t.append("a", "{}", 0);
+        sinks.failNextWrite(file("a"), new IllegalStateException("write bug"));
+        t.flushDirty(0);
+        assertEquals("{}\n", sinks.content(file("b")), "the other file is still written");
+        assertEquals(1, t.lostIoError());
+        assertEquals(List.of("can't write to " + file("a") + "; dropping its messages for 1 s | write bug"), warnings(t));
+
+        sinks.failNextOpen(file("c"), new SecurityException("open bug"));
+        t.append("c", "{}", 10 * s);
+        assertEquals(2, t.lostIoError());
+        assertEquals(List.of("can't open " + file("c") + "; dropping its messages for 1 s | open bug"), warnings(t));
+
+        t.append("a", "{}", 20 * s); // a's retry is due
+        sinks.failNextClose(file("a"), new IllegalStateException("close bug"));
+        t.closeAll(20 * s);
+        assertEquals("{}\n", sinks.content(file("a")));
+        assertEquals(List.of("can't close " + file("a") + " | close bug"), warnings(t));
+        assertEquals(0, sinks.openNow);
+        assertEquals(0, budget.open());
+        assertEquals(2, t.written());
     }
 
     // ---- closing ----

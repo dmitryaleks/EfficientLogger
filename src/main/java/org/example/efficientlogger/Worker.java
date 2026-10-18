@@ -131,6 +131,7 @@ final class Worker implements Runnable, MpscRing.Handler {
             files.closeAll(clock.getAsLong());
             tracker.finalReport();
             warnings.emitAll(files.takeWarnings());
+            warnings.reportSuppressedIoErrors(); // each worker does; the last to finish catches the rest
         } finally {
             terminated = true;
             synchronized (flushLock) {

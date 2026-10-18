@@ -3,8 +3,11 @@ package org.example.efficientlogger;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
+import java.util.EnumSet;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ThreadFactory;
 
 /**
@@ -35,6 +38,7 @@ public final class EfficientLoggerBuilder {
     WarningHandler warningHandler;
     String lineSeparator;
     Integer syncStripes;
+    Set<PosixFilePermission> filePermissions;
 
     EfficientLoggerBuilder(Path directory, String fileNamePattern) {
         this.directory = Objects.requireNonNull(directory, "directory");
@@ -147,6 +151,22 @@ public final class EfficientLoggerBuilder {
         return this;
     }
 
+    /**
+     * Creates new log files, and the directory if it makes it, with these POSIX permissions instead
+     * of the ones the process umask allows, so they aren't readable by other users by default. For
+     * example {@code PosixFilePermissions.fromString("rw-------")}; the directory then gets
+     * {@code rwx------}. Existing files and directories keep their own permissions. Has no effect on
+     * a file system without POSIX permissions, such as on Windows, where new files follow the
+     * directory's access rules.
+     */
+    public EfficientLoggerBuilder filePermissions(Set<PosixFilePermission> permissions) {
+        Objects.requireNonNull(permissions, "filePermissions");
+        EnumSet<PosixFilePermission> copy = EnumSet.noneOf(PosixFilePermission.class);
+        copy.addAll(permissions); // throws NullPointerException on a null element
+        this.filePermissions = copy;
+        return this;
+    }
+
     /** Written after each message: {@code "\n"} (the default) or {@code "\r\n"}. */
     public EfficientLoggerBuilder lineSeparator(String separator) {
         Objects.requireNonNull(separator, "lineSeparator");
@@ -182,6 +202,9 @@ public final class EfficientLoggerBuilder {
 
     EfficientLogger build(TestHooks hooks) {
         Config config = buildConfig();
+        if (config.filePermissions != null && hooks.sinks == FileOutputStreamSink.FACTORY) {
+            hooks.sinks = FileOutputStreamSink.withPermissions(config.filePermissions);
+        }
         try {
             hooks.sinks.createDirectoryIfMissing(config.directory);
         } catch (IOException e) {

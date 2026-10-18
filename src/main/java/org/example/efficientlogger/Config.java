@@ -3,9 +3,11 @@ package org.example.efficientlogger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystems;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ThreadFactory;
 
 /** Validated, immutable settings with defaults resolved, plus values derived from them. */
@@ -39,6 +41,7 @@ final class Config {
     final byte[] lineSeparator; // don't modify
     final WarningHandler warningHandler;
     final Duration closeTimeout;
+    final Set<PosixFilePermission> filePermissions; // null: use the umask
 
     // Async mode (defaults in sync mode)
     final int workerThreads;
@@ -80,6 +83,7 @@ final class Config {
         lineSeparator = (b.lineSeparator != null ? b.lineSeparator : "\n").getBytes(StandardCharsets.US_ASCII);
         warningHandler = b.warningHandler != null ? b.warningHandler : WarningHandler.stderr();
         closeTimeout = b.closeTimeout != null ? b.closeTimeout : DEFAULT_CLOSE_TIMEOUT;
+        filePermissions = b.filePermissions;
 
         workerThreads = orDefault(b.workerThreads, DEFAULT_WORKER_THREADS);
         maxQueuedMessages = orDefault(b.maxQueuedMessages, DEFAULT_MAX_QUEUED_MESSAGES);

@@ -46,6 +46,10 @@ final class AsyncLogger implements EfficientLogger {
         if (exposed != null) {
             warnings.emit(exposed, null);
         }
+        if (config.filePermissions != null && !FileOutputStreamSink.posixSupported()) {
+            warnings.emit("filePermissions is set but this file system has no POSIX permissions;"
+                    + " new files follow the directory's access rules instead", null);
+        }
         startIndex = hooks.ringStartIndex;
         closeTimeout = config.closeTimeout;
 

@@ -43,6 +43,7 @@ All set on the builder; each setter checks its argument at once.
 | `threadFactory(ThreadFactory)` | daemon threads | Default names: `efficient-logger-<n>-worker-<i>`. Async only. |
 | `warningHandler(WarningHandler)` | stderr | Receives the logger's own warnings. |
 | `lineSeparator(String)` | `"\n"` | `"\n"` or `"\r\n"`. |
+| `filePermissions(Set<PosixFilePermission>)` | umask | POSIX permissions for new files, e.g. `rw-------`; the directory gets those plus execute. Existing files keep theirs. No effect off POSIX (e.g. Windows). |
 | `syncStripes(int)` | 16 | Power of two, 1 to 256: independent locks in sync mode. Sync only. |
 
 Combining an async-only option with `synchronous()`, or `syncStripes` without it, throws
@@ -223,6 +224,10 @@ the disk.
   retried like any I/O error. At build it also warns if the directory, or a parent, is writable
   by other users without the sticky bit. A regular file could still be swapped for a symlink in
   the instant between the check and the open, so a private directory is the real safeguard.
+- **`filePermissions(...)` restricts new files.** Without it, new files and the directory follow
+  the process umask, so they are usually world-readable. Pass POSIX permissions such as
+  `rw-------` to keep logs private to the owner; the directory then gets `rwx------`. Existing
+  files keep their own permissions.
 - **Deleting a file or directory the logger has open** makes later lines to that file
   disappear until it is reopened, while `stats()` still counts them as written. (Windows
   doesn't allow deleting open files.)

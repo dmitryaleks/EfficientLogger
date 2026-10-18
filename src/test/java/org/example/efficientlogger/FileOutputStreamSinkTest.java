@@ -13,7 +13,9 @@ import java.io.IOException;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -97,12 +99,46 @@ class FileOutputStreamSinkTest {
         assertTrue(reason.contains("writable by other users"), reason);
     }
 
+    @Test
+    void withPermissionsCreatesFilesAndDirectoriesRestricted() throws IOException {
+        assumeTrue(posix(), "POSIX permissions only");
+        Set<PosixFilePermission> perms = PosixFilePermissions.fromString("rw-------");
+        SinkFactory factory = FileOutputStreamSink.withPermissions(perms);
+
+        Path logs = dir.resolve("logs");
+        assertTrue(factory.createDirectoryIfMissing(logs));
+        assertEquals("rwx------", PosixFilePermissions.toString(Files.getPosixFilePermissions(logs)));
+
+        Path file = logs.resolve("a.json");
+        write(factory, file, "{}\n");
+        assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(file)));
+        assertEquals("{}\n", Files.readString(file, UTF_8));
+    }
+
+    @Test
+    void withPermissionsLeavesAnExistingFileAlone() throws IOException {
+        assumeTrue(posix(), "POSIX permissions only");
+        Path file = Files.writeString(dir.resolve("a.json"), "old\n");
+        Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-r--r--"));
+
+        SinkFactory factory = FileOutputStreamSink.withPermissions(PosixFilePermissions.fromString("rw-------"));
+        write(factory, file, "new\n");
+
+        assertEquals("rw-r--r--", PosixFilePermissions.toString(Files.getPosixFilePermissions(file)),
+                "an existing file keeps its own permissions");
+        assertEquals("old\nnew\n", Files.readString(file, UTF_8));
+    }
+
     private static boolean posix() {
         return FileSystems.getDefault().supportedFileAttributeViews().contains("posix");
     }
 
     private static void write(Path file, String text) throws IOException {
-        Sink sink = FILES.open(file);
+        write(FILES, file, text);
+    }
+
+    private static void write(SinkFactory factory, Path file, String text) throws IOException {
+        Sink sink = factory.open(file);
         try {
             byte[] bytes = text.getBytes(UTF_8);
             sink.write(bytes, 0, bytes.length);

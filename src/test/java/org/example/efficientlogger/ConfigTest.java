@@ -236,6 +236,18 @@ class ConfigTest {
         assertThrows(NullPointerException.class, () -> builder().threadFactory(null));
         assertThrows(NullPointerException.class, () -> builder().warningHandler(null));
         assertThrows(NullPointerException.class, () -> builder().lineSeparator(null));
+        assertThrows(NullPointerException.class, () -> builder().filePermissions(null));
+    }
+
+    @Test
+    void filePermissionsDefaultsToNullAndIsCopiedDefensively() {
+        assertNull(builder().buildConfig().filePermissions);
+
+        java.util.Set<java.nio.file.attribute.PosixFilePermission> perms =
+                new java.util.HashSet<>(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+        EfficientLoggerBuilder b = builder().filePermissions(perms);
+        perms.clear(); // a later change to the caller's set must not affect the logger
+        assertEquals(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"), b.buildConfig().filePermissions);
     }
 
     @Test

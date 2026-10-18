@@ -41,6 +41,10 @@ final class SyncLogger implements EfficientLogger {
         if (exposed != null) {
             warnings.emit(exposed, null);
         }
+        if (config.filePermissions != null && !FileOutputStreamSink.posixSupported()) {
+            warnings.emit("filePermissions is set but this file system has no POSIX permissions;"
+                    + " new files follow the directory's access rules instead", null);
+        }
         budget = new OpenFileBudget(config.maxOpenFiles);
         clock = hooks.nanoClock;
         closeTimeout = config.closeTimeout;

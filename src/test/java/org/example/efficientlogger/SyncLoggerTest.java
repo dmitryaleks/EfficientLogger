@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -187,6 +188,25 @@ class SyncLoggerTest {
             logger.log("a", "{\"t\":\"" + (char) 0x1B + "[2J\"}");
         }
         assertEquals("{\"a\":1} {\"b\":2}\n{\"t\":\"\\u001b[2J\"}\n", read("a"));
+    }
+
+    @Test
+    void filePermissionsRestrictNewFilesAndTheDirectory() throws IOException {
+        assumeTrue(java.nio.file.FileSystems.getDefault().supportedFileAttributeViews().contains("posix"),
+                "POSIX permissions only");
+        Path logs = dir.resolve("private");
+        try (EfficientLogger logger = EfficientLogger.builder(logs, "{id}.json")
+                .synchronous()
+                .filePermissions(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"))
+                .warningHandler((message, cause) -> warnings.add(message))
+                .build()) {
+            assertTrue(logger.log("a", "{}"));
+        }
+        assertEquals("rwx------",
+                java.nio.file.attribute.PosixFilePermissions.toString(Files.getPosixFilePermissions(logs)));
+        assertEquals("rw-------",
+                java.nio.file.attribute.PosixFilePermissions.toString(Files.getPosixFilePermissions(logs.resolve("a.json"))));
+        assertTrue(warnings.isEmpty(), warnings.toString());
     }
 
     @Test

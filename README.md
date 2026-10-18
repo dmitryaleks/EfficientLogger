@@ -97,6 +97,9 @@ Combining an async-only option with `synchronous()`, or `syncStripes` without it
   untrusted input (a user ID, a header) let a caller fill the disk or the directory with files, and
   once more IDs are active than `maxOpenFiles` the logger opens and closes a file per message, which
   is far slower. Map untrusted values to a bounded set of IDs, and set `maxFiles` as a backstop.
+  The worker (or, in sync mode, the lock) for an ID is picked by a hash of its characters keyed
+  with a per-logger random value, so untrusted IDs can't be chosen to pile onto one worker or
+  lock.
 - **I/O errors** don't throw. The messages for that file are dropped for one second, then it is
   retried. A missing directory is created again. Error warnings are limited to one every
   10 seconds, and the number held back is reported at close.
@@ -117,8 +120,9 @@ escape analysis off, so the JIT can't hide an allocation.
 What the caller does is up to the caller: building an ID with `"user-" + n` for each call
 allocates, so keep IDs around when you can.
 
-`log()` takes no locks in async mode: one CAS on the queue limits, one atomic add to claim a
-slot, two reference stores, and a volatile read. It wakes the worker only when the queue is a
+`log()` takes no locks in async mode: a keyed hash of the ID to pick its worker (about a
+nanosecond per character), one CAS on the queue limits, one atomic add to claim a slot, two
+reference stores, and a volatile read. It wakes the worker only when the queue is a
 quarter full (or for every message, with `eagerWakeup`). A slow trickle of messages is therefore
 written in batches, each message waiting at most one flush interval.
 
@@ -141,7 +145,10 @@ Temurin 17.0.20.1. JMH is 1.37. Each figure comes from one fork, with 2 × 1 s o
 These figures predate the line-break and ID checks described under "What to expect". In a
 back-to-back comparison on Windows, those checks cost one worker about 7% of its peak
 throughput, about 10 ns per 85-character message. Sync mode's throughput was unchanged. For
-callers, `log()` gained only a length comparison on the ID.
+callers, `log()` gained only a length comparison on the ID. The keyed routing hash added after
+the code review costs the caller about 0.7 ns per ID character: with these 7-character IDs, one
+thread calling flat out went from about 128 to 75 million calls a second (mostly drops), while
+the paced latency and the written rate, which the worker bounds, were unchanged.
 
 **Throughput, threads calling `log()` flat out.** The figures are messages written per second.
 The async EfficientLogger drops messages instead of making callers wait, so for it the calls

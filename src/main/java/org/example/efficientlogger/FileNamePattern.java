@@ -25,6 +25,13 @@ final class FileNamePattern {
 
     static final String PLACEHOLDER = "{id}";
     static final int MAX_NAME_LENGTH = 255;
+    /**
+     * The most {@link #normalize} can shorten an ID by: NFC composes at most four code points into
+     * one (for example U+03A9 U+0314 U+0342 U+0345 into U+1FAF), and lower-casing never shortens.
+     * So an ID longer than this many times the limit can't normalize to fit, and can be rejected
+     * before it is copied.
+     */
+    static final int MAX_NORMALIZATION_SHRINK = 8;
 
     private static final String RESERVED_CHARS = "/\\:*?\"<>|~";
     private static final int MAX_QUOTED_LENGTH = 100;

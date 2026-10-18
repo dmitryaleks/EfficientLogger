@@ -538,12 +538,17 @@ class AsyncThreadsTest {
                 "the worker to back off from the stuck slot");
         assertLittleCpu(worker, "the stuck worker");
 
-        assertFalse(logger.close(WAIT), "close finishes once the queue stops draining, and reports what it gave up on");
+        CompletableFuture<Boolean> closed = CompletableFuture.supplyAsync(() -> logger.close(WAIT));
+        await(logger::closing, "close to start");
+        assertLittleCpu(worker, "the stuck worker while close waits for it"); // it used to spin until the give-up (review R7)
+        assertFalse(closed.get(WAIT.toSeconds(), SECONDS),
+                "close finishes once the queue stops draining, and reports what it gave up on");
         worker.join(WAIT.toMillis());
         assertFalse(worker.isAlive());
         assertEquals(List.of(leftBehind(2)), warnings);
         assertEquals(List.of(), lines("a"), "the message behind the stuck slot was never written");
         assertAccounted(logger.stats(), 2, 0, 2, 2);
+        assertFalse(logger.flush(WAIT), "flush can't claim the message behind the slot was written (review R9)");
     }
 
     /**
@@ -568,6 +573,7 @@ class AsyncThreadsTest {
         assertFalse(worker.isAlive());
         assertEquals(List.of(leftBehind(2)), warnings);
         assertAccounted(logger.stats(), 2, 0, 2, 2);
+        assertFalse(logger.flush(WAIT), "still not written");
     }
 
     /**
@@ -593,12 +599,51 @@ class AsyncThreadsTest {
         assertTrue(System.nanoTime() - start < WAIT.toNanos() / 2, "close gave up well before its timeout");
         assertEquals(List.of(leftBehind(1)), warnings);
         assertAccounted(logger.stats(), 1, 1, 0, 1);
+        assertTrue(logger.flush(WAIT), "everything that reached the queue was written");
 
         logger.worker(0).ring.offer("a", late, admitted); // the stalled caller resumes: the second half of log()
         assertAccounted(logger.stats(), 2, 1, 1, 1);
         assertEquals(List.of(json(1)), lines("a"));
+        assertFalse(logger.flush(WAIT), "the late message is in the ring, and no worker is left to write it (review R9)");
         assertFalse(logger.close(Duration.ZERO), "a later close still says so");
         assertEquals(1, warnings.size(), "and doesn't warn again");
+    }
+
+    /**
+     * With several workers, one blocked in a slow open or write for longer than the give-up keeps
+     * the logger-wide queue from moving, so its siblings give up and finish. Nothing is lost, so
+     * once it completes, close() must return true and nothing may be reported (review R8).
+     */
+    @Test
+    void aSiblingStalledInIoDuringCloseIsNotReportedAsALoss() throws Exception {
+        String slow = "slow";
+        String fast = null;
+        for (int i = 0; fast == null; i++) {
+            if (Hashing.bucket("fast" + i, 0, 2) != Hashing.bucket(slow, 0, 2)) {
+                fast = "fast" + i;
+            }
+        }
+        CountDownLatch opening = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        TestHooks hooks = new TestHooks();
+        hooks.shardKey = 0; // so the routing above holds
+        hooks.sinks = new BlockingOpenSinks(dir.toAbsolutePath().normalize().resolve(slow + ".json"), opening, release);
+        AsyncLogger logger = start(builder().workerThreads(2), hooks);
+        Worker sibling = logger.worker(Hashing.bucket(fast, 0, 2));
+        assertTrue(logger.log(fast, json(1)));
+        assertTrue(logger.log(slow, json(2)));
+        assertTrue(opening.await(WAIT.toSeconds(), SECONDS), "the slow worker is inside the open, its message not yet released");
+
+        CompletableFuture<Boolean> closed = CompletableFuture.supplyAsync(() -> logger.close(WAIT));
+        await(sibling::terminated, "the sibling to give up: the queue makes no progress while the slow worker is blocked");
+        assertFalse(closed.isDone(), "close waits for the slow worker");
+        release.countDown();
+
+        assertTrue(closed.get(WAIT.toSeconds(), SECONDS), "everything was written in the end");
+        assertEquals(List.of(json(1)), lines(fast));
+        assertEquals(List.of(json(2)), lines(slow));
+        assertAccounted(logger.stats(), 2, 2, 0, 0);
+        assertTrue(warnings.isEmpty(), warnings::toString);
     }
 
     /** What log() does before publishing: admission, then the slot claim. Cut off before the publish. */
@@ -950,6 +995,47 @@ class AsyncThreadsTest {
 
         void open() {
             opened.countDown();
+        }
+    }
+
+    /** Real files, except that the first open of one file blocks until released. */
+    static final class BlockingOpenSinks implements SinkFactory {
+        private final Path blockedFile;
+        private final CountDownLatch opening;
+        private final CountDownLatch release;
+        private boolean blockedOnce; // one worker opens the file, so no synchronization is needed
+
+        BlockingOpenSinks(Path blockedFile, CountDownLatch opening, CountDownLatch release) {
+            this.blockedFile = blockedFile;
+            this.opening = opening;
+            this.release = release;
+        }
+
+        @Override
+        public Sink open(Path path) throws IOException {
+            if (path.equals(blockedFile) && !blockedOnce) {
+                blockedOnce = true;
+                opening.countDown();
+                try {
+                    if (!release.await(30, SECONDS)) {
+                        throw new IOException("test timed out");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException(e);
+                }
+            }
+            return FileOutputStreamSink.FACTORY.open(path);
+        }
+
+        @Override
+        public int lastByte(Path path) throws IOException {
+            return FileOutputStreamSink.FACTORY.lastByte(path);
+        }
+
+        @Override
+        public boolean createDirectoryIfMissing(Path dir) throws IOException {
+            return FileOutputStreamSink.FACTORY.createDirectoryIfMissing(dir);
         }
     }
 

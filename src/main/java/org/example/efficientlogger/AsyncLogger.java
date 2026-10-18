@@ -27,8 +27,9 @@ final class AsyncLogger implements EfficientLogger {
     private final OpenFileBudget budget;
     private final long maxChars;
     private final int maxIdLength;
+    private final int maxIdLengthBeforeNormalizing;
     private final boolean normalizeIds;
-    private final int shardSeed;
+    private final long shardKey;
     private final long startIndex;
     private final Duration closeTimeout;
     private final AtomicLong rejectedClosed = new AtomicLong();
@@ -45,6 +46,7 @@ final class AsyncLogger implements EfficientLogger {
         tracker = new OverflowTracker(admission, config, warnings);
         maxChars = config.maxQueuedChars;
         maxIdLength = config.maxIdLength;
+        maxIdLengthBeforeNormalizing = config.maxIdLengthBeforeNormalizing;
         normalizeIds = config.normalizeIds;
         String exposed = hooks.sinks.directoryExposedReason(config.directory);
         if (exposed != null) {
@@ -54,7 +56,7 @@ final class AsyncLogger implements EfficientLogger {
             warnings.emit("filePermissions is set but this file system has no POSIX permissions;"
                     + " new files follow the directory's access rules instead", null);
         }
-        shardSeed = hooks.shardSeed;
+        shardKey = hooks.shardKey;
         startIndex = hooks.ringStartIndex;
         closeTimeout = config.closeTimeout;
 
@@ -87,15 +89,15 @@ final class AsyncLogger implements EfficientLogger {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(json, "json");
         if (normalizeIds) {
+            if (id.length() > maxIdLengthBeforeNormalizing) {
+                return rejectTooLongId(); // it can't normalize to fit, so don't copy it to find out
+            }
             id = FileNamePattern.normalize(id); // route and name by the canonical form
         }
         if (id.length() > maxIdLength) {
             // It can't fit in a file name. Rejecting it here keeps a huge ID out of the queue,
             // where maxQueuedChars doesn't count it.
-            if (warnings.countTooLongId()) {
-                rings[0].wakeConsumer(); // a worker reports it, so the caller does no I/O
-            }
-            return false;
+            return rejectTooLongId();
         }
         int len = json.length();
         if (len > maxChars) {
@@ -106,7 +108,7 @@ final class AsyncLogger implements EfficientLogger {
             }
             return false;
         }
-        MpscRing ring = rings[Hashing.index(id.hashCode() ^ shardSeed, rings.length)];
+        MpscRing ring = rings[Hashing.bucket(id, shardKey, rings.length)];
         long admitted = admission.tryAcquire(len);
         if (admitted <= 0) {
             if (admitted == Admission.REJECTED_FULL) {
@@ -118,6 +120,14 @@ final class AsyncLogger implements EfficientLogger {
         }
         ring.offer(id, json, admitted); // can't fail or throw, so the admitted slot is always published
         return true;
+    }
+
+    /** Counts a message whose ID is too long for a file name. Allocates nothing. */
+    private boolean rejectTooLongId() {
+        if (warnings.countTooLongId()) {
+            rings[0].wakeConsumer(); // a worker reports it, so the caller does no I/O
+        }
+        return false;
     }
 
     @Override

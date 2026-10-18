@@ -108,7 +108,11 @@ final class Worker implements Runnable, MpscRing.Handler {
                             break;
                         }
                         if (n == 0) {
-                            waitWhileClosing();
+                            if (ring.head() != ring.tail()) {
+                                awaitPublish(); // a slot claimed but not published: back off as when open
+                            } else {
+                                waitWhileClosing();
+                            }
                         }
                         continue;
                     }
@@ -166,9 +170,11 @@ final class Worker implements Runnable, MpscRing.Handler {
             warnings.emitAll(files.takeWarnings());
             warnings.reportSuppressedIoErrors(); // each worker does; the last to finish catches the rest
         } finally {
-            terminated = true;
             synchronized (flushLock) {
-                flushDone = flushRequested.get();
+                if (ring.head() == ring.tail()) {
+                    flushDone = flushRequested.get(); // nothing is left unwritten, so every request is served
+                }
+                terminated = true;
                 flushLock.notifyAll();
             }
         }
@@ -191,7 +197,11 @@ final class Worker implements Runnable, MpscRing.Handler {
         return ticket;
     }
 
-    /** Waits until the flush with this ticket is done. False if the deadline ({@code nanoTime}) passed first. */
+    /**
+     * Waits until the flush with this ticket is done. False if the deadline ({@code nanoTime})
+     * passed first, or if the worker has stopped with messages still in its ring: ones it gave up
+     * on at close, or one published after it stopped.
+     */
     boolean awaitFlush(long ticket, long deadlineNanos) throws InterruptedException {
         synchronized (flushLock) {
             while (flushDone - ticket < 0 && !terminated) {
@@ -201,7 +211,11 @@ final class Worker implements Runnable, MpscRing.Handler {
                 }
                 TimeUnit.NANOSECONDS.timedWait(flushLock, remaining);
             }
-            return true;
+            if (flushDone - ticket >= 0) {
+                return true;
+            }
+            // The worker has stopped: everything it accepted was written only if its ring is empty.
+            return ring.head() == ring.tail();
         }
     }
 

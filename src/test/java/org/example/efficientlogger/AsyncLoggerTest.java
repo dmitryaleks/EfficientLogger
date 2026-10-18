@@ -5,13 +5,17 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -28,7 +32,7 @@ class AsyncLoggerTest {
     private final List<String> warnings = new ArrayList<>();
     private int batchSize; // 0: the logger's own
     private long ringStartIndex;
-    private int shardSeed; // 0: route by the bare hash, so worker assignment is predictable
+    private long shardKey; // fixed (0 by default), so worker assignment is predictable
 
     private EfficientLoggerBuilder builder() {
         return EfficientLogger.builder(dir, "{id}.json")
@@ -43,7 +47,7 @@ class AsyncLoggerTest {
         hooks.nanoClock = () -> now[0];
         hooks.batchSize = batchSize;
         hooks.ringStartIndex = ringStartIndex;
-        hooks.shardSeed = shardSeed;
+        hooks.shardKey = shardKey;
         return (AsyncLogger) b.build(hooks);
     }
 
@@ -114,7 +118,7 @@ class AsyncLoggerTest {
 
         logger.worker(1).runOnce();
         for (int i = 0; i < 30; i++) {
-            boolean ownedByWorker1 = Hashing.index(("id" + i).hashCode(), 3) == 1;
+            boolean ownedByWorker1 = Hashing.bucket("id" + i, 0, 3) == 1;
             if (ownedByWorker1) {
                 assertEquals(json(i) + "\n", content("id" + i));
             } else {
@@ -150,19 +154,43 @@ class AsyncLoggerTest {
     }
 
     @Test
-    void theShardSeedDecidesWhichWorkerAnIdGoesTo() {
-        // The per-logger seed, not the bare hash, picks the worker, so an attacker who controls IDs
-        // can't craft them to all pile on one worker without knowing the seed.
-        for (int seed : new int[] {0, 0x51ED2A17, -987654321}) {
-            shardSeed = seed;
+    void theShardKeyDecidesWhichWorkerAnIdGoesTo() {
+        // A per-logger key, not the bare hash, picks the worker, so an attacker who controls IDs
+        // can't craft them to all pile on one worker without knowing the key.
+        Set<Integer> workers = new HashSet<>();
+        for (long key : new long[] {0, 0x51ED2A17L, -987654321L, Long.MAX_VALUE}) {
+            shardKey = key;
             AsyncLogger logger = manual(builder().workerThreads(4));
             assertTrue(logger.log("tenant", json(1)));
-            int expected = Hashing.index("tenant".hashCode() ^ seed, 4);
+            int expected = Hashing.bucket("tenant", key, 4);
+            workers.add(expected);
             for (int w = 0; w < logger.workerCount(); w++) {
                 long queued = logger.worker(w).ring.tail(); // ringStartIndex is 0
-                assertEquals(w == expected ? 1 : 0, queued, "seed " + seed + ", worker " + w);
+                assertEquals(w == expected ? 1 : 0, queued, "key " + key + ", worker " + w);
             }
         }
+        assertTrue(workers.size() > 1, "the key made no difference: " + workers);
+    }
+
+    /**
+     * String.hashCode() collisions are easy to make in bulk and are the same whatever is mixed in
+     * afterwards, so routing by that hash let a caller pin one worker for every seed (audit F18,
+     * review R5).
+     */
+    @Test
+    void idsWithEqualHashCodesAreSpreadOverWorkers() {
+        AsyncLogger logger = manual(builder().workerThreads(4));
+        List<String> ids = HashingTest.collidingIds(5); // 32 ids, one hash code
+        for (String id : ids) {
+            assertTrue(logger.log(id, json(1)));
+        }
+        int busy = 0;
+        for (int w = 0; w < logger.workerCount(); w++) {
+            if (logger.worker(w).ring.tail() > 0) {
+                busy++;
+            }
+        }
+        assertTrue(busy >= 3, "32 ids with one hash code reached only " + busy + " of 4 workers");
     }
 
     @Test
@@ -408,6 +436,53 @@ class AsyncLoggerTest {
         logger.log("a", "{\r\n  \"n\": 1\r\n}");
         logger.worker(0).runOnce();
         assertEquals("{\"note\":\"hi\"} {\"forged\":true}\n{    \"n\": 1  }\n", content("a"));
+    }
+
+    /**
+     * Normalizing copies the ID, so an ID that can't possibly normalize to fit must be rejected
+     * before that (review R6): otherwise a 20-million-char ID costs 80 MB of garbage per call.
+     */
+    @Test
+    void normalizeIdsRejectsAHugeIdWithoutCopyingIt() {
+        com.sun.management.ThreadMXBean mx = allocationCounter();
+        AsyncLogger logger = manual(builder().normalizeIds());
+        assertFalse(logger.log("a".repeat(10_000), json(1)), "warms up the rejection path"); // 10,000 > 8 x 250
+        String huge = "x".repeat(20_000_000);
+
+        long before = mx.getCurrentThreadAllocatedBytes();
+        assertFalse(logger.log(huge, json(2)));
+        long allocated = mx.getCurrentThreadAllocatedBytes() - before;
+
+        assertTrue(allocated < 1_000_000, "rejecting the huge id allocated " + allocated + " bytes: it was copied first");
+        assertEquals(2, logger.stats().droppedInvalidId());
+    }
+
+    /**
+     * The pre-check must not be too strict: an ID over the limit as written is still valid if it
+     * normalizes to fit. "{id}.json" leaves 250 chars; NFC composes omega with three combining
+     * marks (4 chars) into one letter, so 70 of them (280 chars) normalize to 70.
+     */
+    @Test
+    void normalizeIdsAcceptsAnIdThatNormalizationShrinksToFit() {
+        AsyncLogger logger = manual(builder().normalizeIds().flushIntervalMillis(0));
+        String omegas = "ᾯ".repeat(70);
+        String normalized = FileNamePattern.normalize(omegas);
+        assertEquals(70, normalized.length(), "the sample composes 4:1");
+        assertTrue(omegas.length() > 250 && omegas.length() <= 250 * FileNamePattern.MAX_NORMALIZATION_SHRINK);
+
+        assertTrue(logger.log(omegas, json(1)));
+        logger.worker(0).runOnce();
+        assertEquals(json(1) + "\n", content(normalized));
+        assertTrue(warnings.isEmpty(), warnings.toString());
+    }
+
+    static com.sun.management.ThreadMXBean allocationCounter() {
+        assumeTrue(ManagementFactory.getThreadMXBean() instanceof com.sun.management.ThreadMXBean,
+                "needs com.sun.management.ThreadMXBean");
+        com.sun.management.ThreadMXBean mx = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+        assumeTrue(mx.isThreadAllocatedMemorySupported(), "needs per-thread allocation counting");
+        mx.setThreadAllocatedMemoryEnabled(true);
+        return mx;
     }
 
     @Test

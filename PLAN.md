@@ -116,7 +116,7 @@ return true;
   - **Admission result.** `Admission.tryAcquire(len)` returns the new word (always > 0), `REJECTED_CLOSED` (0) or `REJECTED_FULL` (−1).
   - **Ring cells.** The consumer's `head` lives in its own padded cell of `MpscRing.cells`, so its writes don't share a cache line with the fields producers read. There is no CONSUMED cell.
   - **Draining.** `MpscRing.drain(handler, max)` nulls each slot before handing the message to the handler. The caller releases admission after the batch.
-  - **Shared hashing.** `Hashing.index(hash, n)` (multiply by 0x9E3779B9, then `((m & 0xFFFFFFFFL) * n) >>> 32`) picks both async shards and sync stripes, for any `n`.
+  - **Shared hashing.** `Hashing.index(hash, n)` (multiply by 0x9E3779B9, then `((m & 0xFFFFFFFFL) * n) >>> 32`) picks both async shards and sync stripes, for any `n`. Since the code review (R5) its input is `Hashing.hash(id, key)`, a multiply-xor chain over the ID's chars with a per-logger random key, rather than `String.hashCode()`: equal hash codes are easy to craft in bulk and would share a shard for every seed.
 - **Stats** come from counters that already exist, so the hot path pays no extra atomics:
   - `accepted` = Σ shard tails
   - `written` = Σ worker counters (opaque writes)

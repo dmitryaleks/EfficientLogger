@@ -34,6 +34,7 @@ final class Config {
     final Path directory; // absolute and normalized
     final FileNamePattern fileNamePattern;
     final int maxIdLength; // log() rejects longer IDs at once: they can't fit in a file name
+    final int maxIdLengthBeforeNormalizing; // with normalizeIds: longer ones can't normalize to fit, so skip the copy
     final boolean synchronous;
     final int fileBufferBytes;
     final int maxOpenFiles;
@@ -78,6 +79,7 @@ final class Config {
         directory = b.directory.toAbsolutePath().normalize();
         fileNamePattern = FileNamePattern.parse(directory, b.fileNamePattern);
         maxIdLength = fileNamePattern.maxIdLength();
+        maxIdLengthBeforeNormalizing = maxIdLength * FileNamePattern.MAX_NORMALIZATION_SHRINK;
         synchronous = b.synchronous;
         fileBufferBytes = orDefault(b.fileBufferBytes, DEFAULT_FILE_BUFFER_BYTES);
         maxOpenFiles = orDefault(b.maxOpenFiles, DEFAULT_MAX_OPEN_FILES);

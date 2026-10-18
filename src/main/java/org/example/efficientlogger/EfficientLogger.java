@@ -53,8 +53,9 @@ public interface EfficientLogger extends AutoCloseable {
      * an fsync. In synchronous mode it returns true at once, because {@code log} already wrote.
      *
      * @return false if the timeout passed first, the calling thread was interrupted (the interrupt
-     *     flag stays set), or the caller is the logger's own thread, e.g. in a warning handler, which
-     *     can't wait for itself
+     *     flag stays set), the caller is the logger's own thread, e.g. in a warning handler, which
+     *     can't wait for itself, or {@code close} gave up on messages that were never written (see
+     *     {@link #close(Duration)})
      */
     boolean flush(Duration timeout);
 

@@ -31,16 +31,18 @@ final class SyncLogger implements EfficientLogger {
     private final OpenFileBudget budget;
     private final LongSupplier clock;
     private final int maxIdLength;
+    private final int maxIdLengthBeforeNormalizing;
     private final boolean normalizeIds;
-    private final int shardSeed;
+    private final long shardKey;
     private final AtomicLong rejectedClosed = new AtomicLong();
     private volatile boolean closed;
 
     SyncLogger(Config config, TestHooks hooks) {
         warnings = new Warnings(config.warningHandler, config.maxIdLength);
         maxIdLength = config.maxIdLength;
+        maxIdLengthBeforeNormalizing = config.maxIdLengthBeforeNormalizing;
         normalizeIds = config.normalizeIds;
-        shardSeed = hooks.shardSeed;
+        shardKey = hooks.shardKey;
         String exposed = hooks.sinks.directoryExposedReason(config.directory);
         if (exposed != null) {
             warnings.emit(exposed, null);
@@ -66,19 +68,19 @@ final class SyncLogger implements EfficientLogger {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(json, "json");
         if (normalizeIds) {
+            if (id.length() > maxIdLengthBeforeNormalizing) {
+                return rejectTooLongId(); // it can't normalize to fit, so don't copy it to find out
+            }
             id = FileNamePattern.normalize(id); // route and name by the canonical form
         }
         if (id.length() > maxIdLength) {
-            // It can't fit in a file name: reject it before taking a lock or copying it.
-            warnings.countTooLongId();
-            warnings.reportTooLongIds(); // outside any lock, like sync mode's other warnings
-            return false;
+            return rejectTooLongId(); // it can't fit in a file name: reject it before taking a lock
         }
         if (closed) {
             rejectedClosed.incrementAndGet();
             return false;
         }
-        Stripe s = stripes[Hashing.index(id.hashCode() ^ shardSeed, stripes.length)];
+        Stripe s = stripes[Hashing.bucket(id, shardKey, stripes.length)];
         boolean written;
         List<Warnings.Pending> pending;
         synchronized (s) {
@@ -93,6 +95,13 @@ final class SyncLogger implements EfficientLogger {
             warnings.emitAll(pending);
         }
         return written;
+    }
+
+    /** Counts a message whose ID is too long for a file name, and reports the first, outside any lock. */
+    private boolean rejectTooLongId() {
+        warnings.countTooLongId();
+        warnings.reportTooLongIds(); // outside any lock, like sync mode's other warnings
+        return false;
     }
 
     @Override

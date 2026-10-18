@@ -181,6 +181,24 @@ class SyncLoggerTest {
                 warnings.get(0));
     }
 
+    /** As in async mode: an ID that can't normalize to fit is rejected before it is copied (review R6). */
+    @Test
+    void normalizeIdsRejectsAHugeIdWithoutCopyingIt() {
+        com.sun.management.ThreadMXBean mx = AsyncLoggerTest.allocationCounter();
+        try (EfficientLogger logger = builder().normalizeIds().build()) {
+            assertFalse(logger.log("a".repeat(10_000), "{}"), "warms up the rejection path");
+            String huge = "x".repeat(20_000_000);
+
+            long before = mx.getCurrentThreadAllocatedBytes();
+            assertFalse(logger.log(huge, "{}"));
+            long allocated = mx.getCurrentThreadAllocatedBytes() - before;
+
+            assertTrue(allocated < 1_000_000, "rejecting the huge id allocated " + allocated + " bytes: it was copied first");
+            assertEquals(2, logger.stats().droppedInvalidId());
+        }
+        assertEquals(1, warnings.size(), warnings.toString());
+    }
+
     @Test
     void aMessageCantSpanLinesOrCarryControlCodes() throws IOException {
         try (EfficientLogger logger = builder().build()) {
@@ -357,7 +375,7 @@ class SyncLoggerTest {
         String slowId = "slow";
         String fastId = null;
         for (int i = 0; fastId == null; i++) {
-            if (Hashing.index(("fast" + i).hashCode(), 2) != Hashing.index(slowId.hashCode(), 2)) {
+            if (Hashing.bucket("fast" + i, 0, 2) != Hashing.bucket(slowId, 0, 2)) {
                 fastId = "fast" + i;
             }
         }
@@ -365,7 +383,7 @@ class SyncLoggerTest {
         CountDownLatch release = new CountDownLatch(1);
         Path slowFile = dir.toAbsolutePath().normalize().resolve("events-slow.json");
         TestHooks hooks = new TestHooks();
-        hooks.shardSeed = 0; // so the stripe prediction above holds
+        hooks.shardKey = 0; // so the stripe prediction above holds
         hooks.sinks = new BlockingSinks(slowFile, writing, release);
 
         Thread slowWriter;

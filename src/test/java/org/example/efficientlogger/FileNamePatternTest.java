@@ -140,6 +140,20 @@ class FileNamePatternTest {
         assertTrue(reason.contains(expectedReason), reason);
     }
 
+    /**
+     * log() rejects an ID longer than MAX_NORMALIZATION_SHRINK times the limit before normalizing
+     * it (review R6), which is only safe if nothing shrinks more than that. The longest canonical
+     * composition is four code points into one.
+     */
+    @Test
+    void normalizationShrinksAnIdByAtMostTheDocumentedFactor() {
+        assertEquals("ᾧ", FileNamePattern.normalize("ᾯ"), "omega + 3 marks, lower-cased");
+        assertEquals("한", FileNamePattern.normalize("한"), "three Hangul jamo");
+        assertEquals("ấ", FileNamePattern.normalize("ấ"), "a + 2 marks");
+        assertEquals("i̇", FileNamePattern.normalize("İ"), "lower-casing can lengthen, never shorten");
+        assertTrue(FileNamePattern.MAX_NORMALIZATION_SHRINK >= 2 * 4, "twice the longest known composition");
+    }
+
     @Test
     void buildsTheNameAroundTheId() {
         FileNamePattern pattern = FileNamePattern.parse(DIR, "events-{id}.json");

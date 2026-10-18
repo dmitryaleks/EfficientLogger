@@ -10,11 +10,11 @@ final class TestHooks {
     LongSupplier nanoClock = System::nanoTime;
 
     /**
-     * Mixed into each ID's hash to pick its worker or stripe. Random per logger by default, so IDs
-     * from untrusted input can't be crafted to all land on one worker or one lock; tests set a
-     * fixed value (0 leaves the mapping as the bare hash) for predictable routing.
+     * The key of the hash that picks each ID's worker or stripe (see {@link Hashing#bucket}).
+     * Random per logger by default, so IDs from untrusted input can't be crafted to all land on
+     * one worker or one lock; tests set a fixed value for predictable routing.
      */
-    int shardSeed = ThreadLocalRandom.current().nextInt();
+    long shardKey = ThreadLocalRandom.current().nextLong();
 
     /** Async: false leaves the workers to the test, which runs them with {@code Worker.runOnce}. */
     boolean startThreads = true;

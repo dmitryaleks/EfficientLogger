@@ -101,26 +101,34 @@ written in batches, each message waiting at most one flush interval.
 - log4j2 async loggers (LMAX Disruptor, garbage-free), with a logger and an appender per ID
 
 Each message is about 85 characters, spread over 50 IDs. Every logger writes to the OS null
-device, so the write calls are real but no disk is involved: this measures the loggers, not the
-disk. The test machine ran Windows 11 on an 8-core, 16-thread AMD Ryzen AI 7 PRO 350, with
-JDK 17.0.12 and JMH 1.37. Each figure comes from one fork, with 2 × 1 s of warm-up and
+device (`NUL` or `/dev/null`), so the write calls are real but no disk is involved: this
+measures the loggers, not the disk. The test machine is an 8-core, 16-thread AMD Ryzen AI 7
+PRO 350, running Windows 11 with JDK 17.0.12, and Ubuntu 24.04 under WSL 2 with
+Temurin 17.0.20.1. JMH is 1.37. Each figure comes from one fork, with 2 × 1 s of warm-up and
 3 × 1 s of measurement, so read the differences in orders of magnitude, not in percent.
 
 **Throughput, threads calling `log()` flat out.** The figures are messages written per second.
 The async EfficientLogger drops messages instead of making callers wait, so for it the calls
 per second are shown too.
 
-| Logger | 1 thread | 4 threads | 8 threads | Heap per message |
-|---|---|---|---|---|
-| EfficientLogger async, 1 worker | 12.2 M (134.6 M calls) | 10.3 M (72.3 M calls) | 9.2 M (60.0 M calls) | 0 |
-| EfficientLogger async, 4 workers | 46.1 M | 27.2 M (28.0 M calls) | 35.5 M (35.6 M calls) | 0 |
-| EfficientLogger sync | 3.2 M | 3.0 M | 3.5 M | 0 |
-| `BufferedWriter` per file | 27.1 M | 35.1 M | 35.2 M | 0.6 B |
-| log4j2 async loggers | 0.39 M | 0.52 M | 0.51 M | 0 |
+| Logger | OS | 1 thread | 4 threads | 8 threads | Heap per message |
+|---|---|---|---|---|---|
+| EfficientLogger async, 1 worker | Windows | 12.2 M (134.6 M calls) | 10.3 M (72.3 M calls) | 9.2 M (60.0 M calls) | 0 |
+| | Linux | 18.2 M (114.3 M calls) | 15.2 M (59.5 M calls) | 12.1 M (49.3 M calls) | 0 |
+| EfficientLogger async, 4 workers | Windows | 46.1 M | 27.2 M (28.0 M calls) | 35.5 M (35.6 M calls) | 0 |
+| | Linux | 39.0 M | 28.0 M (28.1 M calls) | 30.6 M (31.3 M calls) | 0 |
+| EfficientLogger sync | Windows | 3.2 M | 3.0 M | 3.5 M | 0 |
+| | Linux | 4.9 M | 10.0 M | 4.0 M | 0 |
+| `BufferedWriter` per file | Windows | 27.1 M | 35.1 M | 35.2 M | 0.6 B |
+| | Linux | 27.1 M | 47.8 M | 43.5 M | 0.6 B |
+| log4j2 async loggers | Windows | 0.39 M | 0.52 M | 0.51 M | 0 |
+| | Linux | 4.6 M | 4.4 M | 4.6 M | 0 |
 
 **Latency at a steady rate.** Each thread does about 0.7 µs of other work between calls, so
 it logs about 1.3 million messages a second. The figures are microseconds per call, including
 that work; the first row is the work alone.
+
+On Windows:
 
 | Logger | Threads | p50 | p99 | p99.9 | p99.99 |
 |---|---|---|---|---|---|
@@ -136,31 +144,75 @@ that work; the first row is the work alone.
 | `BufferedWriter` per file | 4 | 0.8 | 2.3 | 8.0 | 93.8 |
 | log4j2 async loggers | 4 | 0.9 | 3.1 | 982 | 15,379 |
 
-Windows' clock ticks every 0.1 µs, so the latencies are rounded to that.
+On Linux (WSL 2):
+
+| Logger | Threads | p50 | p99 | p99.9 | p99.99 |
+|---|---|---|---|---|---|
+| (the work alone) | 1 | 0.7 | 0.8 | 16.1 | 54.1 |
+| EfficientLogger async | 1 | 0.8 | 1.0 | 22.5 | 59.6 |
+| EfficientLogger sync | 1 | 1.0 | 1.2 | 16.0 | 51.5 |
+| `BufferedWriter` per file | 1 | 0.8 | 2.4 | 16.1 | 44.3 |
+| log4j2 async loggers | 1 | 0.9 | 3.8 | 43.4 | 101.2 |
+| (the work alone) | 4 | 0.8 | 1.2 | 16.6 | 51.1 |
+| EfficientLogger async | 4 | 0.8 | 1.2 | 19.1 | 40.4 |
+| EfficientLogger async, 4 workers | 4 | 0.9 | 1.3 | 20.0 | 44.6 |
+| EfficientLogger sync | 4 | 1.0 | 3.2 | 89.5 | 234.5 |
+| `BufferedWriter` per file | 4 | 0.8 | 1.5 | 15.2 | 61.6 |
+| log4j2 async loggers | 4 | 1.0 | 2.9 | 32.7 | 207.0 |
+
+The latencies are rounded to 0.1 µs, the tick of Windows' clock. Under WSL 2, everything past
+p99 is dominated by the virtual machine: the work alone already reaches 16 µs at p99.9, so only
+differences well above that mean anything there.
 
 What this shows:
 
 - **The async logger costs its callers almost nothing.** At a steady rate, it is within 0.3 µs
-  of doing no logging at all at p99, and it never waits for I/O. Dropping a message costs even
-  less than queueing one.
-- **One worker writes about 10 million messages a second** here, about 0.9 GB/s of JSON.
-  Beyond that it drops, and warns, rather than slowing the callers down. With 4 workers it
-  writes 27 to 46 million a second.
+  of doing no logging at all at p99, on both systems, and it never waits for I/O. Dropping a
+  message costs even less than queueing one.
+- **One worker writes 9 to 12 million messages a second** on Windows and 12 to 18 million on
+  Linux, roughly 1 to 1.5 GB/s of JSON. Beyond that it drops, and warns, rather than slowing
+  the callers down. With 4 workers it writes 27 to 46 million a second.
 - **The `BufferedWriter` approach has high throughput,** because each caller formats its own
   lines and they wait in an 8 KB buffer in memory. But nothing reaches the OS until that buffer
   fills, so a quiet file can hold lines indefinitely, and they are lost on a crash. A caller
   that fills a buffer waits for the write, which shows in its p99.99. On a real disk those
   waits are much longer.
 - **Sync mode makes one OS write call per message,** so each line is in the OS by the time
-  `log()` returns. That limits it to about 3 million messages a second.
-- **log4j2 does poorly here, most likely because of Windows.** When its ring buffer is full,
-  its callers back off with `LockSupport.parkNanos(1)`, which Windows turns into a sleep of at
-  least a millisecond (often about 15 ms). That fits its low flat-out throughput and its
-  millisecond stalls at 4 × 1.3 million messages a second. On Linux that backoff is far
-  shorter, so expect better log4j2 numbers there; this benchmark has only been run on Windows.
+  `log()` returns. That limits it to about 3 million messages a second on Windows, and 4 to
+  10 million on Linux, where system calls are cheaper.
+- **log4j2 does poorly on Windows, most likely because of Windows itself.** When its ring
+  buffer is full, its callers back off with `LockSupport.parkNanos(1)`, which Windows turns
+  into a sleep of at least a millisecond (often about 15 ms). That fits its low flat-out
+  throughput there and its millisecond stalls at 4 × 1.3 million messages a second. On Linux,
+  where that backoff is far shorter, it writes ten times as much, about 4.5 million messages a
+  second, with no such stalls. That is still a quarter to a third of one EfficientLogger
+  worker, and it adds 1.7 to 3.0 µs per call at p99.
 
 To run it with real files instead, add `-p output=disk`. The numbers then depend mostly on
 the disk.
+
+## On Linux
+
+- **Rotate with `copytruncate`.** The logger keeps each file open, so if logrotate renames a
+  file, the logger goes on writing to the renamed one, and the new file stays empty until the
+  logger reopens it, normally at the next restart. With `copytruncate`, writing carries on in
+  the original file without a gap, since it is open for appending. Lines written between
+  logrotate's copy and its truncate are lost, as with any program that logs to a file.
+- **Deleting a file or directory the logger has open** makes later lines to that file
+  disappear until it is reopened, while `stats()` still counts them as written. (Windows
+  doesn't allow deleting open files.)
+- **File names follow the Windows rules on Linux too,** so an ID such as `host:8080` is
+  dropped, as described under "What to expect". A log directory can then be copied to any OS.
+- **IDs outside ASCII need a UTF-8 locale.** Java encodes file names in the locale's charset.
+  With no `LANG` set, as in an empty environment or some containers, it can't create
+  `café.json`, so that ID's messages are dropped as invalid. A systemd service gets `LANG` from
+  `/etc/locale.conf`. Message contents are written as UTF-8 whatever the locale.
+- **Open-file limits rarely matter.** Java raises the soft limit to the hard limit at startup.
+  If even that is too low, the logger closes its least recently used files, warns, and retries,
+  so nothing is lost.
+- **`systemctl stop`** sends SIGTERM, which runs the shutdown hook, so everything queued is
+  written. `kill -9` and the out-of-memory killer lose what is still queued.
+- The library uses only `java.base`, so `java-17-openjdk-headless` is enough to run it.
 
 ## Building and testing
 
@@ -170,7 +222,8 @@ the disk.
 ```
 
 `build` runs the unit, integration and stress tests, then the allocation tests in two separate
-JVMs (`allocationTest` and `allocationTestNoEA`). The library is
+JVMs (`allocationTest` and `allocationTestNoEA`). It passes on Windows 11 and on Ubuntu 24.04
+(WSL 2). The library is
 `build/libs/EfficientLogger-1.0-SNAPSHOT.jar`, with no dependencies. Benchmarks run separately:
 
 ```
@@ -183,10 +236,8 @@ The design, the reasoning behind it and the milestones are in [PLAN.md](PLAN.md)
 
 ## Not included
 
-Rotation, compression, an fsync policy, and log4j integration. Other limits:
+Rotation (on Linux, see logrotate's `copytruncate` above), compression, an fsync policy, and
+log4j integration. Other limits:
 
-- On Unix, deleting a file or directory the logger has open makes later writes to that file
-  disappear until it is reopened, as with most loggers. Windows doesn't allow deleting open
-  files.
 - Running out of file descriptors is recognized by the English error message, on Unix and
   Windows. With a localized message, the file is retried a second later like any other error.

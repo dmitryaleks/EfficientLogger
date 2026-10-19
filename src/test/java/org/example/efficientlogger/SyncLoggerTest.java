@@ -89,7 +89,7 @@ class SyncLoggerTest {
 
     @Test
     void writesEachMessageBeforeLogReturns() throws IOException {
-        try (EfficientLogger logger = builder().build()) {
+        try (EfficientLogger logger = builder().build(new TestHooks())) {
             assertTrue(logger.log("a", "{\"n\":1}"));
             assertEquals("{\"n\":1}\n", read("a"));
 
@@ -103,10 +103,10 @@ class SyncLoggerTest {
 
     @Test
     void appendsAcrossRestarts() throws IOException {
-        try (EfficientLogger logger = builder().build()) {
+        try (EfficientLogger logger = builder().build(new TestHooks())) {
             logger.log("a", "{\"run\":1}");
         }
-        try (EfficientLogger logger = builder().build()) {
+        try (EfficientLogger logger = builder().build(new TestHooks())) {
             logger.log("a", "{\"run\":2}");
         }
         assertEquals("{\"run\":1}\n{\"run\":2}\n", read("a"));
@@ -115,7 +115,7 @@ class SyncLoggerTest {
     @Test
     void finishesATornLastLineBeforeAppending() throws IOException {
         Files.writeString(file("a"), "{\"cut off", UTF_8);
-        try (EfficientLogger logger = builder().build()) {
+        try (EfficientLogger logger = builder().build(new TestHooks())) {
             logger.log("a", "{}");
         }
         assertEquals("{\"cut off\n{}\n", read("a"));
@@ -123,7 +123,7 @@ class SyncLoggerTest {
 
     @Test
     void usesTheConfiguredLineSeparator() throws IOException {
-        try (EfficientLogger logger = builder().lineSeparator("\r\n").build()) {
+        try (EfficientLogger logger = builder().lineSeparator("\r\n").build(new TestHooks())) {
             logger.log("a", "{\"n\":1}");
             logger.log("a", "{\"n\":2}");
         }
@@ -133,7 +133,7 @@ class SyncLoggerTest {
     @Test
     void writesMessagesLargerThanTheBufferExactly() throws IOException {
         String big = "{\"text\":\"" + "ab\u00E9\u6771\uD83D\uDE00".repeat(300) + "\"}";
-        try (EfficientLogger logger = builder().fileBufferBytes(64).build()) {
+        try (EfficientLogger logger = builder().fileBufferBytes(64).build(new TestHooks())) {
             assertTrue(logger.log("a", big));
             assertTrue(logger.log("a", "{}"));
         }
@@ -142,7 +142,7 @@ class SyncLoggerTest {
 
     @Test
     void worksWithASingleStripe() throws IOException {
-        try (EfficientLogger logger = builder().syncStripes(1).build()) {
+        try (EfficientLogger logger = builder().syncStripes(1).build(new TestHooks())) {
             for (int i = 0; i < 10; i++) {
                 assertTrue(logger.log("id" + i, "{}"));
             }
@@ -154,7 +154,7 @@ class SyncLoggerTest {
 
     @Test
     void worksWithTheLargestMaxOpenFiles() throws IOException {
-        try (EfficientLogger logger = builder().maxOpenFiles(Integer.MAX_VALUE).build()) {
+        try (EfficientLogger logger = builder().maxOpenFiles(Integer.MAX_VALUE).build(new TestHooks())) {
             assertTrue(logger.log("a", "{}"));
         }
         assertEquals("{}\n", read("a"));
@@ -165,7 +165,7 @@ class SyncLoggerTest {
     @Test
     void createsTheDirectory() throws IOException {
         Path nested = dir.resolve("x").resolve("y");
-        try (EfficientLogger logger = EfficientLogger.builder(nested, "{id}.json", 1 << 20).synchronous().build()) {
+        try (EfficientLogger logger = EfficientLogger.builder(nested, "{id}.json", 1 << 20).synchronous().build(new TestHooks())) {
             logger.log("a", "{}");
         }
         assertEquals("{}\n", Files.readString(nested.resolve("a.json"), UTF_8));
@@ -175,7 +175,7 @@ class SyncLoggerTest {
     void buildFailsWhenTheDirectoryIsAFile() throws IOException {
         Path notADirectory = Files.createFile(dir.resolve("plain-file"));
         UncheckedIOException e = assertThrows(UncheckedIOException.class,
-                () -> EfficientLogger.builder(notADirectory, "{id}.json", 1 << 20).synchronous().build());
+                () -> EfficientLogger.builder(notADirectory, "{id}.json", 1 << 20).synchronous().build(new TestHooks()));
         assertTrue(e.getMessage().startsWith("can't create directory"), e.getMessage());
     }
 
@@ -183,7 +183,7 @@ class SyncLoggerTest {
 
     @Test
     void dropsInvalidIdsWithOneWarningEach() throws IOException {
-        try (EfficientLogger logger = builder().build()) {
+        try (EfficientLogger logger = builder().build(new TestHooks())) {
             assertFalse(logger.log("../escape", "{}"));
             assertFalse(logger.log("../escape", "{}"));
             assertEquals(2, logger.stats().droppedInvalidId());
@@ -198,7 +198,7 @@ class SyncLoggerTest {
     @Test
     void rejectsIdsTooLongForAFileNameAtOnce() throws IOException {
         int longest = 255 - "events-".length() - ".json".length();
-        try (EfficientLogger logger = builder().build()) {
+        try (EfficientLogger logger = builder().build(new TestHooks())) {
             assertTrue(logger.log("a".repeat(longest), "{}"));
             assertFalse(logger.log("a".repeat(longest + 1), "{}"));
             assertFalse(logger.log("b".repeat(10_000_000), "{}"));
@@ -218,7 +218,7 @@ class SyncLoggerTest {
     @Test
     void normalizeIdsRejectsAHugeIdWithoutCopyingIt() {
         com.sun.management.ThreadMXBean mx = AsyncLoggerTest.allocationCounter();
-        try (EfficientLogger logger = builder().normalizeIds().build()) {
+        try (EfficientLogger logger = builder().normalizeIds().build(new TestHooks())) {
             assertFalse(logger.log("a".repeat(10_000), "{}"), "warms up the rejection path");
             String huge = "x".repeat(20_000_000);
 
@@ -234,7 +234,7 @@ class SyncLoggerTest {
 
     @Test
     void aMessageCantSpanLinesOrCarryControlCodes() throws IOException {
-        try (EfficientLogger logger = builder().build()) {
+        try (EfficientLogger logger = builder().build(new TestHooks())) {
             logger.log("a", "{\"a\":1}\n{\"b\":2}");
             logger.log("a", "{\"t\":\"" + (char) 0x1B + "[2J\"}");
         }
@@ -250,7 +250,7 @@ class SyncLoggerTest {
                 .synchronous()
                 .filePermissions(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"))
                 .warningHandler((message, cause) -> warnings.add(message))
-                .build()) {
+                .build(new TestHooks())) {
             assertTrue(logger.log("a", "{}"));
         }
         assertEquals("rwx------",
@@ -262,7 +262,7 @@ class SyncLoggerTest {
 
     @Test
     void maxFilesCapsTheNumberOfFilesCreated() throws IOException {
-        try (EfficientLogger logger = builder().maxFiles(2).build()) {
+        try (EfficientLogger logger = builder().maxFiles(2).build(new TestHooks())) {
             assertTrue(logger.log("a", "{}"));
             assertTrue(logger.log("b", "{}"));
             assertFalse(logger.log("c", "{}"), "over maxFiles: no file for c");
@@ -290,7 +290,7 @@ class SyncLoggerTest {
 
     @Test
     void rejectsMessagesAfterClose() {
-        EfficientLogger logger = builder().build();
+        EfficientLogger logger = builder().build(new TestHooks());
         assertTrue(logger.log("a", "{}"));
         logger.close();
 
@@ -361,7 +361,7 @@ class SyncLoggerTest {
         int ids = 50;
         CountDownLatch start = new CountDownLatch(1);
         ExecutorService pool = Executors.newFixedThreadPool(threads);
-        try (EfficientLogger logger = builder().build()) {
+        try (EfficientLogger logger = builder().build(new TestHooks())) {
             List<Future<?>> done = new ArrayList<>();
             for (int t = 0; t < threads; t++) {
                 int thread = t;
@@ -436,7 +436,7 @@ class SyncLoggerTest {
 
     @Test
     void anInterruptedCallerStillWritesAndStaysInterrupted() throws IOException {
-        try (EfficientLogger logger = builder().build()) {
+        try (EfficientLogger logger = builder().build(new TestHooks())) {
             Thread.currentThread().interrupt();
             try {
                 assertTrue(logger.log("a", "{}"));
@@ -456,7 +456,7 @@ class SyncLoggerTest {
         AtomicReference<EfficientLogger> ref = new AtomicReference<>();
         EfficientLogger logger = builder()
                 .warningHandler((message, cause) -> ref.get().log("warnings", "{\"warning\":\"seen\"}"))
-                .build();
+                .build(new TestHooks());
         ref.set(logger);
         try (logger) {
             assertFalse(logger.log("bad/id", "{}"));
@@ -469,7 +469,7 @@ class SyncLoggerTest {
     @Test
     void aWarningHandlerMayClose() {
         AtomicReference<EfficientLogger> ref = new AtomicReference<>();
-        EfficientLogger logger = builder().warningHandler((message, cause) -> ref.get().close()).build();
+        EfficientLogger logger = builder().warningHandler((message, cause) -> ref.get().close()).build(new TestHooks());
         ref.set(logger);
 
         assertFalse(logger.log("bad/id", "{}"));

@@ -33,16 +33,18 @@ final class Config {
     // Both modes
     final Path directory; // absolute and normalized
     final FileNamePattern fileNamePattern;
+    // Process-wide once built (see ProcessLimits): the latest build sets them for every logger.
     final long maxFileBytes; // a file never grows past this; maxFileSizeKb * 1024
-    final long minFreeDiskBytes; // shed messages while the volume has less free; 0 means off
+    final long minFreeDiskBytes; // shed messages while the volume has less free; 0 means not set here
     final long resumeFreeDiskBytes; // ...until it has at least this much again
-    final long maxCharsPerSecond; // the output rate cap; 0 means off
+    final long maxCharsPerSecond; // the output rate cap; 0 means not set here
     final int maxIdLength; // log() rejects longer IDs at once: they can't fit in a file name
     final int maxIdLengthBeforeNormalizing; // with normalizeIds: longer ones can't normalize to fit, so skip the copy
     final boolean synchronous;
     final int fileBufferBytes;
     final int maxOpenFiles;
-    final int maxFiles; // logger-wide cap on new files created; Integer.MAX_VALUE means unlimited
+    final int maxFiles; // process-wide cap on new files created; Integer.MAX_VALUE means unlimited
+    final boolean maxFilesSet; // whether this builder set it (an unset one leaves the process's cap as it is)
     final int maxFileEntries; // per FileTable: maxOpenFiles plus room for entries that hold no file
     final byte[] lineSeparator; // don't modify
     final WarningHandler warningHandler;
@@ -92,6 +94,7 @@ final class Config {
         fileBufferBytes = orDefault(b.fileBufferBytes, DEFAULT_FILE_BUFFER_BYTES);
         maxOpenFiles = orDefault(b.maxOpenFiles, DEFAULT_MAX_OPEN_FILES);
         maxFiles = orDefault(b.maxFiles, FileCreationBudget.UNLIMITED);
+        maxFilesSet = b.maxFiles != null;
         maxFileEntries = (int) Math.min(Integer.MAX_VALUE, (long) maxOpenFiles + FileTable.EXTRA_ENTRIES);
         lineSeparator = (b.lineSeparator != null ? b.lineSeparator : "\n").getBytes(StandardCharsets.US_ASCII);
         warningHandler = b.warningHandler != null ? b.warningHandler : WarningHandler.stderr();

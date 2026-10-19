@@ -10,17 +10,23 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
-/** The output rate cap as a meter on a fake clock. */
+/** The output rate cap as a meter on a fake clock: the shared meter and one logger's view of it. */
 class RateLimitTest {
 
     private static final long MS = 1_000_000L;
 
     private final List<String> warnings = new ArrayList<>();
     private final Warnings out = new Warnings((message, cause) -> warnings.add(message));
+    private final RateMeter meter = new RateMeter();
+
+    private RateLimit limit(long charsPerSecond) {
+        meter.set(charsPerSecond);
+        return new RateLimit(meter, out, 0);
+    }
 
     @Test
     void allowsABurstOfASecondsWorthThenTheRate() {
-        RateLimit r = new RateLimit(100, out, 0); // 100 chars/s: a 10-char message is 100 ms
+        RateLimit r = limit(100); // 100 chars/s: a 10-char message is 100 ms
         for (int i = 0; i < 10; i++) {
             assertTrue(r.tryAcquire(10, 0), "message " + i + " of the burst");
         }
@@ -44,17 +50,56 @@ class RateLimitTest {
     }
 
     @Test
+    void untilSomeBuildSetsTheCapEveryMessageIsAccepted() {
+        RateLimit r = new RateLimit(meter, out, 0);
+        assertFalse(r.enabled());
+        for (int i = 0; i < 1000; i++) {
+            assertTrue(r.tryAcquire(1_000_000, 0));
+        }
+        meter.set(10); // a later build sets it
+        assertTrue(r.enabled());
+        assertTrue(r.tryAcquire(10, 0), "the bucket starts full");
+        assertTrue(r.tryAcquire(10, 0));
+        assertFalse(r.tryAcquire(10, 0));
+    }
+
+    @Test
+    void theRateCanChangeAndTheOutputChargedSoFarStands() {
+        RateLimit r = limit(10); // a 10-char message is a second
+        assertTrue(r.tryAcquire(10, 0));
+        assertTrue(r.tryAcquire(10, 0)); // 2 s ahead... judged at 1 s
+        assertFalse(r.tryAcquire(10, 0), "2 s ahead");
+        meter.set(1000); // raised: the next charge is cheap, but the 2 s already charged stand
+        assertFalse(r.tryAcquire(10, 500 * MS), "still 1.5 s ahead");
+        assertTrue(r.tryAcquire(10, 1_000 * MS), "1 s ahead: within the burst; charged 10 ms now");
+        assertFalse(r.tryAcquire(10, 1_000 * MS), "1.01 s ahead");
+        assertTrue(r.tryAcquire(10, 1_010 * MS));
+    }
+
+    @Test
     void aLargeMessageIsAcceptedWhenCalmAndChargedUpToADay() {
-        RateLimit r = new RateLimit(1, out, 0); // 1 char/s
+        RateLimit r = limit(1); // 1 char/s
         assertTrue(r.tryAcquire(5000, 0), "far over a second's worth, but the bucket is calm");
         assertFalse(r.tryAcquire(1, 0));
         assertFalse(r.tryAcquire(1, TimeUnit.SECONDS.toNanos(4998)), "5000 s ahead: still 2 s to go");
         assertTrue(r.tryAcquire(1, TimeUnit.SECONDS.toNanos(4999)), "1 s ahead: within the burst");
 
-        RateLimit capped = new RateLimit(1, out, 0);
+        RateMeter other = new RateMeter();
+        other.set(1);
+        RateLimit capped = new RateLimit(other, out, 0);
         assertTrue(capped.tryAcquire(Integer.MAX_VALUE, 0), "would be 68 years at this rate; charged a day");
         assertFalse(capped.tryAcquire(1, TimeUnit.HOURS.toNanos(23)));
-        assertTrue(capped.tryAcquire(1, TimeUnit.DAYS.toNanos(1) - RateLimit.BURST_NANOS));
+        assertTrue(capped.tryAcquire(1, TimeUnit.DAYS.toNanos(1) - RateMeter.BURST_NANOS));
+    }
+
+    @Test
+    void aNegativeClockIsFine() {
+        RateLimit r = limit(10); // nanoTime may be negative; the first charge must still see a full bucket
+        long now = -TimeUnit.DAYS.toNanos(400);
+        assertTrue(r.tryAcquire(10, now));
+        assertTrue(r.tryAcquire(10, now));
+        assertFalse(r.tryAcquire(10, now));
+        assertTrue(r.tryAcquire(10, now + 1_000 * MS));
     }
 
     /** Several producers against one meter: the total accepted can't exceed the rate times the time plus one burst. */
@@ -62,7 +107,7 @@ class RateLimitTest {
     void staysExactUnderContention() throws InterruptedException {
         long rate = 1_000_000; // chars/s
         int len = 100;
-        RateLimit r = new RateLimit(rate, out, System.nanoTime());
+        RateLimit r = limit(rate);
         long start = System.nanoTime();
         long until = start + 500 * MS;
         AtomicLong accepted = new AtomicLong();
@@ -84,7 +129,7 @@ class RateLimitTest {
         }
         long elapsed = System.nanoTime() - start;
         long chars = accepted.get() * len;
-        long bound = (long) (rate * ((elapsed + RateLimit.BURST_NANOS) / 1e9)) + len;
+        long bound = (long) (rate * ((elapsed + RateMeter.BURST_NANOS) / 1e9)) + len;
         assertTrue(chars <= bound, "accepted " + chars + " chars in " + elapsed / MS + " ms; the cap allows " + bound);
         assertTrue(chars >= rate * (elapsed / 1e9) * 0.5,
                 "accepted only " + chars + " chars in " + elapsed / MS + " ms although the offered load was far over the cap");
@@ -92,7 +137,7 @@ class RateLimitTest {
 
     @Test
     void reportsEpisodesThatEndAfterAQuietSecond() {
-        RateLimit r = new RateLimit(10, out, 0);
+        RateLimit r = limit(10);
         assertTrue(r.tryAcquire(10, 0));
         assertTrue(r.tryAcquire(10, 0));
         assertFalse(r.tryAcquire(10, 0));

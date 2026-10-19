@@ -53,8 +53,8 @@ final class Worker implements MpscRing.Handler {
     final FileTable files;
     private final Admission admission;
     private final OverflowTracker tracker;
-    private final DiskWatch disk; // null unless minFreeDiskSpace is set
-    private final RateLimit rate; // null unless maxCharsPerSecond is set
+    private final DiskWatch disk; // this logger's view of the process-wide free-space mark
+    private final RateLimit rate; // this logger's view of the process-wide rate cap
     private final Warnings warnings;
     private final LongSupplier clock;
     private final int batchSize;
@@ -177,12 +177,8 @@ final class Worker implements MpscRing.Handler {
     /** Reports what the queue, the disk and the rate cap have dropped since last time; takes a free-space reading if one is due. */
     private void checkLimits(long now) {
         tracker.check(now);
-        if (disk != null) {
-            disk.check(now);
-        }
-        if (rate != null) {
-            rate.check(now);
-        }
+        disk.check(now);
+        rate.check(now);
     }
 
     /**
@@ -289,12 +285,8 @@ final class Worker implements MpscRing.Handler {
         try {
             files.closeAll(clock.getAsLong());
             tracker.finalReport();
-            if (disk != null) {
-                disk.finalReport();
-            }
-            if (rate != null) {
-                rate.finalReport();
-            }
+            disk.finalReport();
+            rate.finalReport();
             warnings.reportTooLongIds();
             warnings.reportOversizeMessages();
             warnings.emitAll(files.takeWarnings());

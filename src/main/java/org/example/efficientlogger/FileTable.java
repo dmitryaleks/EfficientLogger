@@ -45,7 +45,7 @@ final class FileTable {
     private final byte[] separator;
     private final int bufferBytes;
     private final int maxEntries;
-    private final long maxFileBytes;
+    private final ProcessLimits limits; // the file cap and the file-count budget, shared by the process
     private final SinkFactory sinks;
     private final OpenFileBudget budget;
     private final FileCreationBudget fileBudget;
@@ -69,17 +69,17 @@ final class FileTable {
     private final long[] counters = new long[5];
     private List<Warnings.Pending> pendingWarnings;
 
-    /** @param maxFileBytes a file never grows past this: records that would take it past are dropped */
-    FileTable(FileNamePattern pattern, byte[] separator, int bufferBytes, int maxEntries, long maxFileBytes,
-            SinkFactory sinks, OpenFileBudget budget, FileCreationBudget fileBudget, Warnings warnings) {
+    /** @param limits the process-wide file cap (a file never grows past it) and file-count budget */
+    FileTable(FileNamePattern pattern, byte[] separator, int bufferBytes, int maxEntries,
+            SinkFactory sinks, OpenFileBudget budget, ProcessLimits limits, Warnings warnings) {
         this.pattern = pattern;
         this.separator = separator;
         this.bufferBytes = bufferBytes;
         this.maxEntries = maxEntries;
-        this.maxFileBytes = maxFileBytes;
+        this.limits = limits;
         this.sinks = sinks;
         this.budget = budget;
-        this.fileBudget = fileBudget;
+        this.fileBudget = limits.files;
         this.warnings = warnings;
         this.files = new HashMap<>(Math.min(maxEntries, 4096) * 4 / 3 + 1);
     }
@@ -110,11 +110,12 @@ final class FileTable {
             r = Utf8.encode(json, 0, b, start, limit);
             fits = Utf8.nextChar(r) == json.length();
         }
+        long cap = limits.maxFileBytes();
         if (fits) {
             // The buffer's earlier records plus this one is what the file grows by.
-            if (f.bytesOnDisk + Utf8.endPos(r) + separator.length > maxFileBytes) {
+            if (f.bytesOnDisk + Utf8.endPos(r) + separator.length > cap) {
                 f.pos = start; // forget the encoded bytes
-                fileFull(f, now);
+                fileFull(f, now, cap);
                 return;
             }
         } else {
@@ -127,8 +128,8 @@ final class FileTable {
             r = Utf8.encode(json, 0, b, 0, limit);
             boolean whole = Utf8.nextChar(r) == json.length();
             long bytes = whole ? Utf8.endPos(r) : encodedBytes(json, b, limit);
-            if (f.bytesOnDisk + bytes + separator.length > maxFileBytes) {
-                fileFull(f, now);
+            if (f.bytesOnDisk + bytes + separator.length > cap) {
+                fileFull(f, now, cap);
                 return;
             }
             if (!whole) {
@@ -203,8 +204,9 @@ final class FileTable {
         long r = Utf8.encode(json, 0, b, 0, limit);
         boolean whole = Utf8.nextChar(r) == json.length();
         long bytes = whole ? Utf8.endPos(r) : encodedBytes(json, b, limit);
-        if (f.bytesOnDisk + bytes + separator.length > maxFileBytes) {
-            fileFull(f, now);
+        long cap = limits.maxFileBytes();
+        if (f.bytesOnDisk + bytes + separator.length > cap) {
+            fileFull(f, now, cap);
             return false;
         }
         if (!whole) {
@@ -325,12 +327,13 @@ final class FileTable {
     }
 
     private boolean reopenIfDue(FileState f, long now) {
-        if ((f.state != FileState.FAILED && f.state != FileState.FULL) || now - f.retryAtNanos < 0) {
+        if (f.state == FileState.OPEN || f.state == FileState.INVALID || now - f.retryAtNanos < 0) {
             return false;
         }
         if (f.state == FileState.FULL) {
             // Worth reopening only if something has made the file smaller (truncated or rotated
-            // it); otherwise it is still full, and so is any record that would fit in the gap.
+            // it), or the process's cap has been raised since it filled; otherwise it is still
+            // full, and so is any record that would fit in the gap.
             long size;
             try {
                 size = sinks.size(f.path);
@@ -340,15 +343,18 @@ final class FileTable {
                 reportIoError("can't check the size of " + f.path + "; dropping its messages for 1 s", e, now);
                 return false;
             }
-            if (size >= f.fullAtBytes || size >= maxFileBytes) {
+            long cap = limits.maxFileBytes();
+            if (size >= cap || (size >= f.fullAtBytes && cap <= f.fullCapBytes)) {
                 // Still full: not shrunk, or shrunk but not below the cap (a file left larger than
-                // the cap by a run with a bigger one). Either way no new warning; remember the
-                // smaller size so a further shrink is seen.
+                // the cap by a run with a bigger one), and the cap no higher than when it filled.
+                // No new warning; remember the smaller size and cap so a further change is seen.
                 f.fullAtBytes = Math.min(f.fullAtBytes, size);
+                f.fullCapBytes = Math.min(f.fullCapBytes, cap);
                 f.retryAtNanos = now + RETRY_NANOS;
                 return false;
             }
         }
+        // FAILED: the retry is due. CAPPED: the process's maxFiles may have been raised; open() checks.
         open(f, now);
         return f.state == FileState.OPEN;
     }
@@ -366,21 +372,23 @@ final class FileTable {
             int last = sinks.lastByte(f.path);
             if (last == SinkFactory.MISSING) {
                 if (!fileBudget.tryCreate()) {
-                    // The file doesn't exist yet and the logger is at its maxFiles limit: don't
+                    // The file doesn't exist yet and the process is at its maxFiles limit: don't
                     // create another. Reopening a file that already exists, even an empty one, is
-                    // always allowed.
+                    // always allowed. Tried again in a second, in case the limit is raised.
                     budget.release();
                     f.state = FileState.CAPPED;
+                    f.retryAtNanos = now + RETRY_NANOS;
                     reportMaxFilesReached();
                     return;
                 }
                 reserved = true;
             }
             long size = last >= 0 ? sinks.size(f.path) : 0;
-            if (size >= maxFileBytes) {
+            long cap = limits.maxFileBytes();
+            if (size >= cap) {
                 // Already at the cap, e.g. from an earlier run: nothing more fits, so don't open it.
                 budget.release();
-                markFull(f, size, now);
+                markFull(f, size, now, cap);
                 return;
             }
             sink = openSink(f.path, now);
@@ -567,7 +575,7 @@ final class FileTable {
      * the buffer holds (which fits), close the file and mark it FULL. It is reopened only once it
      * has shrunk (see {@link #reopenIfDue}), which is checked at most once a second.
      */
-    private void fileFull(FileState f, long now) {
+    private void fileFull(FileState f, long now, long cap) {
         add(FILE_FULL, 1);
         flushFile(f, now);
         if (f.state != FileState.OPEN) {
@@ -577,12 +585,13 @@ final class FileTable {
         if (e != null) {
             reportIoError("can't close " + f.path, e, now);
         }
-        markFull(f, f.bytesOnDisk, now);
+        markFull(f, f.bytesOnDisk, now, cap);
     }
 
-    private void markFull(FileState f, long size, long now) {
+    private void markFull(FileState f, long size, long now, long cap) {
         f.state = FileState.FULL;
         f.fullAtBytes = size;
+        f.fullCapBytes = cap;
         f.retryAtNanos = now + RETRY_NANOS;
         int n = warnings.admitFileFullReport();
         if (n != 0) {
@@ -685,8 +694,9 @@ final class FileTable {
 
     private void reportMaxFilesReached() {
         if (warnings.admitMaxFilesReport()) {
-            warn("the logger has reached its limit of " + fileBudget.max() + " files (maxFiles); dropping"
-                    + " messages for ids without a file yet (counted in stats().droppedInvalidId())", null);
+            warn("this process has reached its limit of " + fileBudget.max() + " files (maxFiles, shared by all its"
+                    + " loggers); dropping messages for ids without a file yet (counted in stats().droppedInvalidId())"
+                    + " until it is raised", null);
         }
     }
 

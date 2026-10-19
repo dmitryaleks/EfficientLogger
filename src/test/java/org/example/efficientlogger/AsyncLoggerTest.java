@@ -33,7 +33,7 @@ class AsyncLoggerTest {
     private int batchSize; // 0: the logger's own
     private long ringStartIndex;
     private long shardKey; // fixed (0 by default), so worker assignment is predictable
-    private DiskWatch.Probe freeSpace; // for minFreeDiskSpace tests
+    private DiskMark.Probe freeSpace; // for minFreeDiskSpace tests
 
     private EfficientLoggerBuilder builder() {
         return EfficientLogger.builder(dir, "{id}.json", 1 << 20)

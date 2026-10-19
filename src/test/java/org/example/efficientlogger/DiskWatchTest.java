@@ -2,36 +2,46 @@ package org.example.efficientlogger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-/** The free-space low-water mark on a fake probe and a fake clock. */
+/** The free-space low-water mark on a fake probe and a fake clock: the shared volume state and one logger's view of it. */
 class DiskWatchTest {
 
     private static final long MS = 1_000_000L;
     private static final long MIB = 1 << 20;
+    private static final Path DIR = Paths.get("fake-disk-logs").toAbsolutePath().normalize();
 
     private final List<String> warnings = new ArrayList<>();
     private final Warnings out = new Warnings((message, cause) -> warnings.add(cause == null ? message : message + " | " + cause.getMessage()));
+    private final ProcessLimits limits = new ProcessLimits();
     private long free = 10 * MIB;
     private boolean probeFails;
     private int readings;
 
-    private DiskWatch watch(long now) {
-        return new DiskWatch(() -> {
+    private DiskMark.Volume volume() {
+        return limits.disk.volume(DIR, () -> {
             readings++;
             if (probeFails) {
                 throw new IOException("no such volume");
             }
             return free;
-        }, MIB, 2 * MIB, out, now);
+        });
+    }
+
+    /** A logger's view, with the mark set to 1 MiB / 2 MiB. */
+    private DiskWatch watch(long now) {
+        limits.disk.set(MIB, 2 * MIB);
+        return new DiskWatch(volume(), out, now);
     }
 
     @Test
@@ -59,6 +69,20 @@ class DiskWatchTest {
         assertTrue(w.shedding(), "below the floor again");
         assertEquals(5, readings);
         assertTrue(warnings.isEmpty(), "nothing was dropped, so nothing is reported");
+    }
+
+    @Test
+    void untilSomeBuildSetsTheMarkNothingIsReadOrShed() {
+        free = 100 << 10;
+        DiskWatch w = new DiskWatch(volume(), out, 0);
+        w.check(1_000 * MS);
+        assertEquals(0, readings, "the probe is never called");
+        assertFalse(w.shedding());
+
+        limits.disk.set(MIB, 2 * MIB); // a later build sets it
+        w.check(2_000 * MS);
+        assertEquals(1, readings);
+        assertTrue(w.shedding(), "and it applies to the logger built before");
     }
 
     @Test
@@ -109,19 +133,6 @@ class DiskWatchTest {
     }
 
     @Test
-    void oneDroppingCallerPerIntervalWakesAWorkerOnceAReadingIsOverdue() {
-        DiskWatch w = watch(0);
-        assertFalse(w.shouldWake(999 * MS), "not overdue yet");
-        assertTrue(w.shouldWake(1_000 * MS), "overdue: this caller wakes a worker");
-        assertFalse(w.shouldWake(1_000 * MS), "the next caller doesn't (review 20, C2)");
-        assertFalse(w.shouldWake(1_999 * MS));
-        assertTrue(w.shouldWake(2_000 * MS), "still nobody took the reading: one more wake");
-        w.check(2_000 * MS); // the worker takes it
-        assertFalse(w.shouldWake(2_500 * MS), "nothing is overdue");
-        assertTrue(w.shouldWake(3_000 * MS), "overdue again");
-    }
-
-    @Test
     void anEpisodeCutShortByAProbeFailureSaysSo() {
         DiskWatch w = watch(0);
         free = 100 << 10;
@@ -141,12 +152,38 @@ class DiskWatchTest {
     }
 
     @Test
-    void readingsOfOneVolumeAreSharedBetweenLoggers(@TempDir Path dir) throws IOException {
+    void oneDroppingCallerPerIntervalWakesAWorkerOnceAReadingIsOverdue() {
+        DiskWatch w = watch(0);
+        assertFalse(w.shouldWake(999 * MS), "not overdue yet");
+        assertTrue(w.shouldWake(1_000 * MS), "overdue: this caller wakes a worker");
+        assertFalse(w.shouldWake(1_000 * MS), "the next caller doesn't (review 20, C2)");
+        assertFalse(w.shouldWake(1_999 * MS));
+        assertTrue(w.shouldWake(2_000 * MS), "still nobody took the reading: one more wake");
+        w.check(2_000 * MS); // the worker takes it
+        assertFalse(w.shouldWake(2_500 * MS), "nothing is overdue");
+        assertTrue(w.shouldWake(3_000 * MS), "overdue again");
+    }
+
+    @Test
+    void loggersOnOneVolumeShareItsReadingAndItsShedding() {
+        DiskWatch a = watch(0);
+        DiskWatch b = new DiskWatch(volume(), out, 0); // another logger, same directory
+        assertEquals(1, readings, "one reading for both");
+        free = 100 << 10;
+        a.check(1_000 * MS);
+        assertEquals(2, readings);
+        assertTrue(b.shedding(), "b sheds on the reading a took");
+        b.recordDrop();
+        b.check(1_100 * MS);
+        assertEquals(1, warnings.size(), "b reports its own drop");
+        assertEquals(0, a.drops());
+        assertEquals(1, b.drops());
+    }
+
+    @Test
+    void realDirectoriesOnOneFileStoreShareOneVolume(@TempDir Path dir) throws IOException {
         Path sub = Files.createDirectories(dir.resolve("sub"));
-        long a = DiskWatch.forDirectory(dir).usableBytes();
-        long b = DiskWatch.forDirectory(sub).usableBytes();
-        assertTrue(a > 0, "a real reading");
-        assertEquals(a, b, "the second probe, on the same volume within the interval, reuses the first's reading");
+        assertSame(limits.disk.volume(dir, null), limits.disk.volume(sub, null));
     }
 
     @Test

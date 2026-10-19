@@ -24,7 +24,8 @@ final class FileState {
     long lastUsedNanos;
     long retryAtNanos;
     long bytesOnDisk; // while OPEN: the file's size once the buffer is written out, less the buffer
-    long fullAtBytes; // while FULL: its size when it filled; it is reopened only once smaller than this
+    long fullAtBytes; // while FULL: its size when it filled; it is reopened once smaller than this...
+    long fullCapBytes; // ...or once the process-wide cap is above what it was when the file filled
 
     FileState(String id, Path path) {
         this.id = id;

@@ -24,7 +24,7 @@ class FileTableTest {
             (message, cause) -> warningLog.add(cause == null ? message : message + " | " + cause.getMessage()));
     private FakeSinks sinks = new FakeSinks(DIR);
     private OpenFileBudget budget = new OpenFileBudget(1024);
-    private FileCreationBudget fileBudget = new FileCreationBudget(FileCreationBudget.UNLIMITED);
+    private final ProcessLimits limits = new ProcessLimits(); // tables made here share its file cap and file count
     private long maxFileBytes = Long.MAX_VALUE;
 
     private FileTable table(int bufferBytes) {
@@ -32,8 +32,9 @@ class FileTableTest {
     }
 
     private FileTable table(int bufferBytes, String separator, int maxEntries) {
+        limits.setMaxFileBytes(maxFileBytes);
         return new FileTable(FileNamePattern.parse(DIR, "{id}.json"), separator.getBytes(US_ASCII),
-                bufferBytes, maxEntries, maxFileBytes, sinks, budget, fileBudget, warnings);
+                bufferBytes, maxEntries, sinks, budget, limits, warnings);
     }
 
     /** Emits the table's queued warnings and returns everything emitted since the last call. */
@@ -379,7 +380,7 @@ class FileTableTest {
 
     @Test
     void capsNewFilesAtMaxFiles() {
-        fileBudget = new FileCreationBudget(2);
+        limits.files.setMax(2);
         FileTable t = table(8192);
         t.append("a", "{}", 0);
         t.append("b", "{}", 0);
@@ -407,7 +408,7 @@ class FileTableTest {
      */
     @Test
     void aFailedOpenGivesItsMaxFilesReservationBack() {
-        fileBudget = new FileCreationBudget(2);
+        limits.files.setMax(2);
         FileTable t = table(8192);
         sinks.failNextOpen(file("a"), new IOException("denied"));
         t.append("a", "{}", 0); // reserves a unit, then the open fails: the unit must come back
@@ -433,7 +434,7 @@ class FileTableTest {
     @Test
     void anExistingEmptyFileDoesNotCountAgainstMaxFiles() {
         sinks.preset(file("a"), ""); // left by an earlier run that wrote nothing
-        fileBudget = new FileCreationBudget(1);
+        limits.files.setMax(1);
         FileTable t = table(8192);
         t.append("a", "{}", 0); // reopens the empty file: no unit used
         t.append("b", "{}", 0); // the one new file
@@ -449,7 +450,7 @@ class FileTableTest {
     @Test
     void reopeningAnExistingFileDoesNotCountAgainstMaxFiles() {
         sinks.preset(file("a"), "{\"old\":1}\n"); // a already exists on disk
-        fileBudget = new FileCreationBudget(1); // room for just one new file
+        limits.files.setMax(1); // room for just one new file
         FileTable t = table(8192);
 
         t.append("a", "{\"n\":2}", 0); // reopens the existing file: doesn't use the budget
@@ -674,6 +675,47 @@ class FileTableTest {
         assertEquals("xxxxx\n{}\n", sinks.content(file("a")), "reopened, its torn line finished, and written to");
         assertEquals(1, t.written());
         assertEquals(2, t.droppedFileFull());
+    }
+
+    @Test
+    void aRaisedCapReopensAFullFile() {
+        maxFileBytes = 20;
+        FileTable t = table(8192);
+        t.append("a", "{\"n\":1}", 0);
+        t.append("a", "{\"n\":2}", 0);
+        t.append("a", "{\"n\":3}", 0); // full at 16 bytes
+        assertEquals(1, t.droppedFileFull());
+
+        limits.setMaxFileBytes(100); // a later build raised the process's cap
+        t.append("a", "{\"n\":4}", 500 * MS); // not checked yet
+        assertEquals(2, t.droppedFileFull());
+        t.append("a", "{\"n\":5}", 1_000 * MS); // checked: the cap is higher than when the file filled
+        t.flushDirty(1_000 * MS);
+        assertEquals("{\"n\":1}\n{\"n\":2}\n{\"n\":5}\n", sinks.content(file("a")));
+        assertEquals(3, t.written());
+        assertEquals(2, t.droppedFileFull());
+    }
+
+    @Test
+    void aRaisedMaxFilesLetsCappedIdsThrough() {
+        limits.files.setMax(1);
+        FileTable t = table(8192);
+        t.append("a", "{}", 0);
+        t.append("b", "{}", 0); // capped
+        assertEquals(1, t.droppedInvalidId());
+        List<String> w = warnings(t);
+        assertEquals(1, w.size(), w::toString);
+        assertTrue(w.get(0).startsWith("this process has reached its limit of 1 files (maxFiles, shared by all its loggers)"), w.get(0));
+        t.append("b", "{}", 500 * MS);
+        assertEquals(2, t.droppedInvalidId(), "not tried again within the second");
+
+        limits.files.setMax(2); // a later build raised it
+        t.append("b", "{}", 1_000 * MS);
+        t.flushDirty(1_000 * MS);
+        assertEquals("{}\n", sinks.content(file("b")));
+        assertEquals(2, t.droppedInvalidId());
+        assertEquals(2, t.written());
+        assertTrue(warnings(t).isEmpty(), "warned once");
     }
 
     @Test

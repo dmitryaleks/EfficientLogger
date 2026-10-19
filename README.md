@@ -41,16 +41,16 @@ everything else is set on the builder, and each setter checks its argument at on
 
 | Option | Default | Range and notes |
 |---|---|---|
-| `maxFileSizeKb` (builder argument) | mandatory | 1 to 2^63/1024 kilobytes of 1024 bytes. A message that would take its file past this is dropped and counted (`droppedFileFull`), with a warning per file (the first 100). The file is checked once a second and written to again once something has truncated it. |
-| `minFreeDiskSpace(long shedBelow, long resumeAbove)` | off | Bytes. Drop every message while the log volume has less than `shedBelow` free, until it has at least `resumeAbove`; the gap is hysteresis. Read once a second, on a worker (sync mode: by a caller). Counted in `droppedDiskSpace` and `droppedCount()`, with a warning when shedding starts and one when it ends. |
-| `maxCharsPerSecond(long)` | off | At least 1. Caps the logger's own output: a leaky bucket over message chars with a burst of one second's worth. Messages over it are dropped at once, counted in `droppedRateLimit` and `droppedCount()`, with a warning when dropping starts and one when it has stopped for a second. |
+| `maxFileSizeKb` (builder argument) | mandatory | 1 to 2^63/1024 kilobytes of 1024 bytes. A message that would take its file past this is dropped and counted (`droppedFileFull`), with a warning per file (the first 100). The file is checked once a second and written to again once something has truncated it, or the cap has been raised. Applied to each file on its own, but one value for the process: the latest `build()` sets it for every logger's files. |
+| `minFreeDiskSpace(long shedBelow, long resumeAbove)` | unset | Bytes. Drop every message while the log volume has less than `shedBelow` free, until it has at least `resumeAbove`; the gap is hysteresis. Read once a second per volume, on a worker (sync mode: by a caller). Counted in `droppedDiskSpace` and `droppedCount()`, with a warning when shedding starts and one when it ends. Process-wide: the latest `build()` that sets it wins, for every logger. |
+| `maxCharsPerSecond(long)` | unset | At least 1. Caps the output of all the loggers in the process together: one leaky bucket over message chars with a burst of one second's worth. Messages over it are dropped at once, counted in `droppedRateLimit` and `droppedCount()`, with a warning when dropping starts and one when it has stopped for a second. The latest `build()` that sets it wins. |
 | `workerThreads(int)` | 1 | 1 to 16 workers, each with its own queue and files. Each ID always goes to the same worker. The workers are spread over the pool's threads, so this is also the most threads that can write for this logger at once. Async only. |
 | `synchronous()` | off | Write on the calling thread. |
 | `maxQueuedMessages(int)` | 65,536 | 1 to 2^23. Messages beyond the limit are dropped. Async only. |
 | `maxQueuedChars(long)` | 16 Mi | 1 to 2^38−1, total `String.length()` of queued messages. A single longer message is always dropped. Async only. |
 | `fileBufferBytes(int)` | 8192 | 64 B to 16 MiB. Async: one per file with unwritten data. Sync: one per stripe. |
 | `maxOpenFiles(int)` | 1024 | At least 1. When reached, the least recently used file is closed, and reopened when next needed. |
-| `maxFiles(int)` | unlimited | Most new files the logger will create. Beyond it, messages for IDs without a file yet are dropped and counted. Reopening an existing file doesn't count. Set it when IDs are untrusted. |
+| `maxFiles(int)` | unlimited | Most new files all the loggers in the process will create between them. Beyond it, messages for IDs without a file yet are dropped and counted; such IDs are tried again once a second, so raising it lets them through. Reopening an existing file doesn't count. Set it when IDs are untrusted. The latest `build()` that sets it wins; files created so far stay counted. |
 | `flushIntervalMillis(long)` | 100 | 0 to 60,000. The longest a message waits before it is handed to the OS. 0 writes after every batch. Async only. |
 | `eagerWakeup(boolean)` | false | Wake the worker for every message instead of when the queue is a quarter full. Lower latency to disk, more CPU. Async only. |
 | `closeTimeout(Duration)` | 10 s | How long `close()` waits for the queue to drain. |
@@ -67,34 +67,41 @@ Combining an async-only option with `synchronous()`, or `syncStripes` without it
 
 ### The guards at a glance
 
-Five limits bound what a logger can cost the machine. Each is independent, each counts what it
+Five limits bound what logging can cost the machine. Each is independent, each counts what it
 drops under its own name in `stats()`, and each reports through the warning handler: one warning
 when dropping starts, one every 10 seconds while it goes on, and one with the total when it ends.
 
 | Guard | Bounds | When it is hit | Counted in | Recovers |
 |---|---|---|---|---|
-| `maxFileSizeKb` (mandatory) | one file's size | the message is dropped and the file closed | `droppedFileFull` | when something truncates or renames the file away |
-| `maxFiles` | files created in this run | messages for IDs without a file yet are dropped | `droppedInvalidId` | never within the run |
-| `minFreeDiskSpace` | free space on the log volume | every message is dropped | `droppedDiskSpace` | when free space reaches the resume mark |
-| `maxCharsPerSecond` | this logger's own output | messages over the cap are dropped | `droppedRateLimit` | as soon as the rate falls |
-| `maxQueuedMessages`, `maxQueuedChars` | memory held by the queue | messages are dropped until the queue is half empty | `droppedQueueFull`, `droppedTooLarge` | as the worker drains |
+| `maxFileSizeKb` (mandatory) | each file's size | the message is dropped and the file closed | `droppedFileFull` | when something truncates or renames the file away, or a build raises the cap |
+| `maxFiles` | files created by the process in this run | messages for IDs without a file yet are dropped | `droppedInvalidId` | when a build raises the cap |
+| `minFreeDiskSpace` | free space on the log volume | every message to that volume is dropped | `droppedDiskSpace` | when free space reaches the resume mark |
+| `maxCharsPerSecond` | the output of all loggers together | messages over the cap are dropped | `droppedRateLimit` | as soon as the rate falls |
+| `maxQueuedMessages`, `maxQueuedChars` | memory held by one logger's queue | messages are dropped until the queue is half empty | `droppedQueueFull`, `droppedTooLarge` | as the worker drains |
 
-A logger fed from untrusted input might take all of them:
+A process whose loggers are fed from untrusted input might take all of them:
 
 ```java
 EfficientLogger logger = EfficientLogger.builder(Path.of("logs"), "events-{id}.json", 100 * 1024) // 100 MiB per file
-        .maxFiles(10_000)                                   // at most 10,000 files, however many IDs arrive
+        .maxFiles(10_000)                                   // at most 10,000 files in the process, however many IDs arrive
         .minFreeDiskSpace(2L << 30, 4L << 30)               // stop below 2 GiB free, resume above 4 GiB
-        .maxCharsPerSecond(5_000_000)                       // about 5 MB/s of JSON from this logger
+        .maxCharsPerSecond(5_000_000)                       // about 5 MB/s of JSON from all loggers together
         .build();
 ```
 
-Two things to know when choosing them:
+Three things to know when choosing them:
 
-- **They are per logger, not per process.** A hundred loggers at 1,000 chars/s are 100,000 chars/s
-  of output between them, and each one sheds on its own reading of the volume (the reading itself is
-  shared). For one budget across an application, route its messages through one logger, or divide
-  the budget between loggers.
+- **The first four are process-wide; the latest build sets them.** `maxFileSizeKb`, `maxFiles`,
+  `minFreeDiskSpace` and `maxCharsPerSecond` are one setting each for the whole JVM, shared by
+  every logger, including those built earlier: the file cap applies at each file's next record, a
+  lower file count caps new IDs until it is raised, a new mark or rate is used at the next reading or
+  charge. Every `build()` sets the file cap, since it is mandatory; a build that leaves one of the
+  other three out leaves it as it is, so configure them once, on whichever logger you build first, or
+  on all of them alike. The queue limits, `maxOpenFiles` and the warning handler stay per logger, and
+  so does the counting and reporting of what the shared limits made each logger drop.
+- **One bucket and one mark, many loggers.** A hundred loggers share the 5 MB/s above between them,
+  and loggers whose directories are on one volume shed together on one reading of it. A logger that
+  must keep writing while others are throttled needs its own process.
 - **A message is counted once, under the first test it fails.** `log()` tests in this order: the
   ID too long for a file name; the message too large for the queue; the volume low; the queue full,
   or the logger closed; the rate cap. So `droppedRateLimit` stays at zero while the queue is
@@ -126,30 +133,31 @@ Two things to know when choosing them:
   Once the queue has made no progress for 2 seconds, the workers give up on what is left, warn,
   and close the files; `close()` then returns false, and the messages left behind are counted in
   `stats()` as `queuedMessages` and, for those that had reached a queue, `abandoned`.
-- **Files have a size cap.** A file never grows past `maxFileSizeKb`. A message that would take
-  it past the cap is dropped and counted in `stats().droppedFileFull()`, with one warning per file
-  (for the first 100 files); what was already buffered for the file is written out, and the file is
-  closed. Once a second, while messages for it keep arriving, the logger checks whether the file
-  has shrunk, and if something has truncated it (logrotate's `copytruncate`, or you) it writes to
-  it again. The size is known exactly, as long as this logger is the file's only writer: the file's
+- **Files have a size cap.** A file never grows past `maxFileSizeKb`, one value for the whole
+  process (the latest `build()` sets it). A message that would take a file past the cap is dropped
+  and counted in `stats().droppedFileFull()`, with one warning per file (for the first 100 files);
+  what was already buffered for the file is written out, and the file is closed. Once a second,
+  while messages for it keep arriving, the logger checks whether the file has shrunk, and if
+  something has truncated it (logrotate's `copytruncate`, or you), or a build has raised the cap,
+  it writes to it again. The size is known exactly, as long as this logger is the file's only writer: the file's
   size when opened plus what the logger has written (another writer's appends are seen when the
   file is next opened). A message larger than the buffer is measured before any of it is written,
   so a file is never left with part of a message.
 - **Low disk space sheds messages, if you ask.** With `minFreeDiskSpace(shedBelow, resumeAbove)`,
-  the logger reads the log volume's free space once a second (one system call, on a worker thread;
-  in sync mode on whichever caller finds the reading due; loggers on the same volume share one
-  reading) and drops every message while it is below `shedBelow`, until it is back above
-  `resumeAbove`. The gap between the two keeps a volume hovering around the mark from switching
+  set once for the process, every logger reads its log volume's free space once a second (one
+  system call, on a worker thread; in sync mode on whichever caller finds the reading due; loggers
+  on the same volume share one reading and shed together) and drops every message while it is
+  below `shedBelow`, until it is back above `resumeAbove`. The gap between the two keeps a volume hovering around the mark from switching
   the logger on and off. Shed messages are counted in `stats().droppedDiskSpace()`, with one
   warning when shedding starts (with the reading), one every 10 seconds while it goes on, and one
   with the total when it ends. If the volume can't be read, nothing is shed and that is warned
   about once. Like a write, the reading can stall on a hung network volume, and it holds up the
   thread that takes it. A worker that has gone to sleep is woken by one dropping caller a second
   while a reading is overdue, so shedding ends even on an otherwise idle logger.
-- **An output rate cap, if you ask.** `maxCharsPerSecond(n)` bounds what the logger accepts, as a
-  leaky bucket over the chars of accepted messages with a burst of one second's worth: a burst of
-  up to that goes through, and over any longer period the accepted messages average no more than
-  the cap. It is one CAS per `log()` call, exact under contention, and it needs no system calls,
+- **An output rate cap, if you ask.** `maxCharsPerSecond(n)` bounds what all the loggers in the
+  process accept between them, as one leaky bucket over the chars of accepted messages with a burst
+  of one second's worth: a burst of up to that goes through, and over any longer period the accepted
+  messages average no more than the cap. It is one CAS per `log()` call, exact under contention, and it needs no system calls,
   so unlike the disk-space mark it can't be fooled by other programs writing to the volume. A
   message larger than the burst is still accepted when the logger is under the cap, and then
   holds the following messages back until its share of time has passed (at most a day). In async
@@ -364,21 +372,23 @@ once is the JVM's periodic cleanup safepoint. None involves the queue. Its optio
 `-Pmany.loggers`, `-Pmany.rate`, `-Pmany.seconds`, `-Pmany.producers`, `-Pmany.dir` and
 `-Pmany.jvmArgs`, plus the caps: `-Pmany.fileKb` (each file's `maxFileSizeKb`, 1 GiB by
 default), `-Pmany.minFreeMb` (turns on `minFreeDiskSpace` with that floor and twice it to
-resume), `-Pmany.charsPerSecond` (turns on `maxCharsPerSecond`, per logger) and `-Pmany.maxFiles`.
+resume), `-Pmany.charsPerSecond` (turns on `maxCharsPerSecond`, shared by the 100 loggers) and
+`-Pmany.maxFiles`.
 
 With the recipe from "The guards at a glance" (100 MiB files, `maxFiles(10_000)`, a 2 GiB floor
 with a 4 GiB resume mark, 5,000,000 chars/s), the minute wrote all 30,000 traces with nothing
 dropped and no warnings; `log()` took 2.8 µs at p50 and 45 µs at p99, the same as without caps.
 
-With all three caps on but none binding (1 MiB files, a 1 GiB free-space floor, 1,000 chars/s
-per logger), the same minute wrote all 30,000 traces with nothing dropped; `log()` took 4.0 µs
-at p50 and 70 µs at p99, within the run-to-run noise of the uncapped figures, so the rate cap's
-CAS and the disk mark's volatile read cost the caller nothing measurable. With the rate cap set
-to bite, 200 chars/s per logger against traces of about 81 chars, every one of the 100 loggers
-accepted exactly 148 of its 300 traces and dropped 152, all counted in `droppedRateLimit`, with
-one "rate limit reached" warning per logger at the start and one with the count at close
-(the drops never paused for the second that would have ended the episode earlier); 14,800 lines
-on disk, every trace accounted for, and the `log()` latency unchanged.
+With all the caps on but none binding (1 MiB files, a 1 GiB free-space floor, 1,000 chars/s),
+the same minute wrote all 30,000 traces with nothing dropped; `log()` took 4.0 µs at p50 and
+70 µs at p99, within the run-to-run noise of the uncapped figures, so the rate cap's CAS and the
+disk mark's volatile read cost the caller nothing measurable. With the rate cap set to bite,
+20,000 chars/s shared by the 100 loggers against 500 traces of about 81 chars a second, 14,768
+traces were accepted and 15,232 dropped, all counted in `droppedRateLimit`, with 14,768 lines on
+disk and every trace accounted for. The bucket is one, so whichever logger's call arrives while
+it has room gets through: the loggers accepted between 113 and 177 of their 300 traces each. Each
+logger reports its own drops, and since a logger's drops come and go, there were 972 warnings in
+the minute: starts, ten-second progress reports and ends. The `log()` latency was unchanged.
 
 ## On Linux
 
@@ -454,4 +464,6 @@ log4j integration. Other limits:
 - The rate cap counts chars, not bytes. ASCII JSON is one byte per char, so the two agree; text
   outside ASCII takes up to three bytes per char on disk, and a message's escapes six, so the
   bytes written can exceed the cap by that much.
-- The caps are per logger. There is no process-wide budget for output or files.
+- `maxOpenFiles` and the queue limits are per logger. There is no process-wide budget for open
+  files or queue memory, and no way to give one logger a cap of its own while the others share
+  another; the four shared limits are one setting each per JVM.

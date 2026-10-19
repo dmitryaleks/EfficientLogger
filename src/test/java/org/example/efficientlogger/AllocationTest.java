@@ -119,7 +119,7 @@ class AllocationTest {
                 .maxCharsPerSecond(1L << 50) // never reached
                 .minFreeDiskSpace(1, 1) // never below: the volume has more than a byte free
                 .workerPool(WorkerPool.create(1))
-                .build()) {
+                .build(new TestHooks())) { // limits of its own, so the caps don't outlive this test
             // The worker isn't measured here: its once-a-second free-space reading allocates a few bytes by design.
             List<Round> rounds = measure(logger, CALLS, CALLS, null, true);
             assertWithin(CALLER_ALLOWANCE, rounds, false, CALLS, "log() with the rate cap and disk mark on");
@@ -146,7 +146,7 @@ class AllocationTest {
         try (EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json", 1 << 20)
                 .maxCharsPerSecond(1)
                 .warningHandler((message, cause) -> {})
-                .build()) {
+                .build(new TestHooks())) { // limits of its own
             assertTrue(logger.log("a", "x".repeat(100_000)), "accepted while calm; at a char a second it is charged a day");
             List<Round> rounds = measure(logger, CALLS, 0, null, false);
             assertWithin(CALLER_ALLOWANCE, rounds, false, CALLS, "log() over the rate cap");

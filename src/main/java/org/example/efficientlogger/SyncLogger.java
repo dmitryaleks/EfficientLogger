@@ -28,8 +28,8 @@ final class SyncLogger implements EfficientLogger {
     private final Stripe[] stripes;
     private final Duration closeTimeout;
     private final Warnings warnings;
-    private final DiskWatch disk; // null unless minFreeDiskSpace is set
-    private final RateLimit rate; // null unless maxCharsPerSecond is set
+    private final DiskWatch disk; // this logger's view of the process-wide free-space mark
+    private final RateLimit rate; // this logger's view of the process-wide rate cap
     private final OpenFileBudget budget;
     private final LongSupplier clock;
     private final int maxIdLength;
@@ -54,20 +54,16 @@ final class SyncLogger implements EfficientLogger {
                     + " new files follow the directory's access rules instead", null);
         }
         budget = new OpenFileBudget(config.maxOpenFiles);
-        FileCreationBudget fileBudget = new FileCreationBudget(config.maxFiles);
+        ProcessLimits limits = hooks.limits;
         clock = hooks.nanoClock;
         long now = clock.getAsLong();
-        disk = config.minFreeDiskBytes > 0
-                ? new DiskWatch(hooks.freeSpace != null ? hooks.freeSpace : DiskWatch.forDirectory(config.directory),
-                        config.minFreeDiskBytes, config.resumeFreeDiskBytes, warnings, now)
-                : null;
-        rate = config.maxCharsPerSecond > 0 ? new RateLimit(config.maxCharsPerSecond, warnings, now) : null;
+        disk = new DiskWatch(limits.disk.volume(config.directory, hooks.freeSpace), warnings, now);
+        rate = new RateLimit(limits.rate, warnings, now);
         closeTimeout = config.closeTimeout;
         stripes = new Stripe[config.syncStripes];
         for (int i = 0; i < stripes.length; i++) {
             stripes[i] = new Stripe(new FileTable(config.fileNamePattern, config.lineSeparator,
-                    config.fileBufferBytes, config.maxFileEntries, config.maxFileBytes, hooks.sinks,
-                    budget, fileBudget, warnings));
+                    config.fileBufferBytes, config.maxFileEntries, hooks.sinks, budget, limits, warnings));
         }
     }
 
@@ -89,19 +85,15 @@ final class SyncLogger implements EfficientLogger {
             return false;
         }
         long now = clock.getAsLong();
-        if (disk != null) {
-            disk.check(now); // the caller takes the reading when one is due: there is no worker to do it
-            if (disk.shedding()) {
-                disk.recordDrop();
-                return false;
-            }
+        disk.check(now); // the caller takes the reading when one is due: there is no worker to do it
+        if (disk.shedding()) {
+            disk.recordDrop();
+            return false;
         }
-        if (rate != null) {
-            rate.check(now);
-            if (!rate.tryAcquire(json.length(), now)) {
-                rate.recordDrop(now);
-                return false;
-            }
+        rate.check(now);
+        if (!rate.tryAcquire(json.length(), now)) {
+            rate.recordDrop(now);
+            return false;
         }
         Stripe s = stripes[Hashing.bucket(id, shardKey, stripes.length)];
         boolean written;
@@ -141,7 +133,7 @@ final class SyncLogger implements EfficientLogger {
     @Override
     public long droppedCount() {
         // No queue, so nothing is dropped for space; only the disk and rate limits drop here.
-        return (disk != null ? disk.drops() : 0) + (rate != null ? rate.drops() : 0);
+        return disk.drops() + rate.drops();
     }
 
     @Override
@@ -157,8 +149,7 @@ final class SyncLogger implements EfficientLogger {
             lostIoError += s.files.lostIoError();
         }
         return new LoggerStats(written + invalidId + fileFull + lostIoError, written, 0, 0, invalidId, fileFull,
-                disk != null ? disk.drops() : 0, rate != null ? rate.drops() : 0, lostIoError, 0,
-                rejectedClosed.get(), 0, 0, budget.open());
+                disk.drops(), rate.drops(), lostIoError, 0, rejectedClosed.get(), 0, 0, budget.open());
     }
 
     @Override
@@ -176,12 +167,8 @@ final class SyncLogger implements EfficientLogger {
             }
             warnings.emitAll(pending);
         }
-        if (disk != null) {
-            disk.finalReport();
-        }
-        if (rate != null) {
-            rate.finalReport();
-        }
+        disk.finalReport();
+        rate.finalReport();
         warnings.reportSuppressedIoErrors();
         return true;
     }

@@ -32,7 +32,10 @@ public interface EfficientLogger extends AutoCloseable {
      *     message that would take its file past this is dropped and counted (in
      *     {@code stats().droppedFileFull()}), with a warning per file; the file is checked again
      *     once a second and written to again once something has truncated it, for example
-     *     logrotate with {@code copytruncate}
+     *     logrotate with {@code copytruncate}. Applied to each file on its own, but one value for
+     *     the whole process: the latest {@code build()} sets it for every logger's files, from
+     *     their next record (so do the optional {@code maxFiles}, {@code minFreeDiskSpace} and
+     *     {@code maxCharsPerSecond})
      * @throws IllegalArgumentException if {@code maxFileSizeKb} is out of range
      */
     static EfficientLoggerBuilder builder(Path directory, String fileNamePattern, long maxFileSizeKb) {

@@ -32,9 +32,9 @@ import java.util.stream.Stream;
  *
  * <p>The caps: {@code many.fileKb} is each file's maxFileSizeKb (default 1 GiB, so it never bites);
  * {@code many.minFreeMb} turns on minFreeDiskSpace with that floor and twice it as the resume mark;
- * {@code many.charsPerSecond} turns on maxCharsPerSecond, per logger; {@code many.maxFiles} turns on
- * maxFiles, per logger. At 5 traces of about 95 chars
- * a second, a cap of 200 chars/s lets about two of every five through.
+ * {@code many.charsPerSecond} turns on maxCharsPerSecond and {@code many.maxFiles} turns on maxFiles,
+ * both shared by all the loggers in the process. At 500 traces of about 81 chars a second in all, a
+ * cap of 20,000 chars/s lets about half through.
  *
  * <p>The producers are a few threads that each own a share of the loggers and pace their calls:
  * logger {@code i}'s {@code n}-th trace is due at {@code start + n / rate + i * (1 / rate) / loggers},
@@ -71,7 +71,7 @@ public final class ManyLoggersBenchmark {
         out.printf(Locale.ROOT, "caps: maxFileSizeKb=%d%s%s%s%n", fileKb,
                 maxFiles > 0 ? ", maxFiles=" + maxFiles : ", no maxFiles",
                 minFreeMb > 0 ? ", minFreeDiskSpace(" + minFreeMb + " MiB, " + 2 * minFreeMb + " MiB)" : ", no minFreeDiskSpace",
-                charsPerSecond > 0 ? ", maxCharsPerSecond=" + charsPerSecond + " per logger" : ", no maxCharsPerSecond");
+                charsPerSecond > 0 ? ", maxCharsPerSecond=" + charsPerSecond + " shared by all loggers" : ", no maxCharsPerSecond");
 
         EfficientLogger[] all = new EfficientLogger[loggers];
         String[] ids = new String[loggers];

@@ -61,6 +61,11 @@ public final class EfficientLoggerBuilder {
      * shedding starts and one with the count when it ends. If the volume can't be queried,
      * nothing is shed and that is warned about once.
      *
+     * <p>Process-wide: the thresholds are shared by every logger, the latest {@code build()} that
+     * sets them wins, and a build that doesn't set them leaves them as they are. Loggers whose
+     * directories are on one volume share its reading and shed together; each counts and reports
+     * its own shed messages.
+     *
      * @param shedBelowBytes at least 1
      * @param resumeAboveBytes at least {@code shedBelowBytes}
      */
@@ -87,6 +92,10 @@ public final class EfficientLoggerBuilder {
      * async mode a message is charged only once the queue has taken it, so one the queue refuses
      * costs nothing; in sync mode it is charged before it is written, so one that then fails to
      * write (an invalid id, a full file, an I/O error) stays charged.
+     *
+     * <p>Process-wide: one bucket for every logger, so the cap bounds the process's whole output,
+     * not each logger's. The latest {@code build()} that sets it wins, from its next charge; a
+     * build that doesn't set it leaves it as it is. Each logger counts and reports its own drops.
      *
      * @param charsPerSecond at least 1
      */
@@ -154,11 +163,15 @@ public final class EfficientLoggerBuilder {
     }
 
     /**
-     * Maximum number of new files the logger will create, at least 1. Unlimited by default. Once
-     * reached, messages for IDs that don't have a file yet are dropped and counted (in
-     * {@code stats().droppedInvalidId()}), with one warning. Reopening a file that already exists
-     * doesn't count, so a bounded set of IDs never hits the limit. Set it when IDs can come from
-     * untrusted input, so they can't fill the disk with files.
+     * Maximum number of new files the loggers of this process will create between them, at least 1.
+     * Unlimited until some build sets it. Once reached, messages for IDs that don't have a file yet
+     * are dropped and counted (in {@code stats().droppedInvalidId()}), with one warning per logger;
+     * such IDs are tried again once a second, so raising the cap lets them through. Reopening a file
+     * that already exists doesn't count, so a bounded set of IDs never hits the limit. Set it when
+     * IDs can come from untrusted input, so they can't fill the disk with files.
+     *
+     * <p>Process-wide: the latest {@code build()} that sets it wins, for every logger, and files
+     * created so far stay counted. A build that doesn't set it leaves the cap as it is.
      */
     public EfficientLoggerBuilder maxFiles(int files) {
         this.maxFiles = checkRange("maxFiles", files, 1, Integer.MAX_VALUE);
@@ -277,7 +290,9 @@ public final class EfficientLoggerBuilder {
      * @throws UncheckedIOException if the directory can't be created
      */
     public EfficientLogger build() {
-        return build(new TestHooks());
+        TestHooks hooks = new TestHooks();
+        hooks.limits = ProcessLimits.shared();
+        return build(hooks);
     }
 
     EfficientLogger build(TestHooks hooks) {
@@ -290,6 +305,7 @@ public final class EfficientLoggerBuilder {
         } catch (IOException e) {
             throw new UncheckedIOException("can't create directory " + config.directory, e);
         }
+        hooks.limits.apply(config); // the latest build sets the process-wide limits, for every logger
         return config.synchronous ? new SyncLogger(config, hooks) : new AsyncLogger(config, hooks).start();
     }
 

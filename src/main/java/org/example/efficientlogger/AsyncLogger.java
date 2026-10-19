@@ -26,8 +26,8 @@ final class AsyncLogger implements EfficientLogger {
     private final boolean registerShutdownHook;
     private final Admission admission;
     private final OverflowTracker tracker;
-    private final DiskWatch disk; // null unless minFreeDiskSpace is set
-    private final RateLimit rate; // null unless maxCharsPerSecond is set
+    private final DiskWatch disk; // this logger's view of the process-wide free-space mark
+    private final RateLimit rate; // this logger's view of the process-wide rate cap
     private final LongSupplier clock;
     private final Warnings warnings;
     private final OpenFileBudget budget;
@@ -45,16 +45,13 @@ final class AsyncLogger implements EfficientLogger {
     AsyncLogger(Config config, TestHooks hooks) {
         warnings = new Warnings(config.warningHandler, config.maxIdLength, config.maxQueuedChars);
         budget = new OpenFileBudget(config.maxOpenFiles);
-        FileCreationBudget fileBudget = new FileCreationBudget(config.maxFiles);
+        ProcessLimits limits = hooks.limits;
         admission = new Admission(config.maxQueuedMessages, config.maxQueuedChars);
         tracker = new OverflowTracker(admission, config, warnings);
         clock = hooks.nanoClock;
         long now = clock.getAsLong();
-        disk = config.minFreeDiskBytes > 0
-                ? new DiskWatch(hooks.freeSpace != null ? hooks.freeSpace : DiskWatch.forDirectory(config.directory),
-                        config.minFreeDiskBytes, config.resumeFreeDiskBytes, warnings, now)
-                : null;
-        rate = config.maxCharsPerSecond > 0 ? new RateLimit(config.maxCharsPerSecond, warnings, now) : null;
+        disk = new DiskWatch(limits.disk.volume(config.directory, hooks.freeSpace), warnings, now);
+        rate = new RateLimit(limits.rate, warnings, now);
         maxChars = config.maxQueuedChars;
         maxIdLength = config.maxIdLength;
         maxIdLengthBeforeNormalizing = config.maxIdLengthBeforeNormalizing;
@@ -78,7 +75,7 @@ final class AsyncLogger implements EfficientLogger {
         for (int i = 0; i < n; i++) {
             rings[i] = new MpscRing(config.ringCapacity, startIndex, config.wakeCount, config.wakeChars);
             FileTable files = new FileTable(config.fileNamePattern, config.lineSeparator, config.fileBufferBytes,
-                    config.maxFileEntries, config.maxFileBytes, hooks.sinks, budget, fileBudget, warnings);
+                    config.maxFileEntries, hooks.sinks, budget, limits, warnings);
             workers[i] = new Worker(rings[i], files, admission, tracker, disk, rate, warnings, hooks.nanoClock, batchSize,
                     config.flushIntervalNanos, config.eagerWakeup, hooks.beforeBatch);
             workers[i].onTerminated(this::workerFinished);
@@ -144,7 +141,7 @@ final class AsyncLogger implements EfficientLogger {
             }
             return false;
         }
-        if (disk != null && disk.shedding()) {
+        if (disk.shedding()) {
             if (closing()) {
                 return rejectClosed(); // after close it is only that
             }
@@ -163,7 +160,7 @@ final class AsyncLogger implements EfficientLogger {
             }
             return rejectClosed();
         }
-        if (rate != null) {
+        if (rate.enabled()) {
             // After admission, so a message the queue refuses (or a closed logger) is never charged to the rate.
             long now = clock.getAsLong();
             if (!rate.tryAcquire(len, now)) {
@@ -222,7 +219,7 @@ final class AsyncLogger implements EfficientLogger {
 
     @Override
     public long droppedCount() {
-        return tracker.drops() + warnings.oversizeMessages() + (disk != null ? disk.drops() : 0) + (rate != null ? rate.drops() : 0);
+        return tracker.drops() + warnings.oversizeMessages() + disk.drops() + rate.drops();
     }
 
     @Override
@@ -252,9 +249,8 @@ final class AsyncLogger implements EfficientLogger {
         long oversize = warnings.oversizeMessages();
         long queueFull = tracker.drops();
         long word = admission.get();
-        return new LoggerStats(accepted, written, queueFull, oversize, invalidId, fileFull,
-                disk != null ? disk.drops() : 0, rate != null ? rate.drops() : 0, lostIoError, abandoned,
-                rejectedClosed.get(), Admission.messages(word), Admission.chars(word), budget.open());
+        return new LoggerStats(accepted, written, queueFull, oversize, invalidId, fileFull, disk.drops(), rate.drops(),
+                lostIoError, abandoned, rejectedClosed.get(), Admission.messages(word), Admission.chars(word), budget.open());
     }
 
     @Override

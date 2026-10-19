@@ -9,7 +9,12 @@ final class TestHooks {
     SinkFactory sinks = FileOutputStreamSink.FACTORY;
     LongSupplier nanoClock = System::nanoTime;
     /** How minFreeDiskSpace reads the free space; null means the log directory's file store. */
-    DiskWatch.Probe freeSpace = null;
+    DiskMark.Probe freeSpace = null;
+    /**
+     * The process-wide limits the logger shares. {@link EfficientLoggerBuilder#build()} uses
+     * {@link ProcessLimits#shared()}; a fresh instance here keeps tests apart, as a private pool does.
+     */
+    ProcessLimits limits = new ProcessLimits();
 
     /**
      * The key of the hash that picks each ID's worker or stripe (see {@link Hashing#bucket}).

@@ -79,6 +79,7 @@ class AllocationTest {
         try (EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json")
                 .maxQueuedMessages(1 << 20) // room for a whole round, so nothing is dropped
                 .maxQueuedChars(1L << 30)
+                .workerPool(WorkerPool.create(1)) // a thread of its own, so what it allocates is this logger's
                 .build()) {
             Thread worker = ((AsyncLogger) logger).thread(0);
             List<Round> rounds = measure(logger, CALLS, CALLS, worker, true);

@@ -8,7 +8,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ThreadFactory;
 
 /** Validated, immutable settings with defaults resolved, plus values derived from them. */
 final class Config {
@@ -53,7 +52,7 @@ final class Config {
     final long flushIntervalNanos;
     final boolean eagerWakeup; // also true when the flush interval is 0
     final boolean registerShutdownHook;
-    final ThreadFactory threadFactory; // null means the default daemon threads
+    final WorkerPool workerPool; // null means WorkerPool.shared()
 
     // Derived (async mode)
     final int ringCapacity; // power of two >= maxQueuedMessages, so a ring claim never fails
@@ -99,7 +98,7 @@ final class Config {
         // With a 0 interval a timed sleep would spin, so the worker must sleep until woken.
         eagerWakeup = (b.eagerWakeup != null && b.eagerWakeup) || flushIntervalMillis == 0;
         registerShutdownHook = b.registerShutdownHook == null || b.registerShutdownHook;
-        threadFactory = b.threadFactory;
+        workerPool = b.workerPool;
 
         ringCapacity = nextPowerOfTwo(maxQueuedMessages);
         batchSize = Math.max(1, Math.min(maxQueuedMessages / 4, BATCH_SIZE_MAX));
@@ -119,7 +118,7 @@ final class Config {
         if (b.flushIntervalMillis != null) set.add("flushIntervalMillis");
         if (b.eagerWakeup != null) set.add("eagerWakeup");
         if (b.registerShutdownHook != null) set.add("registerShutdownHook");
-        if (b.threadFactory != null) set.add("threadFactory");
+        if (b.workerPool != null) set.add("workerPool");
         if (!set.isEmpty()) {
             throw new IllegalArgumentException(
                     "synchronous() can't be combined with async-only options: " + String.join(", ", set));

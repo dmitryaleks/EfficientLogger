@@ -9,31 +9,43 @@ import java.util.function.LongSupplier;
  * Drains one ring into one {@link FileTable}. Each ID always goes to the same worker, so its lines
  * stay in order, and the worker's files need no locks.
  *
- * <p>The loop: write a batch, hand buffers to the OS once the oldest record has waited a flush
- * interval, then go round again or sleep. Before sleeping it always writes everything out. It
- * sleeps TIMED (up to a flush interval; producers wake it only once the queue is a quarter full),
- * or DEEP (until any message arrives) after about a second with nothing to do, or always in eager
- * mode. See {@link MpscRing} for the wake-up protocol.
+ * <p>A worker doesn't own a thread: a {@link WorkerPool} thread serves several workers, from any
+ * number of loggers, by calling {@link #step} on each in turn and sleeping only when none of them
+ * has anything to do. A step writes a batch, hands buffers to the OS once the oldest record has
+ * waited a flush interval, and says what the worker wants next: another step at once, a wait for
+ * a slot that a producer is still publishing, a wait for the rest of a closing logger, or sleep.
+ * Before the thread sleeps each worker writes everything out and announces how it sleeps on its
+ * own ring: TIMED (up to a flush interval; producers wake it only once the queue is a quarter
+ * full), or DEEP (until any message arrives) after about a second with nothing to do, or always in
+ * eager mode. See {@link MpscRing} for the wake-up protocol; it is per ring, so a thread serving
+ * several rings announces on each and re-checks each.
  *
  * <p>After close, it keeps going until every admitted message, logger-wide, has been consumed,
- * then writes out and closes its files. If the queue makes no progress for
+ * then writes out and closes its files ({@link #finish}). If the queue makes no progress for
  * {@link #STUCK_CLOSE_NANOS} (a {@code log} call cut off, or stalled, between being admitted and
  * publishing), it gives up instead, so close can finish; the last worker to finish reports what
  * was left (see {@code AsyncLogger}).
  *
- * <p>Tests can drive it by hand with {@link #runOnce} and {@link #finish} instead of a thread.
+ * <p>Tests can drive it by hand with {@link #runOnce} and {@link #finish} instead of a pool.
  */
-final class Worker implements Runnable, MpscRing.Handler {
+final class Worker implements MpscRing.Handler {
+
+    /** What {@link #step} wants next, most urgent first; a pool thread does the most urgent of its workers'. */
+    static final int CONTINUE = 0;      // took messages: step again at once
+    static final int AWAIT_PUBLISH = 1; // the head slot is claimed but not yet published
+    static final int CLOSING = 2;       // closed and its ring is empty, but the logger's queue isn't
+    static final int IDLE = 3;          // nothing to do
+    static final int DONE = 4;          // closed and drained, or gave up: call finish()
 
     /** Timed sleeps in a row with nothing to do before sleeping until woken. */
     static final int DEEP_SLEEP_AFTER = 10;
-    private static final int SPINS = 64;
-    private static final long CLOSING_POLL_NANOS = TimeUnit.MICROSECONDS.toNanos(100);
+    static final int SPINS = 64;
+    static final long CLOSING_POLL_NANOS = TimeUnit.MICROSECONDS.toNanos(100);
     private static final long ERROR_PAUSE_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
-    /** Passes spent waiting for one slot to be published before the worker stops spinning for it. */
-    private static final int STALL_SPINS = 100;
-    /** How often the worker then polls a slot that stays unpublished (a producer cut off mid-publish). */
-    private static final long STUCK_SLOT_POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
+    /** Passes spent waiting for one slot to be published before the thread stops spinning for it. */
+    static final int STALL_SPINS = 100;
+    /** How often the thread then polls a slot that stays unpublished (a producer cut off mid-publish). */
+    static final long STUCK_SLOT_POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
     /** After close, how long the queue size may stop falling before the worker gives up and finishes. */
     static final long STUCK_CLOSE_NANOS = TimeUnit.SECONDS.toNanos(2);
 
@@ -51,12 +63,18 @@ final class Worker implements Runnable, MpscRing.Handler {
     private long batchNanos; // time of the current batch, for append()
     private long releasable; // admission to release once the current batch's slots are free
     private int emptyTimedWakeups;
-    private int stalledPasses; // consecutive passes waiting for an unpublished head slot
+    private int stalledPasses; // consecutive steps waiting for an unpublished head slot
+    private long parkedMode = MpscRing.AWAKE; // what announceSleep() last set on the ring
+    private boolean closing;   // the queue has been observed closed
+    private long closeCount;   // its size the last time that changed
+    private long closeStableNanos; // when it last changed
 
     private final AtomicLong flushRequested = new AtomicLong();
     private volatile long flushDone;
     private final Object flushLock = new Object();
     private volatile boolean terminated;
+    private volatile Thread thread; // the pool thread serving this worker; null when tests run it by hand
+    private Runnable onTerminated; // set by the logger before the worker runs
 
     Worker(MpscRing ring, FileTable files, Admission admission, OverflowTracker tracker, Warnings warnings,
             LongSupplier clock, int batchSize, long flushIntervalNanos, boolean eager, Runnable beforeBatch) {
@@ -72,65 +90,149 @@ final class Worker implements Runnable, MpscRing.Handler {
         this.beforeBatch = beforeBatch;
     }
 
-    @Override
-    public void run() {
-        boolean closing = false;   // the queue has been observed closed
-        long closeCount = 0;       // its size the last time that changed
-        long closeStableNanos = 0; // when it last changed
-        try {
-            for (;;) {
-                try {
-                    Thread.interrupted(); // a leftover interrupt would make every park() return at once
-                    int n = runOnce();
-                    if (n > 0) {
-                        stalledPasses = 0;
-                    }
-                    if (n == batchSize) {
-                        continue;
-                    }
-                    long word = admission.get();
-                    if (Admission.isClosed(word)) {
-                        long count = Admission.messages(word);
-                        if (count == 0) {
-                            break; // everything admitted, logger-wide, has been consumed
-                        }
-                        // The queue won't reach zero if a log() call was cut off between being
-                        // admitted and publishing its message (e.g. a StackOverflowError). Once the
-                        // size has stopped falling for a while, give up so close can't wait forever.
-                        // The last worker to finish reports what was left, so a worker whose own
-                        // ring is simply empty while a sibling is stalled doesn't raise a false alarm.
-                        long now = clock.getAsLong();
-                        if (!closing || count != closeCount) {
-                            closing = true;
-                            closeCount = count;
-                            closeStableNanos = now;
-                        } else if (now - closeStableNanos >= STUCK_CLOSE_NANOS) {
-                            break;
-                        }
-                        if (n == 0) {
-                            if (ring.head() != ring.tail()) {
-                                awaitPublish(); // a slot claimed but not published: back off as when open
-                            } else {
-                                waitWhileClosing();
-                            }
-                        }
-                        continue;
-                    }
-                    if (n == 0) {
-                        if (ring.head() != ring.tail()) {
-                            awaitPublish(); // a producer is between claiming a slot and publishing it
-                        } else {
-                            idle();
-                        }
-                    }
-                } catch (Throwable t) {
-                    recover(t);
-                }
-            }
-        } finally {
-            finish();
+    // ---- what the pool thread calls ----
+
+    /**
+     * One pass of the worker's loop: {@link #runOnce}, then a look at the logger's state.
+     *
+     * @return what the worker wants next: {@link #CONTINUE}, {@link #AWAIT_PUBLISH}, {@link #CLOSING},
+     *     {@link #IDLE} or {@link #DONE}
+     */
+    int step() {
+        int n = runOnce();
+        if (n > 0) {
+            stalledPasses = 0;
         }
+        if (n == batchSize) {
+            return CONTINUE;
+        }
+        long word = admission.get();
+        if (Admission.isClosed(word)) {
+            long count = Admission.messages(word);
+            if (count == 0) {
+                return DONE; // everything admitted, logger-wide, has been consumed
+            }
+            // The queue won't reach zero if a log() call was cut off between being admitted and
+            // publishing its message (e.g. a StackOverflowError). Once the size has stopped falling
+            // for a while, give up so close can't wait forever. The last worker to finish reports
+            // what was left, so a worker whose own ring is simply empty while a sibling is stalled
+            // doesn't raise a false alarm.
+            long now = clock.getAsLong();
+            if (!closing || count != closeCount) {
+                closing = true;
+                closeCount = count;
+                closeStableNanos = now;
+            } else if (now - closeStableNanos >= STUCK_CLOSE_NANOS) {
+                return DONE;
+            }
+            if (n != 0) {
+                return CONTINUE;
+            }
+            return ring.head() != ring.tail() ? awaitPublish() : CLOSING;
+        }
+        if (n != 0) {
+            return CONTINUE;
+        }
+        return ring.head() != ring.tail() ? awaitPublish() : IDLE;
     }
+
+    /**
+     * The head slot is claimed but not published. A producer that has claimed it is normally
+     * microseconds from publishing, so the thread spins at first ({@link #stalledBriefly}). But if a
+     * producer was cut off between claiming the slot and publishing it (e.g. a StackOverflowError
+     * in log()), the slot never arrives, so after many passes the thread backs off to a timed poll
+     * rather than burn a core. The poll leaves PARKED as AWAKE, so it is only a poll: no producer
+     * unparks the thread and no wake-up can be lost. The slot is never reused, so a merely slow
+     * producer that later publishes is still safe.
+     */
+    private int awaitPublish() {
+        stalledPasses++;
+        return AWAIT_PUBLISH;
+    }
+
+    /** After {@link #AWAIT_PUBLISH}: true while the slot is worth spinning for, false once the thread should poll. */
+    boolean stalledBriefly() {
+        return stalledPasses <= STALL_SPINS;
+    }
+
+    /** Before the thread sleeps: writes everything out. Never sleep holding unwritten records. */
+    void beforeSleep() {
+        long now = clock.getAsLong();
+        files.flushDirty(now);
+        warnings.emitAll(files.takeWarnings());
+        tracker.check(now);
+    }
+
+    /**
+     * Announces on the ring how the thread is about to sleep, so producers know whether to wake
+     * it. Then {@link #hasWork} must re-check what a producer may have done meanwhile (Dekker).
+     *
+     * @return {@link MpscRing#TIMED} or {@link MpscRing#DEEP}
+     */
+    long announceSleep() {
+        long mode = eager || emptyTimedWakeups >= DEEP_SLEEP_AFTER ? MpscRing.DEEP : MpscRing.TIMED;
+        ring.setParkedState(mode);
+        parkedMode = mode;
+        return mode;
+    }
+
+    /** After {@link #announceSleep}: true if a message, a close or a flush request arrived meanwhile. */
+    boolean hasWork() {
+        long tail = ring.tail();
+        long word = admission.get();
+        return (tail != ring.head() && (parkedMode == MpscRing.DEEP || ring.aboveWakeThreshold(word)))
+                || Admission.isClosed(word)
+                || flushRequested.get() != flushDone;
+    }
+
+    /**
+     * After the sleep (or the decision not to): the ring is awake again.
+     *
+     * @param sleptNanos how long the thread slept; a full timed sleep that found nothing counts
+     *     towards deep sleep
+     */
+    void afterSleep(long sleptNanos) {
+        if (parkedMode == MpscRing.TIMED && sleptNanos >= flushIntervalNanos >> 1 && ring.tail() == ring.head()) {
+            emptyTimedWakeups++;
+        }
+        parkedMode = MpscRing.AWAKE;
+        ring.setParkedState(MpscRing.AWAKE);
+    }
+
+    long flushIntervalNanos() {
+        return flushIntervalNanos;
+    }
+
+    /** Recovers from an unexpected error in a step without ever letting the thread die. */
+    void recover(Throwable t) {
+        try {
+            reportError("unexpected error in the worker thread", t);
+        } catch (Throwable ignored) {
+            // Even reporting failed, e.g. out of memory. The worker must still not die.
+        }
+        LockSupport.parkNanos(this, ERROR_PAUSE_NANOS);
+    }
+
+    /** The pool thread serving this worker, set before it starts; null when tests run the worker by hand. */
+    Thread thread() {
+        return thread;
+    }
+
+    void attach(Thread thread) {
+        this.thread = thread;
+        ring.attachConsumer(thread);
+    }
+
+    /** What to run once {@link #finish} has completed, on the thread that ran it. */
+    void onTerminated(Runnable callback) {
+        onTerminated = callback;
+    }
+
+    Runnable onTerminated() {
+        return onTerminated;
+    }
+
+    // ---- the steps themselves ----
 
     /**
      * One step: write up to a batch of messages, serve a flush request, hand buffers to the OS if
@@ -254,7 +356,7 @@ final class Worker implements Runnable, MpscRing.Handler {
      * <p>If the ring can't be drained that far because its head slot was claimed but not yet
      * published (a producer between claiming and publishing: normally for microseconds, but for
      * good if its {@code log()} call was cut off), this returns with the request still pending
-     * rather than spin here. The main loop waits for the slot with back-off, or gives up at close,
+     * rather than spin here. The thread waits for the slot with back-off, or gives up at close,
      * and comes back to the request. Spinning here instead once wedged the worker for the life of
      * the process after such a cut-off, with {@code close()} unable to finish.
      */
@@ -272,76 +374,6 @@ final class Worker implements Runnable, MpscRing.Handler {
             flushDone = request;
             flushLock.notifyAll();
         }
-    }
-
-    /** Sleeps until there is work. Never sleeps holding unwritten records. */
-    private void idle() {
-        files.flushDirty(clock.getAsLong());
-        warnings.emitAll(files.takeWarnings());
-        tracker.check(clock.getAsLong());
-
-        long mode = eager || emptyTimedWakeups >= DEEP_SLEEP_AFTER ? MpscRing.DEEP : MpscRing.TIMED;
-        ring.setParkedState(mode); // then re-check what a producer may have done meanwhile (Dekker)
-        long tail = ring.tail();
-        long word = admission.get();
-        boolean work = (tail != ring.head() && (mode == MpscRing.DEEP || ring.aboveWakeThreshold(word)))
-                || Admission.isClosed(word)
-                || flushRequested.get() != flushDone;
-        if (!work) {
-            if (mode == MpscRing.DEEP) {
-                LockSupport.park(this);
-            } else {
-                LockSupport.parkNanos(this, flushIntervalNanos);
-                if (ring.tail() == ring.head()) {
-                    emptyTimedWakeups++;
-                }
-            }
-        }
-        ring.setParkedState(MpscRing.AWAKE);
-    }
-
-    /** Closing, with nothing to take: producers are still publishing, or other workers still draining. */
-    private void waitWhileClosing() {
-        for (int i = 0; i < SPINS && ring.head() == ring.tail(); i++) {
-            Thread.onSpinWait();
-        }
-        if (ring.head() == ring.tail()) {
-            Thread.yield();
-            LockSupport.parkNanos(this, CLOSING_POLL_NANOS);
-        }
-    }
-
-    private static void spinThenYield() {
-        for (int i = 0; i < SPINS; i++) {
-            Thread.onSpinWait();
-        }
-        Thread.yield();
-    }
-
-    /**
-     * Waits for the slot at the head of the ring to be published. A producer that has claimed it is
-     * normally microseconds from publishing, so spin at first. But if a producer was cut off between
-     * claiming the slot and publishing it (e.g. a StackOverflowError in log()), the slot never
-     * arrives, so after many passes back off to a timed poll rather than burn a core. The poll
-     * leaves PARKED as AWAKE, so it is only a poll: no producer unparks the worker and no wake-up can
-     * be lost. The slot is never reused, so a merely slow producer that later publishes is still safe.
-     */
-    private void awaitPublish() {
-        if (++stalledPasses <= STALL_SPINS) {
-            spinThenYield();
-        } else {
-            LockSupport.parkNanos(this, STUCK_SLOT_POLL_NANOS);
-        }
-    }
-
-    /** Recovers from an unexpected error without ever letting the worker loop exit. */
-    private void recover(Throwable t) {
-        try {
-            reportError("unexpected error in the worker thread", t);
-        } catch (Throwable ignored) {
-            // Even reporting failed, e.g. out of memory. The worker must still not die.
-        }
-        LockSupport.parkNanos(this, ERROR_PAUSE_NANOS);
     }
 
     private void reportError(String message, Throwable t) {

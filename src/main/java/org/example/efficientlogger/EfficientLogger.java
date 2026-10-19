@@ -14,7 +14,8 @@ import java.time.Duration;
  *
  * <p>By default a background thread does the writing: {@code log} queues the message and returns
  * at once, without allocating. When the queue is full, messages are dropped and a warning is
- * reported. In {@linkplain EfficientLoggerBuilder#synchronous() synchronous mode}, {@code log}
+ * reported. The threads come from a {@link WorkerPool} that all loggers share, so an application
+ * with many loggers still has only a few logging threads. In {@linkplain EfficientLoggerBuilder#synchronous() synchronous mode}, {@code log}
  * writes the message itself before returning.
  *
  * <p>Thread-safe. In each file, lines appear in the order their {@code log} calls happened. Files

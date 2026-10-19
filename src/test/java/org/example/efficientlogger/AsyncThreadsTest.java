@@ -48,7 +48,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 /**
  * Async mode on real threads: waking the worker, flush, close, the shutdown hook and interrupts.
  * Every wait has a deadline, and no result depends on sleeping. The same code driven step by
- * step is tested in AsyncLoggerTest.
+ * step is tested in AsyncLoggerTest. Each test's loggers get a pool of their own, with a thread
+ * per worker, so a test that holds a worker can't hold up another test's; sharing a pool between
+ * loggers is tested in WorkerPoolTest.
  */
 @Timeout(value = 2, unit = java.util.concurrent.TimeUnit.MINUTES)
 class AsyncThreadsTest {
@@ -61,6 +63,7 @@ class AsyncThreadsTest {
     private final List<String> warnings = Collections.synchronizedList(new ArrayList<>());
     private final List<Gate> gates = new ArrayList<>();
     private final List<EfficientLogger> loggers = new ArrayList<>();
+    private final WorkerPool pool = WorkerPool.create(4); // as many threads as any test here has workers
 
     @AfterEach
     void releaseAndClose() {
@@ -77,7 +80,7 @@ class AsyncThreadsTest {
     @Test
     void buildIsAsynchronousByDefault() throws Exception {
         Thread worker;
-        try (EfficientLogger logger = builder().build()) {
+        try (EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json").build()) { // on the shared pool
             assertTrue(logger instanceof AsyncLogger);
             assertTrue(logger.log("a", json(1)));
             assertTrue(logger.log("b", json(2)));
@@ -88,11 +91,12 @@ class AsyncThreadsTest {
 
             worker = ((AsyncLogger) logger).thread(0);
             assertTrue(worker.isDaemon());
-            assertTrue(worker.getName().matches("efficient-logger-\\d+-worker-0"), worker.getName());
+            assertTrue(worker.getName().matches("efficient-logger-\\d+-worker-\\d+"), worker.getName());
+            assertTrue(WorkerPool.shared().threads() >= 1);
         }
+        await(() -> WorkerPool.shared().threads() == 0, "the shared pool's thread to exit once no logger needs it");
         worker.join(WAIT.toMillis());
         assertFalse(worker.isAlive());
-        assertTrue(warnings.isEmpty(), warnings::toString);
     }
 
     @Test
@@ -449,7 +453,7 @@ class AsyncThreadsTest {
             created.add(t);
             return t;
         };
-        AsyncLogger logger = start(builder().threadFactory(factory));
+        AsyncLogger logger = start(builder().workerPool(WorkerPool.create(1, factory)));
         Thread worker = created.get(0);
         for (int i = 0; i < 20_000; i++) {
             assertTrue(logger.log("a", json(i)));
@@ -809,18 +813,31 @@ class AsyncThreadsTest {
             created.add(t);
             return t;
         };
+        WorkerPool failing = WorkerPool.create(2, factory);
         OutOfMemoryError e = assertThrows(OutOfMemoryError.class,
-                () -> builder().workerThreads(2).threadFactory(factory).build());
+                () -> builder().workerThreads(2).workerPool(failing).build());
         assertSame(failure, e);
         Thread first = created.get(0);
         first.join(WAIT.toMillis());
         assertFalse(first.isAlive(), "the worker that started is still running");
+        await(() -> failing.threads() == 0, "the pool to forget both threads");
+
+        // The pool is still usable: the next logger gets fresh threads.
+        AsyncLogger logger = start(builder().workerPool(WorkerPool.create(2, r -> {
+            Thread t = new Thread(r);
+            t.setDaemon(true);
+            return t;
+        })));
+        assertTrue(logger.log("a", json(1)));
+        assertTrue(logger.flush(WAIT));
     }
 
     /**
-     * The logger is built in two steps: the constructor creates the threads without starting them,
-     * and start() runs once construction is complete, so no worker can see a half-built logger
-     * (review Q3). What a factory can see of that: every thread it made earlier is still NEW.
+     * The logger is built in two steps: the constructor creates everything without handing it to a
+     * thread, and start() registers the workers once construction is complete, so no worker can
+     * see a half-built logger (review Q3). The pool, in turn, creates every thread a registration
+     * needs before it starts any. What a factory can see of that: every thread it made earlier is
+     * still NEW.
      */
     @Test
     void workerThreadsAreAllCreatedBeforeAnyIsStarted() {
@@ -834,7 +851,7 @@ class AsyncThreadsTest {
             created.add(t);
             return t;
         };
-        AsyncLogger logger = start(builder().workerThreads(3).threadFactory(factory));
+        AsyncLogger logger = start(builder().workerThreads(3).workerPool(WorkerPool.create(3, factory)));
         assertEquals(3, created.size());
         for (Thread t : created) {
             assertNotEquals(Thread.State.NEW, t.getState(), t.getName() + " was never started");
@@ -846,7 +863,7 @@ class AsyncThreadsTest {
     @Test
     void aThreadFactoryThatReturnsNullIsAnError() {
         IllegalStateException e = assertThrows(IllegalStateException.class,
-                () -> builder().threadFactory(r -> null).build());
+                () -> builder().workerPool(WorkerPool.create(1, r -> null)).build());
         assertEquals("threadFactory returned null", e.getMessage());
     }
 
@@ -854,6 +871,7 @@ class AsyncThreadsTest {
 
     private EfficientLoggerBuilder builder() {
         return EfficientLogger.builder(dir, "{id}.json")
+                .workerPool(pool)
                 .warningHandler((message, cause) -> warnings.add(cause == null ? message : message + " | " + cause));
     }
 

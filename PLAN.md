@@ -50,7 +50,7 @@ public record LoggerStats(long accepted, long written, long droppedQueueFull, lo
 ### Builder options (`build()` validates everything and creates the directory)
 | Option | Default | Notes |
 |---|---|---|
-| `workerThreads(int)` | 1 | 1..16 |
+| `workerThreads(int)` | 1 | 1..16 workers (shards). They run on the pool's threads, so at most that many threads write for the logger |
 | `synchronous()` | off | Combining it with an async-only option throws `IllegalArgumentException` |
 | `maxQueuedMessages(int)` | 65 536 | 1..2^23, exact |
 | `maxQueuedChars(long)` | 16 Mi | 1..2^38−1. A single message over the limit is dropped as too large. |
@@ -60,7 +60,7 @@ public record LoggerStats(long accepted, long written, long droppedQueueFull, lo
 | `eagerWakeup(boolean)` | false | Wake the worker on every message. With interval 0 this matches log4j's `immediateFlush`. |
 | `closeTimeout(Duration)` | 10 s | |
 | `registerShutdownHook(boolean)` | true | Async only. Drains at JVM exit. |
-| `threadFactory(ThreadFactory)` | daemon threads named `efficient-logger-<n>-worker-<i>` | |
+| `workerPool(WorkerPool)` | `WorkerPool.shared()` | Shared by every logger in the JVM; at most 4 threads (or the processor count, if lower; `-Defficientlogger.sharedWorkerThreads=n` sets it). `WorkerPool.create(n[, threadFactory])` makes a private pool. Replaced `threadFactory(ThreadFactory)`, whose per-logger threads grew with the number of loggers. |
 | `warningHandler(WarningHandler)` | stderr | |
 | `lineSeparator(String)` | `"\n"` | `"\n"` or `"\r\n"` |
 | `syncStripes(int)` | 16 | Power of two 1..256, sync only |
@@ -125,6 +125,8 @@ return true;
 ### 3.3 `Worker` loop, batching, and the idle/wake protocol
 Each worker owns one shard and that shard's files. The affinity keeps per-file order with no locks on file state.
 `batchSize = clamp(maxQueuedMessages/4, 1, 256)`. Call `System.nanoTime()` once per batch.
+
+**As built after the review: the loop runs on a shared `WorkerPool` thread.** A worker no longer owns a thread. The loop below is split: its body is `Worker.step()`, which does one pass and returns what the worker wants next (`CONTINUE`, `AWAIT_PUBLISH`, `CLOSING`, `IDLE` or `DONE`), and the sleeping is done by `WorkerPool.Runner`, one per pool thread, over every worker assigned to it (from any number of loggers). A pass steps each worker in turn and then does the most urgent thing any of them asked for: another pass at once; the spin-then-poll back-off for an unpublished slot (per-worker stall counts, so a trickle on one ring doesn't keep the thread spinning for another's stuck slot); the 100 µs closing poll; or sleep. `idle()` became three calls per worker, `beforeSleep()` (write out), `announceSleep()` (the Dekker write on that worker's own ring) and `hasWork()` (the re-check on that ring), so the lost-wake-up argument below holds per ring unchanged; the thread parks DEEP only if every ring is DEEP, else TIMED for the shortest flush interval among the TIMED rings, and `afterSleep()` sets each ring AWAKE and counts a full, empty timed sleep towards DEEP. A worker returning `DONE` has `finish()` run and is removed; a thread with no workers left exits, and the pool starts one again when a logger needs it. The runner's list is copy-on-write under the pool's lock and read once per pass, so stepping allocates nothing (the allocation tests run on a pool thread). Workers are assigned to the least loaded thread, so threads = min(workers, pool size): one default logger still gets one thread, and 50 of them share 4.
 ```java
 for (;;) {
   Thread.interrupted();                                    // a stale interrupt flag would make park() return at once and spin
@@ -194,13 +196,13 @@ On Windows `parkNanos` is about 16 ms granular. Don't use microsecond parks for 
 - **`build()`**
   - Start the threads only after construction finishes.
   - If a thread start fails, set CLOSED, join the threads already started, and rethrow.
-- **Shutdown hook:** calls `close(closeTimeout)`.
+- **Shutdown hook:** calls `close(closeTimeout)`. **As built after the review:** one JVM-wide hook (`ShutdownHook`) for every open logger, registered when the first logger wants one and removed when the last finishes closing; at exit it calls `beginClose()` on each (stop admitting, wake the threads) and then waits for each until its own `closeTimeout` counted from the hook's start, so the hook takes at most the longest timeout, not the sum.
 - **As built in M7:**
   - **No STATE CAS.** Setting CLOSED is idempotent. Every caller waits on one `CountDownLatch` that each worker thread counts down when it finishes, so concurrent `close` calls all return true once the queue is drained. Waiting on the latch rather than joining threads means a custom `threadFactory` can't make `close` hang.
   - **From a worker thread** (e.g. a warning handler), `close` sets CLOSED, wakes the workers and returns false at once. Waiting there would stall until the timeout, because the drain needs that very thread.
   - **The last worker to finish removes the shutdown hook.** A `close` that times out keeps it, so a JVM exit still drains what is left.
   - **Messages.** On timeout: "close didn't finish within X ms; the remaining N messages will be written in the background". When interrupted, `close` and `flush` return false, keep the interrupt flag and warn nothing.
-  - **Test seams:** `TestHooks.beforeBatch` (runs before every batch; tests block in it to hold a worker) and the accessors `AsyncLogger.thread(i)`, `closing()`, `admission()` and `shutdownHook()`.
+  - **Test seams:** `TestHooks.beforeBatch` (runs before every batch; tests block in it to hold a worker) and the accessors `AsyncLogger.thread(i)` (the pool thread serving worker i), `closing()`, `admission()` and `shutdownHook()`. `WorkerPool.threads()` is public and counts the live threads.
   - **Bugs the threaded tests found:**
     1. A record ending exactly at the end of a file buffer left the next append starting past the encoder's limit. With assertions on, that tripped an assert. Without them, an empty message threw `ArrayIndexOutOfBoundsException`.
     2. `maxOpenFiles + EXTRA_ENTRIES` overflowed `int` for very large `maxOpenFiles`. It is now `Config.maxFileEntries`, capped at `Integer.MAX_VALUE`.
@@ -278,10 +280,11 @@ On Windows `parkNanos` is about 16 ms granular. Don't use microsecond parks for 
 ### 3.9 Classes (package-private unless listed in §2)
 | Class | Role |
 |---|---|
-| `EfficientLogger`, `EfficientLoggerBuilder`, `WarningHandler`, `LoggerStats` | Public API |
+| `EfficientLogger`, `EfficientLoggerBuilder`, `WarningHandler`, `LoggerStats`, `WorkerPool` | Public API |
 | `Config` | Immutable validated settings + derived values (cap, mask, thresholds) |
 | `AsyncLogger` / `SyncLogger` | The two implementations |
 | `Admission`, `MpscRing`, `Worker`, `OverflowTracker` | Async core |
+| `WorkerPool.Runner`, `ShutdownHook` | The threads that step the workers; the one JVM-wide exit hook |
 | `FileTable`, `FileState`, `FileNamePattern`, `OpenFileBudget` | File management |
 | `Sink`, `SinkFactory`, `FileOutputStreamSink` | I/O seam |
 | `Utf8`, `Warnings` | Encoding; safe handler calls + rate limiting |

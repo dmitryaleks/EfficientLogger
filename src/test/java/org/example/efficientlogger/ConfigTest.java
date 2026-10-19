@@ -17,7 +17,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.Map;
-import java.util.concurrent.ThreadFactory;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
@@ -53,7 +52,7 @@ class ConfigTest {
         assertFalse(c.eagerWakeup);
         assertEquals(Duration.ofSeconds(10), c.closeTimeout);
         assertTrue(c.registerShutdownHook);
-        assertNull(c.threadFactory);
+        assertNull(c.workerPool, "null means the shared pool");
         assertNotNull(c.warningHandler);
         assertArrayEquals(new byte[] {'\n'}, c.lineSeparator);
         assertFalse(c.normalizeIds);
@@ -86,7 +85,7 @@ class ConfigTest {
 
     @Test
     void appliesEverySetting() {
-        ThreadFactory factory = Thread::new;
+        WorkerPool pool = WorkerPool.create(2);
         WarningHandler handler = (message, cause) -> {};
         Config c = builder()
                 .workerThreads(4)
@@ -99,7 +98,7 @@ class ConfigTest {
                 .eagerWakeup(true)
                 .closeTimeout(Duration.ofSeconds(3))
                 .registerShutdownHook(false)
-                .threadFactory(factory)
+                .workerPool(pool)
                 .warningHandler(handler)
                 .lineSeparator("\r\n")
                 .normalizeIds()
@@ -115,7 +114,7 @@ class ConfigTest {
         assertTrue(c.eagerWakeup);
         assertEquals(Duration.ofSeconds(3), c.closeTimeout);
         assertFalse(c.registerShutdownHook);
-        assertSame(factory, c.threadFactory);
+        assertSame(pool, c.workerPool);
         assertSame(handler, c.warningHandler);
         assertArrayEquals(new byte[] {'\r', '\n'}, c.lineSeparator);
         assertTrue(c.normalizeIds);
@@ -189,7 +188,7 @@ class ConfigTest {
                 option("flushIntervalMillis", b -> b.flushIntervalMillis(10)),
                 option("eagerWakeup", b -> b.eagerWakeup(false)),
                 option("registerShutdownHook", b -> b.registerShutdownHook(true)),
-                option("threadFactory", b -> b.threadFactory(Thread::new)));
+                option("workerPool", b -> b.workerPool(WorkerPool.create(1))));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -242,7 +241,7 @@ class ConfigTest {
         assertThrows(NullPointerException.class, () -> new EfficientLoggerBuilder(null, "{id}"));
         assertThrows(NullPointerException.class, () -> new EfficientLoggerBuilder(dir, null));
         assertThrows(NullPointerException.class, () -> builder().closeTimeout(null));
-        assertThrows(NullPointerException.class, () -> builder().threadFactory(null));
+        assertThrows(NullPointerException.class, () -> builder().workerPool(null));
         assertThrows(NullPointerException.class, () -> builder().warningHandler(null));
         assertThrows(NullPointerException.class, () -> builder().lineSeparator(null));
         assertThrows(NullPointerException.class, () -> builder().filePermissions(null));

@@ -15,8 +15,10 @@ Files are opened in append mode, so a restarted process carries on where the las
 ## Two modes
 
 - **Asynchronous (the default).** `log()` puts the message in a bounded in-memory queue and
-  returns. One worker thread (or more, with `workerThreads(n)`) writes the queue out. When the
-  queue is full, `log()` drops the message and returns false instead of waiting. You get one
+  returns. A worker (or more, with `workerThreads(n)`) writes the queue out, on a thread from a
+  pool that every logger in the JVM shares, so ten loggers don't mean ten threads (see
+  "Allocation and threads"). When the queue is full, `log()` drops the message and returns false
+  instead of waiting. You get one
   warning when dropping starts and one when the queue recovers, with the count; these are
   rate-limited to one every 10 seconds, so a queue that keeps overflowing can't flood the handler.
   A message by itself larger than `maxQueuedChars` is dropped as too large (counted separately in
@@ -30,7 +32,7 @@ All set on the builder; each setter checks its argument at once.
 
 | Option | Default | Range and notes |
 |---|---|---|
-| `workerThreads(int)` | 1 | 1 to 16. Each ID always goes to the same worker. Async only. |
+| `workerThreads(int)` | 1 | 1 to 16 workers, each with its own queue and files. Each ID always goes to the same worker. The workers are spread over the pool's threads, so this is also the most threads that can write for this logger at once. Async only. |
 | `synchronous()` | off | Write on the calling thread. |
 | `maxQueuedMessages(int)` | 65,536 | 1 to 2^23. Messages beyond the limit are dropped. Async only. |
 | `maxQueuedChars(long)` | 16 Mi | 1 to 2^38−1, total `String.length()` of queued messages. A single longer message is always dropped. Async only. |
@@ -41,7 +43,7 @@ All set on the builder; each setter checks its argument at once.
 | `eagerWakeup(boolean)` | false | Wake the worker for every message instead of when the queue is a quarter full. Lower latency to disk, more CPU. Async only. |
 | `closeTimeout(Duration)` | 10 s | How long `close()` waits for the queue to drain. |
 | `registerShutdownHook(boolean)` | true | Close the logger at JVM exit, so queued messages are written. Async only. |
-| `threadFactory(ThreadFactory)` | daemon threads | Default names: `efficient-logger-<n>-worker-<i>`. Async only. |
+| `workerPool(WorkerPool)` | `WorkerPool.shared()` | The threads that write for this logger. `WorkerPool.create(n)` or `create(n, threadFactory)` gives a logger (or a group of them) threads of their own. Async only. |
 | `warningHandler(WarningHandler)` | stderr | Receives the logger's own warnings. Must be thread-safe and must not block. |
 | `lineSeparator(String)` | `"\n"` | `"\n"` or `"\r\n"`. |
 | `filePermissions(Set<PosixFilePermission>)` | umask | POSIX permissions for new files, e.g. `rw-------`; the directory gets those plus execute. The umask can still remove bits, never add any. Existing files keep theirs. No effect off POSIX (e.g. Windows). |
@@ -127,11 +129,28 @@ reference stores, and a volatile read. It wakes the worker only when the queue i
 quarter full (or for every message, with `eagerWakeup`). A slow trickle of messages is therefore
 written in batches, each message waiting at most one flush interval.
 
+**The threads are shared.** Workers don't own threads: they run on a `WorkerPool`, and by default
+every logger in the JVM uses the same one, `WorkerPool.shared()`, which has at most 4 threads (or
+fewer on a machine with fewer processors; the system property
+`efficientlogger.sharedWorkerThreads` sets it, from 1 to 256). Each logger's workers are spread
+over the pool's threads, and a thread serves every worker given to it in turn, sleeping only when
+none of them has anything to do; a worker's queue is drained whenever its thread passes by, so
+sharing adds no latency beyond the other loggers' batches. Threads start when a logger first needs
+them and exit when the last logger they serve closes. So an application with 50 loggers has at
+most 4 logging threads, and one logger with `workerThreads(4)` gets 4 threads on a shared pool with
+room for them, but only as many as the pool has. A logger whose handler blocks, or whose disk
+stalls, holds up the other loggers on its thread for that long; give such a logger a pool of its
+own with `workerPool(WorkerPool.create(n))`, which also takes a `ThreadFactory` to name the
+threads. The default threads are daemons named `efficient-logger-<pool>-worker-<i>`. One shutdown
+hook, registered while any logger wants one, closes every open logger at JVM exit, all draining
+at once, so it waits at most the longest `closeTimeout`, not the sum.
+
 ## Performance
 
 `LoggerBenchmark` (JMH) compares five ways of appending JSON lines to one file per ID:
 
-- EfficientLogger, async with 1 worker (the default) and with 4 workers
+- EfficientLogger, async with 1 worker (the default) and with 4 workers (on the shared pool,
+  whose 4 threads they fill on this machine)
 - EfficientLogger, sync
 - a `BufferedWriter` per file, locked while a line is written
 - log4j2 async loggers (LMAX Disruptor, garbage-free), with a logger and an appender per ID

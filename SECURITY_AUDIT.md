@@ -132,7 +132,7 @@ rework of how files are evicted.
 - **`id` and `json` may be attacker-influenced.** A server might use a user or tenant ID as `id`
   and log request data in `json`.
 - **The application developer is trusted.** That covers the directory, the pattern, the options,
-  the `WarningHandler` and the `ThreadFactory`.
+  the `WarningHandler` and the `WorkerPool` with its `ThreadFactory`.
 - **Log files have readers.** Tenants may receive their own file, and administrators, shell
   scripts, log shippers and terminals all read the directory.
 - **The log directory may be shared** with other local users or processes in some deployments.

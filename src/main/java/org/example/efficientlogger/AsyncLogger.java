@@ -3,30 +3,26 @@ package org.example.efficientlogger;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Asynchronous mode: {@code log} admits the message against the queue limits and puts it in the
  * ring of the worker that owns its ID. That is one CAS, one atomic add, two reference stores and one
- * volatile read, with no allocation and no locks. Everything else happens on the workers.
+ * volatile read, with no allocation and no locks. Everything else happens on the workers, which run
+ * on the threads of a {@link WorkerPool} shared with other loggers.
  *
- * <p>Built in two steps: the constructor creates everything, the worker threads included, without
- * starting them, and {@link #start} starts them once construction is complete, so no worker can
- * ever observe a half-built logger.
+ * <p>Built in two steps: the constructor creates everything without handing it to any thread, and
+ * {@link #start} registers the workers with the pool once construction is complete, so no pool
+ * thread can ever observe a half-built logger.
  */
 final class AsyncLogger implements EfficientLogger {
 
-    private static final AtomicInteger LOGGER_NUMBERS = new AtomicInteger();
-
     private final MpscRing[] rings;
     private final Worker[] workers;
-    private final Thread[] threads; // null when tests run the workers by hand
+    private final WorkerPool pool; // null when tests run the workers by hand
     private final boolean registerShutdownHook;
-    private final int loggerNumber;
     private final Admission admission;
     private final OverflowTracker tracker;
     private final Warnings warnings;
@@ -39,12 +35,10 @@ final class AsyncLogger implements EfficientLogger {
     private final long startIndex;
     private final Duration closeTimeout;
     private final AtomicLong rejectedClosed = new AtomicLong();
-    private final AtomicInteger running; // worker threads that haven't finished
-    private final CountDownLatch finished; // counted down as each worker thread finishes
-    private final AtomicReference<Thread> shutdownHook = new AtomicReference<>(); // null once removed
+    private final AtomicInteger running; // workers that haven't finished
+    private final CountDownLatch finished; // counted down as each worker finishes
 
     AsyncLogger(Config config, TestHooks hooks) {
-        int number = LOGGER_NUMBERS.incrementAndGet();
         warnings = new Warnings(config.warningHandler, config.maxIdLength, config.maxQueuedChars);
         budget = new OpenFileBudget(config.maxOpenFiles);
         FileCreationBudget fileBudget = new FileCreationBudget(config.maxFiles);
@@ -76,48 +70,33 @@ final class AsyncLogger implements EfficientLogger {
                     config.maxFileEntries, hooks.sinks, budget, fileBudget, warnings);
             workers[i] = new Worker(rings[i], files, admission, tracker, warnings, hooks.nanoClock, batchSize,
                     config.flushIntervalNanos, config.eagerWakeup, hooks.beforeBatch);
+            workers[i].onTerminated(this::workerFinished);
         }
 
         running = new AtomicInteger(n);
         finished = new CountDownLatch(n);
-        loggerNumber = number;
         registerShutdownHook = config.registerShutdownHook;
-        threads = hooks.startThreads
-                ? createThreads(config.threadFactory != null ? config.threadFactory : defaultThreadFactory(number))
-                : null;
+        pool = hooks.startThreads ? (config.workerPool != null ? config.workerPool : WorkerPool.shared()) : null;
     }
 
     /**
-     * Starts the workers and registers the shutdown hook. The builder calls this once construction
-     * has finished; the constructor itself hands {@code this} to nothing that runs.
+     * Hands the workers to the pool and registers the shutdown hook. The builder calls this once
+     * construction has finished; the constructor itself hands {@code this} to nothing that runs.
      *
      * @return this
      */
     AsyncLogger start() {
-        if (threads == null) {
+        if (pool == null) {
             return this; // tests run the workers by hand
         }
-        int started = 0;
         try {
-            for (; started < threads.length; started++) {
-                threads[started].start();
-            }
+            pool.register(workers);
         } catch (RuntimeException | Error e) {
-            // Don't leave the started workers running: they stop at once, since nothing is queued.
-            admission.close();
-            for (int i = 0; i < started; i++) {
-                rings[i].wakeConsumer();
-                try {
-                    threads[i].join(TimeUnit.SECONDS.toMillis(10));
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
+            admission.close(); // nothing will ever drain the rings
             throw e;
         }
         if (registerShutdownHook) {
-            registerShutdownHook(loggerNumber);
+            ShutdownHook.register(this);
         }
         return this;
     }
@@ -171,8 +150,8 @@ final class AsyncLogger implements EfficientLogger {
     @Override
     public boolean flush(Duration timeout) {
         long deadline = System.nanoTime() + saturatedNanos(timeout);
-        if (threads == null || isWorkerThread()) {
-            return false; // nobody to wait for, or a worker waiting for itself
+        if (pool == null || onOwnThread()) {
+            return false; // nobody to wait for, or a worker's thread waiting for itself
         }
         long[] tickets = new long[workers.length];
         for (int i = 0; i < workers.length; i++) {
@@ -232,35 +211,52 @@ final class AsyncLogger implements EfficientLogger {
 
     @Override
     public boolean close(Duration timeout) {
-        return close(timeout, false);
-    }
-
-    @Override
-    public void close() {
-        close(closeTimeout, false);
-    }
-
-    /**
-     * @param jvmExiting true when called from the shutdown hook: a timeout then means the messages
-     *     are lost, because the JVM halts once the hooks return, rather than written in the background
-     */
-    private boolean close(Duration timeout, boolean jvmExiting) {
         long timeoutNanos = saturatedNanos(timeout);
-        admission.close(); // from here on log() returns false; idempotent
-        if (threads == null) {
+        beginClose();
+        if (pool == null) {
             return allTerminated() && nothingLeft();
         }
-        for (MpscRing ring : rings) {
-            ring.wakeConsumer();
-        }
-        if (isWorkerThread()) {
+        if (onOwnThread()) {
             // E.g. from a warning handler. The drain needs this very thread, so don't wait for it:
             // it carries on once the handler returns.
             return false;
         }
+        return awaitClose(timeoutNanos, timeoutNanos, false);
+    }
+
+    @Override
+    public void close() {
+        close(closeTimeout);
+    }
+
+    /** Stops accepting messages and wakes the workers' threads. Idempotent. */
+    void beginClose() {
+        admission.close(); // from here on log() returns false
+        for (MpscRing ring : rings) {
+            ring.wakeConsumer();
+        }
+    }
+
+    /**
+     * The shutdown hook's wait for this logger, after {@link #beginClose}: until the logger's close
+     * timeout, counted from when the hook started closing every logger (they all drain at once).
+     */
+    void awaitCloseAtExit(long hookStartNanos) {
+        long timeoutNanos = saturatedNanos(closeTimeout);
+        long remaining = Math.max(0, timeoutNanos - (System.nanoTime() - hookStartNanos));
+        awaitClose(remaining, timeoutNanos, true);
+    }
+
+    /**
+     * @param waitNanos how long to wait for the workers to finish
+     * @param timeoutNanos the timeout to report if they don't
+     * @param jvmExiting true when called from the shutdown hook: a timeout then means the messages
+     *     are lost, because the JVM halts once the hooks return, rather than written in the background
+     */
+    private boolean awaitClose(long waitNanos, long timeoutNanos, boolean jvmExiting) {
         boolean done;
         try {
-            done = finished.await(timeoutNanos, TimeUnit.NANOSECONDS);
+            done = finished.await(waitNanos, TimeUnit.NANOSECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return false;
@@ -292,9 +288,9 @@ final class AsyncLogger implements EfficientLogger {
         return workers.length;
     }
 
-    /** For tests: worker thread i, or null when the workers run by hand. */
+    /** For tests: the pool thread serving worker i, or null when the workers run by hand. */
     Thread thread(int i) {
-        return threads == null ? null : threads[i];
+        return workers[i].thread();
     }
 
     /** For tests that play the part of a producer step by step. */
@@ -307,36 +303,27 @@ final class AsyncLogger implements EfficientLogger {
         return Admission.isClosed(admission.get());
     }
 
-    /** For tests: the registered shutdown hook, or null if there is none (any more). */
+    /** For tests: the shutdown hook that will close this logger, or null if there is none (any more). */
     Thread shutdownHook() {
-        return shutdownHook.get();
+        return ShutdownHook.hookFor(this);
     }
 
-    // ---- threads ----
+    // ---- the workers' threads ----
 
     /**
-     * What a worker thread runs. The last one to finish removes the shutdown hook, which is no
-     * longer needed, and reports any messages the workers gave up on, before close() is released.
+     * Runs on the pool thread once a worker has finished. The last one removes this logger from
+     * the shutdown hook, which no longer needs it, and reports any messages the workers gave up
+     * on, before close() is released.
      */
-    private Runnable task(Worker worker) {
-        return () -> {
-            try {
-                worker.run();
-            } catch (Throwable t) {
-                // worker.run() guards its own loop, so this is a last resort. Don't leave the logger
-                // accepting messages that no worker will write.
-                if (!Admission.isClosed(admission.get())) {
-                    admission.close();
-                    warnings.emit("a logging worker stopped unexpectedly; the logger is now closed", t);
-                }
-            } finally {
-                if (running.decrementAndGet() == 0) {
-                    removeShutdownHook();
-                    reportLeftBehind();
-                }
-                finished.countDown();
+    private void workerFinished() {
+        try {
+            if (running.decrementAndGet() == 0) {
+                ShutdownHook.unregister(this);
+                reportLeftBehind();
             }
-        };
+        } finally {
+            finished.countDown();
+        }
     }
 
     /**
@@ -357,53 +344,18 @@ final class AsyncLogger implements EfficientLogger {
                 + " and abandoned()", null);
     }
 
-    /** Creates the worker threads without starting them; {@link #start} does that. */
-    private Thread[] createThreads(ThreadFactory factory) {
-        Thread[] created = new Thread[workers.length];
-        for (int i = 0; i < workers.length; i++) {
-            Thread t = factory.newThread(task(workers[i]));
-            if (t == null) {
-                throw new IllegalStateException("threadFactory returned null");
-            }
-            created[i] = t;
-            rings[i].attachConsumer(t);
+    /**
+     * True if the current thread is a pool thread serving one of this logger's workers that hasn't
+     * finished: waiting on it would wait for ourselves. (Once all have finished, any thread may wait:
+     * the wait returns at once.)
+     */
+    private boolean onOwnThread() {
+        if (finished.getCount() == 0) {
+            return false;
         }
-        return created;
-    }
-
-    private static ThreadFactory defaultThreadFactory(int loggerNumber) {
-        AtomicInteger next = new AtomicInteger();
-        return runnable -> {
-            Thread t = new Thread(runnable, "efficient-logger-" + loggerNumber + "-worker-" + next.getAndIncrement());
-            t.setDaemon(true);
-            return t;
-        };
-    }
-
-    private void registerShutdownHook(int loggerNumber) {
-        Thread hook = new Thread(() -> close(closeTimeout, true), "efficient-logger-" + loggerNumber + "-shutdown");
-        try {
-            Runtime.getRuntime().addShutdownHook(hook);
-            shutdownHook.set(hook);
-        } catch (IllegalStateException e) {
-            // the JVM is already shutting down
-        }
-    }
-
-    private void removeShutdownHook() {
-        Thread hook = shutdownHook.getAndSet(null);
-        if (hook != null) {
-            try {
-                Runtime.getRuntime().removeShutdownHook(hook);
-            } catch (IllegalStateException e) {
-                // the JVM is shutting down, possibly running this very hook
-            }
-        }
-    }
-
-    private boolean isWorkerThread() {
-        for (Thread t : threads) {
-            if (t == Thread.currentThread()) {
+        Thread current = Thread.currentThread();
+        for (Worker w : workers) {
+            if (w.thread() == current) {
                 return true;
             }
         }

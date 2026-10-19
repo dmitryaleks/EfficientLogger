@@ -8,7 +8,6 @@ import java.time.Duration;
 import java.util.EnumSet;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.ThreadFactory;
 
 /**
  * Configures an {@link EfficientLogger}; get one from {@link EfficientLogger#builder}. Files live in
@@ -35,7 +34,7 @@ public final class EfficientLoggerBuilder {
     Boolean eagerWakeup;
     Duration closeTimeout;
     Boolean registerShutdownHook;
-    ThreadFactory threadFactory;
+    WorkerPool workerPool;
     WarningHandler warningHandler;
     String lineSeparator;
     Integer syncStripes;
@@ -48,8 +47,10 @@ public final class EfficientLoggerBuilder {
     }
 
     /**
-     * Number of worker threads, 1 to 16. Default 1. A given ID is always handled by the same worker,
-     * so each file's lines stay in order. Async only.
+     * Number of workers, 1 to 16. Default 1. Each worker has its own queue and writes its own set of
+     * files; a given ID is always handled by the same worker, so each file's lines stay in order.
+     * The workers run on the threads of the logger's {@link WorkerPool}, spread over them, so this
+     * is also the most threads that can write for this logger at once. Async only.
      */
     public EfficientLoggerBuilder workerThreads(int threads) {
         this.workerThreads = checkRange("workerThreads", threads, 1, Config.WORKER_THREADS_MAX);
@@ -151,11 +152,13 @@ public final class EfficientLoggerBuilder {
     }
 
     /**
-     * Creates the worker threads. By default they are daemon threads named
-     * {@code efficient-logger-<n>-worker-<i>}. Async only.
+     * The threads that write for this logger. Default {@link WorkerPool#shared()}, which every
+     * logger in the JVM shares, so the number of logging threads stays bounded however many loggers
+     * there are. Give a logger its own pool (see {@link WorkerPool#create}) to keep its threads to
+     * itself, or to make them with a {@code ThreadFactory}. Async only.
      */
-    public EfficientLoggerBuilder threadFactory(ThreadFactory factory) {
-        this.threadFactory = Objects.requireNonNull(factory, "threadFactory");
+    public EfficientLoggerBuilder workerPool(WorkerPool pool) {
+        this.workerPool = Objects.requireNonNull(pool, "workerPool");
         return this;
     }
 

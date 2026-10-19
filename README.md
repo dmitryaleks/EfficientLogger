@@ -378,10 +378,6 @@ default), `-Pmany.minFreeMb` (turns on `minFreeDiskSpace` with that floor and tw
 resume), `-Pmany.charsPerSecond` (turns on `maxCharsPerSecond`, shared by the 100 loggers) and
 `-Pmany.maxFiles`.
 
-With the recipe from "The guards at a glance" (100 MiB files, `maxFiles(10_000)`, a 2 GiB floor
-with a 4 GiB resume mark, 5,000,000 chars/s), the minute wrote all 30,000 traces with nothing
-dropped and no warnings; `log()` took 2.8 µs at p50 and 45 µs at p99, the same as without caps.
-
 With all the caps on but none binding (1 MiB files, a 1 GiB free-space floor, 1,000 chars/s),
 the same minute wrote all 30,000 traces with nothing dropped; `log()` took 4.0 µs at p50 and
 70 µs at p99, within the run-to-run noise of the uncapped figures, so the rate cap's CAS and the
@@ -392,6 +388,42 @@ disk and every trace accounted for. The bucket is one, so whichever logger's cal
 it has room gets through: the loggers accepted between 113 and 177 of their 300 traces each. Each
 logger reports its own drops, and since a logger's drops come and go, there were 972 warnings in
 the minute: starts, ten-second progress reports and ends. The `log()` latency was unchanged.
+
+### Many loggers under the recipe caps
+
+The same minute with the recipe from "The guards at a glance", now that the caps are process-wide:
+a 100 MiB cap on every file, `maxFiles(10_000)` across all loggers, a 2 GiB free-space floor with
+a 4 GiB resume mark on the shared volume, and 5,000,000 chars/s shared by all 100 loggers
+(`gradlew manyLoggers -Pmany.fileKb=102400 -Pmany.maxFiles=10000 -Pmany.minFreeMb=2048
+-Pmany.charsPerSecond=5000000`, on the Windows machine above, 2026-10-19). The stats as the
+benchmark printed them, with the 98 identical middle rows left out:
+
+```
+100 loggers, 1 worker each, 5 traces/s each (500/s in all), 60 s, 4 producer threads
+caps: maxFileSizeKb=102400, maxFiles=10000, minFreeDiskSpace(2048 MiB, 4096 MiB), maxCharsPerSecond=5000000 shared by all loggers
+built; the shared pool runs 4 thread(s)
+
+logger accepted  written queueFull tooLarge invalidId fileFull diskLow rateCap ioError abandoned rejClsd queued    lines
+000         300      300         0        0         0        0       0       0       0         0       0      0      300
+...
+099         300      300         0        0         0        0       0       0       0         0       0      0      300
+total     30000    30000         0        0         0        0       0       0       0         0       0      0    30000
+
+traces: 30000 attempted of 30000 planned, 30000 accepted, 0 dropped by the caps, 30000 written, 30000 lines on disk in 100 files; nothing lost
+producers ran 60.0 s; pool threads while running: 4; close() of 100 loggers took 13 ms, 100 returned true
+log() latency (us): p50 3.8  p99 73.2  p99.9 167.5  max 2622.0
+pacing lateness (us; how long after its due time each call was made): p50 7870.5  p99 16336.8  max 29948.5
+GC during the run: 1 collections, 3 ms in all
+warnings: none
+```
+
+Every logger accepted, wrote and has on disk all 300 of its traces; no guard dropped anything;
+the four pool threads served the 100 loggers; and closing all 100 took 13 ms. The latency is the
+same as without caps within this benchmark's noise (3.8 µs against 2.8 µs at p50, 73 µs against
+45 µs at p99, at a call rate where the code runs cold), so the four shared guards together cost
+the caller nothing it can measure. The 2.6 ms maximum is the first `log()` call in the JVM, as
+always; this time all four producers made theirs in the same millisecond and waited together on
+the same class loading and call-site linking.
 
 ## On Linux
 

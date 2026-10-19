@@ -162,9 +162,11 @@ PRO 350, running Windows 11 with JDK 17.0.12, and Ubuntu 24.04 under WSL 2 with
 Temurin 17.0.20.1. JMH is 1.37. Each figure comes from one fork, with 2 × 1 s of warm-up and
 3 × 1 s of measurement, so read the differences in orders of magnitude, not in percent.
 
-All figures were measured on 2026-10-19 against the current code, after the security audit and
-the code review, so they include the line-break and ID checks described under "What to expect"
-and the keyed routing hash. Measured back to back when they were added, the checks cost one
+All figures were measured on 2026-10-19 against the current code, after the security audit, the
+code review and the move to a shared worker pool, so they include the line-break and ID checks
+described under "What to expect", the keyed routing hash, and the pool thread's loop over its
+workers (which cost nothing measurable: the figures before and after the pool are within each
+other's noise). Measured back to back when they were added, the checks cost one
 worker about 7% of its peak throughput, about 10 ns per 85-character message, which is within
 the run-to-run noise of the tables below; sync mode was unchanged. The keyed routing hash costs
 the caller about 0.7 ns per ID character: with these 7-character IDs, one thread calling flat
@@ -177,16 +179,16 @@ per second are shown too.
 
 | Logger | OS | 1 thread | 4 threads | 8 threads | Heap per message |
 |---|---|---|---|---|---|
-| EfficientLogger async, 1 worker | Windows | 12.3 M (74.8 M calls) | 9.9 M (54.2 M calls) | 7.5 M (52.6 M calls) | 0 |
-| | Linux | 17.8 M (79.0 M calls) | 14.6 M (50.6 M calls) | 11.5 M (52.7 M calls) | 0 |
-| EfficientLogger async, 4 workers | Windows | 39.8 M | 24.2 M (27.0 M calls) | 21.2 M (40.2 M calls) | 0 |
-| | Linux | 36.9 M | 29.4 M | 33.9 M | 0 |
-| EfficientLogger sync | Windows | 3.0 M | 3.2 M | 2.9 M | 0 |
-| | Linux | 4.8 M | 10.0 M | 4.0 M | 0 |
-| `BufferedWriter` per file | Windows | 27.0 M | 33.6 M | 35.9 M | 0.6 B |
-| | Linux | 27.0 M | 52.9 M | 49.0 M | 0.6 B |
-| log4j2 async loggers | Windows | 0.40 M | 0.59 M | 0.56 M | 0 |
-| | Linux | 4.7 M | 4.9 M | 4.6 M | 0 |
+| EfficientLogger async, 1 worker | Windows | 11.6 M (75.0 M calls) | 10.3 M (53.0 M calls) | 8.6 M (51.3 M calls) | 0 |
+| | Linux | 17.6 M (75.2 M calls) | 14.5 M (54.3 M calls) | 11.4 M (49.1 M calls) | 0 |
+| EfficientLogger async, 4 workers | Windows | 38.7 M | 31.8 M | 23.0 M (39.6 M calls) | 0 |
+| | Linux | 37.2 M | 30.4 M | 31.5 M | 0 |
+| EfficientLogger sync | Windows | 3.1 M | 2.6 M | 2.9 M | 0 |
+| | Linux | 4.8 M | 10.1 M | 3.7 M | 0 |
+| `BufferedWriter` per file | Windows | 27.5 M | 34.4 M | 33.7 M | 0.6 B |
+| | Linux | 26.8 M | 54.8 M | 46.9 M | 0.6 B |
+| log4j2 async loggers | Windows | 0.40 M | 0.54 M | 0.51 M | 0 |
+| | Linux | 4.5 M | 4.8 M | 4.7 M | 0 |
 
 **Latency at a steady rate.** Each thread does about 0.7 µs of other work between calls, so
 it logs about 1.3 million messages a second. The figures are microseconds per call, including
@@ -196,36 +198,36 @@ On Windows:
 
 | Logger | Threads | p50 | p99 | p99.9 | p99.99 |
 |---|---|---|---|---|---|
-| (the work alone) | 1 | 0.7 | 0.8 | 2.7 | 17.1 |
-| EfficientLogger async | 1 | 0.7 | 0.9 | 3.4 | 27.9 |
-| EfficientLogger sync | 1 | 1.0 | 1.2 | 3.8 | 28.0 |
-| `BufferedWriter` per file | 1 | 0.7 | 1.3 | 5.2 | 41.4 |
-| log4j2 async loggers | 1 | 0.8 | 2.5 | 8.0 | 44.6 |
-| (the work alone) | 4 | 0.7 | 0.8 | 3.3 | 17.6 |
-| EfficientLogger async | 4 | 0.8 | 1.0 | 3.7 | 28.4 |
-| EfficientLogger async, 4 workers | 4 | 0.8 | 0.9 | 3.7 | 20.2 |
-| EfficientLogger sync | 4 | 1.1 | 20.4 | 44.0 | 80.8 |
-| `BufferedWriter` per file | 4 | 0.8 | 1.3 | 6.6 | 35.7 |
-| log4j2 async loggers | 4 | 0.9 | 3.0 | 991 | 15,172 |
+| (the work alone) | 1 | 0.7 | 0.8 | 3.4 | 30.8 |
+| EfficientLogger async | 1 | 0.7 | 0.8 | 2.9 | 20.0 |
+| EfficientLogger sync | 1 | 1.0 | 1.1 | 3.5 | 9.3 |
+| `BufferedWriter` per file | 1 | 0.7 | 1.2 | 3.5 | 23.5 |
+| log4j2 async loggers | 1 | 0.8 | 2.6 | 10.3 | 44.0 |
+| (the work alone) | 4 | 0.7 | 0.8 | 3.0 | 24.1 |
+| EfficientLogger async | 4 | 0.8 | 1.1 | 3.4 | 20.5 |
+| EfficientLogger async, 4 workers | 4 | 0.8 | 1.2 | 3.8 | 19.6 |
+| EfficientLogger sync | 4 | 1.1 | 24.8 | 62.9 | 145.9 |
+| `BufferedWriter` per file | 4 | 0.8 | 2.3 | 12.4 | 49.2 |
+| log4j2 async loggers | 4 | 0.9 | 3.1 | 1,036 | 15,286 |
 
 On Linux (WSL 2):
 
 | Logger | Threads | p50 | p99 | p99.9 | p99.99 |
 |---|---|---|---|---|---|
-| (the work alone) | 1 | 0.7 | 1.2 | 21.7 | 46.9 |
-| EfficientLogger async | 1 | 0.8 | 0.9 | 20.3 | 56.5 |
-| EfficientLogger sync | 1 | 0.9 | 1.1 | 14.0 | 38.5 |
-| `BufferedWriter` per file | 1 | 0.8 | 2.3 | 25.0 | 42.0 |
-| log4j2 async loggers | 1 | 0.9 | 3.7 | 39.7 | 64.3 |
-| (the work alone) | 4 | 0.7 | 1.2 | 15.7 | 40.1 |
-| EfficientLogger async | 4 | 0.8 | 1.2 | 14.2 | 34.2 |
-| EfficientLogger async, 4 workers | 4 | 0.8 | 1.2 | 17.8 | 34.0 |
-| EfficientLogger sync | 4 | 1.0 | 3.8 | 99.0 | 241.3 |
-| `BufferedWriter` per file | 4 | 0.8 | 2.1 | 16.7 | 86.9 |
-| log4j2 async loggers | 4 | 1.0 | 3.1 | 106.5 | 249.2 |
+| (the work alone) | 1 | 0.7 | 0.8 | 11.8 | 35.4 |
+| EfficientLogger async | 1 | 0.8 | 0.8 | 16.5 | 50.1 |
+| EfficientLogger sync | 1 | 0.9 | 1.0 | 13.4 | 38.6 |
+| `BufferedWriter` per file | 1 | 0.8 | 2.3 | 13.6 | 58.5 |
+| log4j2 async loggers | 1 | 0.9 | 3.6 | 44.0 | 75.7 |
+| (the work alone) | 4 | 0.7 | 1.0 | 14.0 | 39.8 |
+| EfficientLogger async | 4 | 0.8 | 1.3 | 15.2 | 35.9 |
+| EfficientLogger async, 4 workers | 4 | 0.8 | 1.3 | 21.2 | 40.6 |
+| EfficientLogger sync | 4 | 1.0 | 2.0 | 59.8 | 155.7 |
+| `BufferedWriter` per file | 4 | 0.8 | 1.6 | 14.7 | 62.3 |
+| log4j2 async loggers | 4 | 1.0 | 3.1 | 33.8 | 223.3 |
 
 The latencies are rounded to 0.1 µs, the tick of Windows' clock. Under WSL 2, everything past
-p99 is dominated by the virtual machine: the work alone already reaches 16 to 22 µs at p99.9,
+p99 is dominated by the virtual machine: the work alone already reaches 12 to 14 µs at p99.9,
 so only differences well above that mean anything there.
 
 What this shows:
@@ -235,7 +237,7 @@ What this shows:
   message costs even less than queueing one.
 - **One worker writes 7 to 12 million messages a second** on Windows and 11 to 18 million on
   Linux, roughly 0.6 to 1.5 GB/s of JSON. Beyond that it drops, and warns, rather than slowing
-  the callers down. With 4 workers it writes 21 to 40 million a second.
+  the callers down. With 4 workers, on 4 pool threads, it writes 23 to 39 million a second.
 - **The `BufferedWriter` approach has high throughput,** because each caller formats its own
   lines and they wait in an 8 KB buffer in memory. But nothing reaches the OS until that buffer
   fills, so a quiet file can hold lines indefinitely, and they are lost on a crash. A caller

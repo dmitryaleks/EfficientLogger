@@ -314,7 +314,19 @@ the next ones (1 to 1.6 ms, a couple per minute) coincide with nothing in the JV
 the OS taking the core from the producer, and a cluster of 0.35 ms calls on every producer at
 once is the JVM's periodic cleanup safepoint. None involves the queue. Its options are
 `-Pmany.loggers`, `-Pmany.rate`, `-Pmany.seconds`, `-Pmany.producers`, `-Pmany.dir` and
-`-Pmany.jvmArgs`.
+`-Pmany.jvmArgs`, plus the caps: `-Pmany.fileKb` (each file's `maxFileSizeKb`, 1 GiB by
+default), `-Pmany.minFreeMb` (turns on `minFreeDiskSpace` with that floor and twice it to
+resume) and `-Pmany.charsPerSecond` (turns on `maxCharsPerSecond`, per logger).
+
+With all three caps on but none binding (1 MiB files, a 1 GiB free-space floor, 1,000 chars/s
+per logger), the same minute wrote all 30,000 traces with nothing dropped; `log()` took 4.0 µs
+at p50 and 70 µs at p99, within the run-to-run noise of the uncapped figures, so the rate cap's
+CAS and the disk mark's volatile read cost the caller nothing measurable. With the rate cap set
+to bite, 200 chars/s per logger against traces of about 81 chars, every one of the 100 loggers
+accepted exactly 148 of its 300 traces and dropped 152, all counted in `droppedRateLimit`, with
+one "rate limit reached" warning per logger at the start and one with the count at close
+(the drops never paused for the second that would have ended the episode earlier); 14,800 lines
+on disk, every trace accounted for, and the `log()` latency unchanged.
 
 ## On Linux
 

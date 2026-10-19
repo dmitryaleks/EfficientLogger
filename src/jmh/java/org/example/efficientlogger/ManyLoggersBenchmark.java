@@ -27,7 +27,13 @@ import java.util.stream.Stream;
  * <pre>
  *   .\gradlew.bat manyLoggers
  *   .\gradlew.bat manyLoggers -Pmany.loggers=100 -Pmany.rate=5 -Pmany.seconds=60 -Pmany.producers=4 -Pmany.dir=build/many-loggers
+ *   .\gradlew.bat manyLoggers -Pmany.fileKb=1024 -Pmany.minFreeMb=1024 -Pmany.charsPerSecond=200   # the caps
  * </pre>
+ *
+ * <p>The caps: {@code many.fileKb} is each file's maxFileSizeKb (default 1 GiB, so it never bites);
+ * {@code many.minFreeMb} turns on minFreeDiskSpace with that floor and twice it as the resume mark;
+ * {@code many.charsPerSecond} turns on maxCharsPerSecond, per logger. At 5 traces of about 95 chars
+ * a second, a cap of 200 chars/s lets about two of every five through.
  *
  * <p>The producers are a few threads that each own a share of the loggers and pace their calls:
  * logger {@code i}'s {@code n}-th trace is due at {@code start + n / rate + i * (1 / rate) / loggers},
@@ -44,6 +50,9 @@ public final class ManyLoggersBenchmark {
         long seconds = Long.getLong("many.seconds", 60);
         int producers = Integer.getInteger("many.producers", Math.min(4, loggers));
         Path dir = Paths.get(System.getProperty("many.dir", "build/many-loggers")).toAbsolutePath().normalize();
+        long fileKb = Long.getLong("many.fileKb", 1 << 20);
+        long minFreeMb = Long.getLong("many.minFreeMb", 0);
+        long charsPerSecond = Long.getLong("many.charsPerSecond", 0);
         PrintStream out = System.out;
 
         clean(dir);
@@ -57,12 +66,22 @@ public final class ManyLoggersBenchmark {
         int tracesPerLogger = (int) (seconds * rate);
         out.printf(Locale.ROOT, "%d loggers, 1 worker each, %s traces/s each (%s/s in all), %d s, %d producer threads, files in %s%n",
                 loggers, fmt(rate), fmt(rate * loggers), seconds, producers, dir);
+        out.printf(Locale.ROOT, "caps: maxFileSizeKb=%d%s%s%n", fileKb,
+                minFreeMb > 0 ? ", minFreeDiskSpace(" + minFreeMb + " MiB, " + 2 * minFreeMb + " MiB)" : ", no minFreeDiskSpace",
+                charsPerSecond > 0 ? ", maxCharsPerSecond=" + charsPerSecond + " per logger" : ", no maxCharsPerSecond");
 
         EfficientLogger[] all = new EfficientLogger[loggers];
         String[] ids = new String[loggers];
         for (int i = 0; i < loggers; i++) {
             ids[i] = String.format(Locale.ROOT, "%03d", i);
-            all[i] = EfficientLogger.builder(dir, "logger-{id}.json", 1 << 20).warningHandler(onWarning).build();
+            EfficientLoggerBuilder b = EfficientLogger.builder(dir, "logger-{id}.json", fileKb).warningHandler(onWarning);
+            if (minFreeMb > 0) {
+                b.minFreeDiskSpace(minFreeMb << 20, (2 * minFreeMb) << 20);
+            }
+            if (charsPerSecond > 0) {
+                b.maxCharsPerSecond(charsPerSecond);
+            }
+            all[i] = b.build();
         }
         out.printf(Locale.ROOT, "built; the shared pool runs %d thread(s)%n", WorkerPool.shared().threads());
 
@@ -96,28 +115,33 @@ public final class ManyLoggersBenchmark {
 
         // ---- report ----
         out.println();
-        out.printf(Locale.ROOT, "%-6s %8s %8s %9s %8s %9s %9s %9s %8s %6s %8s%n",
-                "logger", "accepted", "written", "queueFull", "tooLarge", "invalidId", "ioError", "abandoned", "rejClsd", "queued", "lines");
-        long accepted = 0, written = 0, queueFull = 0, tooLarge = 0, invalidId = 0, ioError = 0, abandoned = 0, rejected = 0, queued = 0, lines = 0;
+        String row = "%-6s %8s %8s %9s %8s %9s %8s %7s %7s %7s %9s %7s %6s %8s%n";
+        out.printf(Locale.ROOT, row, "logger", "accepted", "written", "queueFull", "tooLarge", "invalidId", "fileFull",
+                "diskLow", "rateCap", "ioError", "abandoned", "rejClsd", "queued", "lines");
+        long accepted = 0, written = 0, queueFull = 0, tooLarge = 0, invalidId = 0, fileFull = 0, diskLow = 0, rateCap = 0,
+                ioError = 0, abandoned = 0, rejected = 0, queued = 0, lines = 0;
         for (int i = 0; i < loggers; i++) {
             LoggerStats s = all[i].stats();
             long n = countLines(dir.resolve("logger-" + ids[i] + ".json"));
-            out.printf(Locale.ROOT, "%-6s %8d %8d %9d %8d %9d %9d %9d %8d %6d %8d%n", ids[i], s.accepted(), s.written(),
-                    s.droppedQueueFull(), s.droppedTooLarge(), s.droppedInvalidId(), s.lostIoError(), s.abandoned(),
-                    s.rejectedClosed(), s.queuedMessages(), n);
+            out.printf(Locale.ROOT, row, ids[i], s.accepted(), s.written(), s.droppedQueueFull(), s.droppedTooLarge(),
+                    s.droppedInvalidId(), s.droppedFileFull(), s.droppedDiskSpace(), s.droppedRateLimit(), s.lostIoError(),
+                    s.abandoned(), s.rejectedClosed(), s.queuedMessages(), n);
             accepted += s.accepted();
             written += s.written();
             queueFull += s.droppedQueueFull();
             tooLarge += s.droppedTooLarge();
             invalidId += s.droppedInvalidId();
+            fileFull += s.droppedFileFull();
+            diskLow += s.droppedDiskSpace();
+            rateCap += s.droppedRateLimit();
             ioError += s.lostIoError();
             abandoned += s.abandoned();
             rejected += s.rejectedClosed();
             queued += s.queuedMessages();
             lines += n;
         }
-        out.printf(Locale.ROOT, "%-6s %8d %8d %9d %8d %9d %9d %9d %8d %6d %8d%n", "total", accepted, written, queueFull,
-                tooLarge, invalidId, ioError, abandoned, rejected, queued, lines);
+        out.printf(Locale.ROOT, row, "total", accepted, written, queueFull, tooLarge, invalidId, fileFull, diskLow, rateCap,
+                ioError, abandoned, rejected, queued, lines);
         out.println();
 
         long expected = (long) loggers * tracesPerLogger;
@@ -133,9 +157,11 @@ public final class ManyLoggersBenchmark {
         }
         Arrays.sort(latencies, 0, k);
         Arrays.sort(lateness, 0, k);
-        out.printf(Locale.ROOT, "traces: %d attempted of %d planned, %d accepted, %d written, %d lines on disk in %d files; %s%n",
-                attempted, expected, accepted, written, lines, countFiles(dir),
-                lines == expected && written == expected && accepted == expected ? "nothing lost" : "MISMATCH");
+        long dropped = queueFull + tooLarge + diskLow + rateCap;
+        out.printf(Locale.ROOT, "traces: %d attempted of %d planned, %d accepted, %d dropped by the caps, %d written, %d lines on disk in %d files; %s%n",
+                attempted, expected, accepted, dropped, written, lines, countFiles(dir),
+                lines == written && accepted == written + fileFull && accepted + dropped == attempted
+                        ? (dropped == 0 ? "nothing lost" : "every trace accounted for") : "MISMATCH");
         out.printf(Locale.ROOT, "producers ran %.1f s; pool threads while running: %d; close() of %d loggers took %d ms, %d returned true%n",
                 produced / 1e9, poolThreads, loggers, closeNanos / 1_000_000, closedCleanly);
         out.printf(Locale.ROOT, "log() latency (us): p50 %.1f  p99 %.1f  p99.9 %.1f  max %.1f%n",

@@ -29,7 +29,10 @@ It is mandatory: a logger that writes one file per ID must have a ceiling on eac
   A message by itself larger than `maxQueuedChars` is dropped as too large (counted separately in
   `stats()`), with its own one-time warning, not a "queue full" one.
 - **Synchronous**, with `.synchronous()`. `log()` writes the message to the file before it
-  returns, on the calling thread, with no queue and no extra threads.
+  returns, on the calling thread, with no queue and no extra threads. The file cap, the
+  disk-space mark and the rate cap apply here too; with no worker, the caller that finds a
+  free-space reading due takes it, and the rate is charged before the write, so a message that
+  then fails to write stays charged.
 
 ## Options
 
@@ -61,6 +64,43 @@ everything else is set on the builder, and each setter checks its argument at on
 
 Combining an async-only option with `synchronous()`, or `syncStripes` without it, throws
 `IllegalArgumentException` at `build()`.
+
+### The guards at a glance
+
+Five limits bound what a logger can cost the machine. Each is independent, each counts what it
+drops under its own name in `stats()`, and each reports through the warning handler: one warning
+when dropping starts, one every 10 seconds while it goes on, and one with the total when it ends.
+
+| Guard | Bounds | When it is hit | Counted in | Recovers |
+|---|---|---|---|---|
+| `maxFileSizeKb` (mandatory) | one file's size | the message is dropped and the file closed | `droppedFileFull` | when something truncates or renames the file away |
+| `maxFiles` | files created in this run | messages for IDs without a file yet are dropped | `droppedInvalidId` | never within the run |
+| `minFreeDiskSpace` | free space on the log volume | every message is dropped | `droppedDiskSpace` | when free space reaches the resume mark |
+| `maxCharsPerSecond` | this logger's own output | messages over the cap are dropped | `droppedRateLimit` | as soon as the rate falls |
+| `maxQueuedMessages`, `maxQueuedChars` | memory held by the queue | messages are dropped until the queue is half empty | `droppedQueueFull`, `droppedTooLarge` | as the worker drains |
+
+A logger fed from untrusted input might take all of them:
+
+```java
+EfficientLogger logger = EfficientLogger.builder(Path.of("logs"), "events-{id}.json", 100 * 1024) // 100 MiB per file
+        .maxFiles(10_000)                                   // at most 10,000 files, however many IDs arrive
+        .minFreeDiskSpace(2L << 30, 4L << 30)               // stop below 2 GiB free, resume above 4 GiB
+        .maxCharsPerSecond(5_000_000)                       // about 5 MB/s of JSON from this logger
+        .build();
+```
+
+Two things to know when choosing them:
+
+- **They are per logger, not per process.** A hundred loggers at 1,000 chars/s are 100,000 chars/s
+  of output between them, and each one sheds on its own reading of the volume (the reading itself is
+  shared). For one budget across an application, route its messages through one logger, or divide
+  the budget between loggers.
+- **A message is counted once, under the first test it fails.** `log()` tests in this order: the
+  ID too long for a file name; the message too large for the queue; the volume low; the queue full,
+  or the logger closed; the rate cap. So `droppedRateLimit` stays at zero while the queue is
+  overflowing, a shed message is never charged to the rate, and after `close()` everything is
+  `rejectedClosed` whatever else is wrong with it. A file at its cap is found later, by the worker,
+  and counted in `droppedFileFull`.
 
 ## What to expect
 
@@ -405,3 +445,9 @@ log4j integration. Other limits:
 
 - Running out of file descriptors is recognized by the English error message, on Unix and
   Windows. With a localized message, the file is retried a second later like any other error.
+- The free-space floor is in bytes, not a percentage of the volume; compute one from
+  `Files.getFileStore(dir).getTotalSpace()` if that is what you want.
+- The rate cap counts chars, not bytes. ASCII JSON is one byte per char, so the two agree; text
+  outside ASCII takes up to three bytes per char on disk, and a message's escapes six, so the
+  bytes written can exceed the cap by that much.
+- The caps are per logger. There is no process-wide budget for output or files.

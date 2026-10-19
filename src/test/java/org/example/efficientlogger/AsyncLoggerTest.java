@@ -369,6 +369,34 @@ class AsyncLoggerTest {
         assertEquals(0, logger.stats().queuedMessages());
     }
 
+    /**
+     * A flush over a backlog is served one batch per step, so on a shared thread the other workers
+     * get their turns in between; it used to drain the whole ring in one go (review 19, T4).
+     */
+    @Test
+    void aFlushIsServedOneBatchPerStep() throws InterruptedException {
+        batchSize = 2;
+        AsyncLogger logger = manual(builder().flushIntervalMillis(60_000));
+        Worker w = logger.worker(0);
+        for (int i = 1; i <= 6; i++) {
+            assertTrue(logger.log("a", json(i)));
+        }
+        long ticket = w.requestFlush();
+
+        assertEquals(2, w.runOnce());
+        assertFalse(w.awaitFlush(ticket, System.nanoTime()), "two of six taken: the flush is still pending");
+        assertEquals(4, logger.stats().queuedMessages());
+        assertEquals(0, logger.stats().written(), "nothing is written out until the flush completes");
+        assertEquals(2, w.runOnce());
+        assertFalse(w.awaitFlush(ticket, System.nanoTime()));
+        assertEquals(2, w.runOnce());
+        assertTrue(w.awaitFlush(ticket, System.nanoTime()), "all six taken: written out and done");
+        assertEquals(json(1) + "\n" + json(2) + "\n" + json(3) + "\n" + json(4) + "\n" + json(5) + "\n" + json(6) + "\n",
+                content("a"));
+        assertEquals(0, logger.stats().queuedMessages());
+        assertEquals(6, logger.stats().written());
+    }
+
     // ---- closing ----
 
     @Test
@@ -509,6 +537,30 @@ class AsyncLoggerTest {
         assertEquals(s.accepted(), s.written() + s.droppedInvalidId() + s.lostIoError());
         assertEquals(json(1) + "\n", content(longest));
         assertEquals(1, warnings.size(), "reported once");
+    }
+
+    /**
+     * After close, a message is rejected for being after close, whatever else is wrong with it:
+     * it used to count as accepted and dropped for its ID or size, and its one-time warning was
+     * handed to a worker that no longer existed (review 19, Q1).
+     */
+    @Test
+    void rejectionsAfterCloseCountAsRejectedClosed() {
+        AsyncLogger logger = manual(builder().maxQueuedChars(10));
+        assertTrue(logger.log("a", json(1)));
+        logger.close(Duration.ZERO);
+        drainAndFinish(logger);
+
+        assertFalse(logger.log("a".repeat(251), json(2)), "an id too long for a file name");
+        assertFalse(logger.log("a", "x".repeat(11)), "a message too large for the queue");
+        assertFalse(logger.log("a", json(3)), "an ordinary message");
+        LoggerStats s = logger.stats();
+        assertEquals(3, s.rejectedClosed(), s::toString);
+        assertEquals(1, s.accepted(), s::toString);
+        assertEquals(0, s.droppedInvalidId(), s::toString);
+        assertEquals(0, s.droppedTooLarge(), s::toString);
+        assertEquals(0, logger.droppedCount());
+        assertTrue(warnings.isEmpty(), warnings::toString);
     }
 
     // ---- errors ----

@@ -582,6 +582,98 @@ class AsyncThreadsTest {
     }
 
     /**
+     * With the stuck worker sharing its thread with an idle one, the back-off must still engage.
+     * The idle worker used to look like one that had only just started waiting for its slot, so the
+     * thread spun at full CPU for as long as the slot stayed unpublished (review 19, T2).
+     */
+    @Test
+    void anUnpublishedSlotOnASharedThreadStillBacksOff() throws Exception {
+        WorkerPool one = WorkerPool.create(1);
+        AsyncLogger stuck = start(builder().flushIntervalMillis(60_000).workerPool(one), nullSinks());
+        AsyncLogger idle = start(builder().flushIntervalMillis(60_000).workerPool(one), nullSinks());
+        Thread thread = stuck.thread(0);
+        assertSame(thread, idle.thread(0));
+        cutOffLog(stuck);
+        assertTrue(stuck.log("a", json(1)));
+
+        await(() -> thread.getState() == Thread.State.WAITING || thread.getState() == Thread.State.TIMED_WAITING,
+                "the shared thread to back off from the stuck slot");
+        assertLittleCpu(thread, "the shared thread with a stuck slot and an idle worker");
+
+        assertTrue(idle.log("b", json(2)), "the idle logger is still served meanwhile");
+        assertTrue(idle.flush(WAIT));
+        assertFalse(stuck.close(WAIT), "gives up on the stuck slot");
+        assertTrue(idle.close(WAIT));
+    }
+
+    /**
+     * An Error from a write (FileOutputStream throws OutOfMemoryError when it can't get a native
+     * buffer for a write over 8 KiB) used to escape the pool thread's loop when the write happened
+     * on the way to sleep, and the thread died: its loggers were never served again, and new
+     * loggers were sent to it (review 19, T3). Now it is reported like any unexpected error, and the
+     * buffered records are written on the next step.
+     */
+    @Test
+    void anErrorWhileWritingOutBeforeSleepingDoesNotKillTheThread() throws Exception {
+        WorkerPool one = WorkerPool.create(1);
+        TestHooks hooks = new TestHooks();
+        hooks.sinks = new FirstWriteSinks(() -> {
+            throw new OutOfMemoryError("no native buffer");
+        });
+        AsyncLogger logger = start(builder().workerPool(one), hooks);
+        Thread thread = logger.thread(0);
+        assertTrue(logger.log("a", json(1)));
+
+        await(() -> logger.stats().written() == 1, "the record to be written on the step after the error");
+        assertTrue(thread.isAlive());
+        assertEquals(1, warnings.size(), warnings::toString);
+        assertTrue(warnings.get(0).startsWith("unexpected error in the worker thread | java.lang.OutOfMemoryError: no native buffer"),
+                warnings.get(0));
+
+        AsyncLogger second = start(builder().workerPool(one));
+        assertSame(thread, second.thread(0), "the thread is still the pool's");
+        assertTrue(second.log("b", json(2)));
+        assertTrue(second.flush(WAIT));
+        assertEquals(List.of(json(2)), lines("b"));
+        assertTrue(logger.close(WAIT));
+        assertEquals(List.of(json(1)), lines("a"));
+        assertTrue(second.close(WAIT));
+    }
+
+    /**
+     * The timeout warning counts records a worker has taken from the queue into a file buffer but
+     * not yet written out, not only those still queued, so a close that times out behind a stalled
+     * write doesn't say "0 messages" (review 19, D1).
+     */
+    @Test
+    void theCloseTimeoutWarningCountsBufferedRecordsToo() throws Exception {
+        CountDownLatch writing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        TestHooks hooks = new TestHooks();
+        hooks.sinks = new FirstWriteSinks(() -> {
+            writing.countDown();
+            try {
+                assertTrue(release.await(WAIT.toSeconds(), SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        AsyncLogger logger = start(builder().flushIntervalMillis(0), hooks); // writes out after every batch
+        assertTrue(logger.log("a", json(1)));
+        assertTrue(writing.await(WAIT.toSeconds(), SECONDS), "the worker is stalled in the write of the first record");
+        assertTrue(logger.log("a", json(2)));
+        assertTrue(logger.log("a", json(3)));
+
+        assertFalse(logger.close(Duration.ofMillis(200)));
+        assertEquals(List.of("close didn't finish within 200 ms; the remaining 3 messages will be written in the"
+                + " background"), warnings, "two queued and one buffered");
+
+        release.countDown();
+        assertTrue(logger.close(WAIT));
+        assertEquals(jsons(1, 4), lines("a"));
+    }
+
+    /**
      * A producer cut off after being admitted but before claiming a ring slot leaves the queue
      * size above zero with nothing in any ring to drain. close() gives up after 2 s, says so, and
      * returns false. If that producer was merely stalled and resumes, its log() returns true, but
@@ -1078,6 +1170,45 @@ class AsyncThreadsTest {
                 }
             }
             return FileOutputStreamSink.FACTORY.open(path);
+        }
+
+        @Override
+        public int lastByte(Path path) throws IOException {
+            return FileOutputStreamSink.FACTORY.lastByte(path);
+        }
+
+        @Override
+        public boolean createDirectoryIfMissing(Path dir) throws IOException {
+            return FileOutputStreamSink.FACTORY.createDirectoryIfMissing(dir);
+        }
+    }
+
+    /** Real files, except that {@code beforeFirstWrite} runs before the first write, once; it may block or throw. */
+    static final class FirstWriteSinks implements SinkFactory {
+        private final AtomicReference<Runnable> beforeFirstWrite;
+
+        FirstWriteSinks(Runnable beforeFirstWrite) {
+            this.beforeFirstWrite = new AtomicReference<>(beforeFirstWrite);
+        }
+
+        @Override
+        public Sink open(Path path) throws IOException {
+            Sink real = FileOutputStreamSink.FACTORY.open(path);
+            return new Sink() {
+                @Override
+                public void write(byte[] b, int off, int len) throws IOException {
+                    Runnable first = beforeFirstWrite.getAndSet(null);
+                    if (first != null) {
+                        first.run();
+                    }
+                    real.write(b, off, len);
+                }
+
+                @Override
+                public void close() throws IOException {
+                    real.close();
+                }
+            };
         }
 
         @Override

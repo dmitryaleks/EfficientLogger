@@ -96,7 +96,12 @@ final class AsyncLogger implements EfficientLogger {
             throw e;
         }
         if (registerShutdownHook) {
-            ShutdownHook.register(this);
+            try {
+                ShutdownHook.register(this);
+            } catch (RuntimeException | Error e) {
+                beginClose(); // the workers are running: have them finish and leave the pool, since nobody will hold this logger
+                throw e;
+            }
         }
         return this;
     }
@@ -120,6 +125,9 @@ final class AsyncLogger implements EfficientLogger {
         if (len > maxChars) {
             // Too large for the queue. Not a full queue, so it doesn't feed overflow episodes; it
             // has its own warning, which a worker emits so the caller does no I/O.
+            if (closing()) {
+                return rejectClosed(); // after close it is only that, and no worker is left to warn
+            }
             if (warnings.countOversizeMessage()) {
                 rings[0].wakeConsumer();
             }
@@ -130,10 +138,9 @@ final class AsyncLogger implements EfficientLogger {
         if (admitted <= 0) {
             if (admitted == Admission.REJECTED_FULL) {
                 tracker.recordDrop();
-            } else {
-                rejectedClosed.incrementAndGet();
+                return false;
             }
-            return false;
+            return rejectClosed();
         }
         ring.offer(id, json, admitted); // can't fail or throw, so the admitted slot is always published
         return true;
@@ -141,9 +148,17 @@ final class AsyncLogger implements EfficientLogger {
 
     /** Counts a message whose ID is too long for a file name. Allocates nothing. */
     private boolean rejectTooLongId() {
+        if (closing()) {
+            return rejectClosed(); // after close it is only that, and no worker is left to warn
+        }
         if (warnings.countTooLongId()) {
             rings[0].wakeConsumer(); // a worker reports it, so the caller does no I/O
         }
+        return false;
+    }
+
+    private boolean rejectClosed() {
+        rejectedClosed.incrementAndGet();
         return false;
     }
 
@@ -266,12 +281,26 @@ final class AsyncLogger implements EfficientLogger {
                     ? "won't be written: the JVM is exiting"
                     : "will be written in the background";
             warnings.emit("close didn't finish within " + TimeUnit.NANOSECONDS.toMillis(timeoutNanos)
-                    + " ms; the remaining " + messages(Admission.messages(admission.get())) + " " + fate, null);
+                    + " ms; the remaining " + messages(unwritten()) + " " + fate, null);
             return false;
         }
         // The workers give up on a queue that stops draining (see Worker), so "finished" doesn't
         // mean "everything written": say so, as the javadoc promises.
         return nothingLeft();
+    }
+
+    /**
+     * Messages not yet handed to the OS: still queued, or taken from a queue into a file buffer
+     * that a worker hasn't written out (for example because its thread is stalled in a write).
+     * A snapshot of moving counters: a record inside the batch being drained can be in both for
+     * an instant.
+     */
+    private long unwritten() {
+        long n = Admission.messages(admission.get());
+        for (Worker w : workers) {
+            n += w.files.buffered();
+        }
+        return n;
     }
 
     /** True if every admitted message has been consumed. Only meaningful once the workers have finished. */
@@ -298,7 +327,7 @@ final class AsyncLogger implements EfficientLogger {
         return admission;
     }
 
-    /** For tests: true once close has started. */
+    /** True once close has started. */
     boolean closing() {
         return Admission.isClosed(admission.get());
     }

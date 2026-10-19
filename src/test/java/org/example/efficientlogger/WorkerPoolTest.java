@@ -223,6 +223,33 @@ class WorkerPoolTest {
         assertTrue(raising.close(WAIT));
     }
 
+    /**
+     * A thread with nothing to do sleeps until a producer wakes it, and producers wake a thread only
+     * through a ring it has announced on. A logger that arrives on that thread later has a ring it
+     * never announced on, so registering must wake the thread itself; otherwise the new logger's
+     * messages waited, and then dropped, until one of the thread's other loggers happened to log
+     * (review 19, T1).
+     */
+    @Test
+    void aLoggerRegisteredOntoASleepingThreadIsServedAtOnce() throws Exception {
+        WorkerPool pool = WorkerPool.create(1);
+        AsyncLogger first = start(builder("f").flushIntervalMillis(10).workerPool(pool));
+        assertTrue(first.log("a", json(1)));
+        assertTrue(first.flush(WAIT));
+        Thread thread = first.thread(0);
+        await(() -> thread.getState() == Thread.State.WAITING, "the thread to fall into deep sleep"); // park, not parkNanos
+
+        AsyncLogger second = start(builder("s").workerPool(pool));
+        assertSame(thread, second.thread(0));
+        for (int i = 1; i <= 5; i++) {
+            assertTrue(second.log("a", json(i)));
+        }
+        await(() -> second.stats().written() == 5, "the new logger's messages to be written while its thread's other logger stays quiet");
+        assertEquals(List.of(json(1), json(2), json(3), json(4), json(5)), lines("s", "a"));
+        assertEquals(0, second.droppedCount());
+        assertTrue(warnings.isEmpty(), warnings::toString);
+    }
+
     @Test
     void oneShutdownHookServesEveryLogger() {
         AsyncLogger first = start(builder("f"));

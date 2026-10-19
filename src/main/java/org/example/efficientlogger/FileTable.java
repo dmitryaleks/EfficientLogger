@@ -38,6 +38,7 @@ final class FileTable {
     private static final int WRITTEN = 0;
     private static final int LOST_IO_ERROR = 1;
     private static final int DROPPED_INVALID_ID = 2;
+    private static final int BUFFERED = 3; // records in file buffers, not yet handed to the OS
 
     private final FileNamePattern pattern;
     private final byte[] separator;
@@ -63,7 +64,7 @@ final class FileTable {
     private byte[] scratch; // write-through mode
 
     // Written by the owner with opaque stores, so other threads can read them without tearing.
-    private final long[] counters = new long[3];
+    private final long[] counters = new long[4];
     private List<Warnings.Pending> pendingWarnings;
 
     FileTable(FileNamePattern pattern, byte[] separator, int bufferBytes, int maxEntries,
@@ -121,6 +122,7 @@ final class FileTable {
         }
         f.pos = putSeparator(b, Utf8.endPos(r));
         f.pendingRecords++;
+        add(BUFFERED, 1);
         markDirty(f, now);
     }
 
@@ -215,6 +217,11 @@ final class FileTable {
     /** Counts records the owner lost to an unexpected error. */
     void countLost(long records) {
         add(LOST_IO_ERROR, records);
+    }
+
+    /** Records taken from the queue but still in a file buffer, not yet handed to the OS. */
+    long buffered() {
+        return (long) LONGS.getOpaque(counters, BUFFERED);
     }
 
     /** Records dropped because their ID can't be a file name. */
@@ -394,6 +401,7 @@ final class FileTable {
             return false;
         }
         add(WRITTEN, f.pendingRecords);
+        add(BUFFERED, -f.pendingRecords);
         f.pos = 0;
         f.pendingRecords = 0;
         return true;
@@ -422,6 +430,7 @@ final class FileTable {
     /** Drops f's buffered records, closes it, and backs off before reopening. */
     private void fail(FileState f, String what, Exception e, long now) {
         add(LOST_IO_ERROR, f.pendingRecords);
+        add(BUFFERED, -f.pendingRecords);
         f.pos = 0;
         f.pendingRecords = 0;
         releaseBuffer(f);

@@ -139,9 +139,14 @@ sharing adds no latency beyond the other loggers' batches. Threads start when a 
 them and exit when the last logger they serve closes. So an application with 50 loggers has at
 most 4 logging threads, and one logger with `workerThreads(4)` gets 4 threads on a shared pool with
 room for them, but only as many as the pool has. A logger whose handler blocks, or whose disk
-stalls, holds up the other loggers on its thread for that long; give such a logger a pool of its
-own with `workerPool(WorkerPool.create(n))`, which also takes a `ThreadFactory` to name the
-threads. The default threads are daemons named `efficient-logger-<pool>-worker-<i>`. One shutdown
+stalls, holds up the other loggers on its thread for that long, and ties their fates to it: while
+it stalls, `close()` on the others returns false at its timeout, and at JVM exit the shutdown hook
+waits at most the longest `closeTimeout` for all loggers at once, so one stalled logger can cost
+every logger on its thread the messages still queued. Give such a logger a pool of its own with
+`workerPool(WorkerPool.create(n))`; a logger whose messages must survive exit is the one that
+most needs its own. `create` also takes a `ThreadFactory`, for example to name the threads; it is
+called while a logger is being built, under the pool's lock, so it must return promptly and not
+block. The default threads are daemons named `efficient-logger-<pool>-worker-<i>`. One shutdown
 hook, registered while any logger wants one, closes every open logger at JVM exit, all draining
 at once, so it waits at most the longest `closeTimeout`, not the sum.
 

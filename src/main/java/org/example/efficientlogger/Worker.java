@@ -41,7 +41,7 @@ final class Worker implements MpscRing.Handler {
     static final int DEEP_SLEEP_AFTER = 10;
     static final int SPINS = 64;
     static final long CLOSING_POLL_NANOS = TimeUnit.MICROSECONDS.toNanos(100);
-    private static final long ERROR_PAUSE_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
+    static final long ERROR_PAUSE_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
     /** Passes spent waiting for one slot to be published before the thread stops spinning for it. */
     static final int STALL_SPINS = 100;
     /** How often the thread then polls a slot that stays unpublished (a producer cut off mid-publish). */
@@ -71,6 +71,9 @@ final class Worker implements MpscRing.Handler {
 
     private final AtomicLong flushRequested = new AtomicLong();
     private volatile long flushDone;
+    private boolean flushPending; // a request has been taken up and not yet completed
+    private long flushTicket;     // the request being served
+    private long flushTarget;     // the ring position it must drain to
     private final Object flushLock = new Object();
     private volatile boolean terminated;
     private volatile Thread thread; // the pool thread serving this worker; null when tests run it by hand
@@ -150,9 +153,13 @@ final class Worker implements MpscRing.Handler {
         return AWAIT_PUBLISH;
     }
 
-    /** After {@link #AWAIT_PUBLISH}: true while the slot is worth spinning for, false once the thread should poll. */
+    /**
+     * After {@link #AWAIT_PUBLISH}: true while the slot is worth spinning for, false once the thread
+     * should poll. False for a worker that isn't waiting for a slot at all: a thread serving one
+     * stuck worker and one idle one must still back off, so the idle one mustn't look stalled.
+     */
     boolean stalledBriefly() {
-        return stalledPasses <= STALL_SPINS;
+        return stalledPasses > 0 && stalledPasses <= STALL_SPINS;
     }
 
     /** Before the thread sleeps: writes everything out. Never sleep holding unwritten records. */
@@ -351,27 +358,32 @@ final class Worker implements MpscRing.Handler {
     }
 
     /**
-     * Writes out every message logged before the request, then signals the requester.
+     * Once every message logged before the request has been taken from the ring, writes out the
+     * files and signals the requester. Called after each step's batch, so a request over a deep
+     * backlog is served one batch per step, with the thread's other workers getting their turns in
+     * between, rather than by draining the whole ring here and holding them all up.
      *
      * <p>If the ring can't be drained that far because its head slot was claimed but not yet
      * published (a producer between claiming and publishing: normally for microseconds, but for
-     * good if its {@code log()} call was cut off), this returns with the request still pending
-     * rather than spin here. The thread waits for the slot with back-off, or gives up at close,
-     * and comes back to the request. Spinning here instead once wedged the worker for the life of
-     * the process after such a cut-off, with {@code close()} unable to finish.
+     * good if its {@code log()} call was cut off), the request simply stays pending. The thread
+     * waits for the slot with back-off, or gives up at close, and comes back to the request.
+     * Spinning here instead once wedged the worker for the life of the process after such a
+     * cut-off, with {@code close()} unable to finish.
      */
     private void serveFlush() {
-        long request = flushRequested.get();
-        long target = ring.tail(); // read after the request, so it covers every log() that came before flush()
-        while (ring.head() - target < 0) {
-            if (drainBatch(clock.getAsLong()) == 0) {
-                return; // the head slot isn't published yet
-            }
+        if (!flushPending) {
+            flushTicket = flushRequested.get();
+            flushTarget = ring.tail(); // read after the request, so it covers every log() that came before flush()
+            flushPending = true;
+        }
+        if (ring.head() - flushTarget < 0) {
+            return; // more to take: the next step's batch continues, or waits for an unpublished slot
         }
         files.flushDirty(clock.getAsLong());
         warnings.emitAll(files.takeWarnings());
+        flushPending = false;
         synchronized (flushLock) {
-            flushDone = request;
+            flushDone = flushTicket;
             flushLock.notifyAll();
         }
     }

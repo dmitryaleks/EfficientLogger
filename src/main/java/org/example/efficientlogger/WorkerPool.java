@@ -81,6 +81,11 @@ public final class WorkerPool {
      * A pool of at most {@code maxThreads} threads made by {@code factory}, which should make daemon
      * threads: a non-daemon worker would keep the JVM from exiting while any logger is open.
      *
+     * <p>The factory is called while a logger is being built, under the pool's lock, so it must
+     * return promptly and must not block, and must not take a lock that a {@link WarningHandler}
+     * might hold while it builds a logger. While it runs, no other logger can register with this
+     * pool and none of the pool's threads can exit.
+     *
      * @param maxThreads 1 to 256
      * @throws NullPointerException if {@code factory} is null
      */
@@ -145,9 +150,11 @@ public final class WorkerPool {
 
     /**
      * Gives a logger's workers to the pool's threads, each to the one serving the fewest workers,
-     * and starts the threads that aren't running yet. Every thread is created before any is started,
-     * so a worker can't run before its logger has finished registering. If a thread can't be made
-     * or started, nothing stays registered and the error propagates.
+     * starts the threads that aren't running yet, and wakes the ones that are, so a thread asleep
+     * with nothing to do picks the new worker up at once rather than when one of its other loggers
+     * happens to wake it. Every thread is created before any is started, so a worker can't run
+     * before its logger has finished registering. If a thread can't be made or started, nothing
+     * stays registered and the error propagates.
      *
      * @throws IllegalStateException if the thread factory returns null
      */
@@ -168,12 +175,20 @@ public final class WorkerPool {
                         runners[r.slot] = r;
                         fresh.add(r);
                     }
+                    w.attach(r.thread); // before the thread can see the worker, so flush/close from a handler on it recognise it
                     r.add(w);
                     assigned.add(r);
-                    w.attach(r.thread);
                 }
                 for (; started < fresh.size(); started++) {
                     fresh.get(started).thread.start();
+                }
+                for (Runner r : assigned) {
+                    // A running thread reads its list once per pass and only then sleeps. If it read
+                    // the list before the add, the permit ends its sleep and the next pass sees the
+                    // worker. Without this, a thread in deep sleep (and a new ring, whose parked
+                    // state no producer finds set) would sleep on while the new logger's queue
+                    // filled and dropped.
+                    LockSupport.unpark(r.thread);
                 }
             } catch (RuntimeException | Error e) {
                 // Don't leave the logger half-registered. A thread already started finds no work
@@ -263,61 +278,90 @@ public final class WorkerPool {
             }
         }
 
+        /**
+         * The thread never dies while it has workers: each call into a worker is guarded, and so is
+         * the pass as a whole. A thread that died would stay in the pool's table, so its loggers
+         * would never be served again and new loggers would be sent to it.
+         */
         @Override
         public void run() {
             for (;;) {
-                Thread.interrupted(); // a leftover interrupt would make every park() return at once
-                Worker[] ws = workers;
-                if (ws.length == 0) {
-                    if (retire(this)) {
+                try {
+                    if (!pass()) {
                         return;
                     }
-                    continue; // a worker arrived meanwhile
-                }
-                int want = Worker.IDLE;
-                for (Worker w : ws) {
-                    int s;
-                    try {
-                        s = w.step();
-                    } catch (Throwable t) {
-                        w.recover(t);
-                        s = Worker.CONTINUE;
+                } catch (Throwable t) {
+                    // Nothing below should let anything through; this is the last resort.
+                    Worker[] ws = workers;
+                    if (ws.length > 0) {
+                        ws[0].recover(t);
+                    } else {
+                        LockSupport.parkNanos(this, Worker.ERROR_PAUSE_NANOS);
                     }
-                    if (s == Worker.DONE) {
-                        finish(w);
-                        s = Worker.CONTINUE; // the list has changed: read it again before sleeping
-                    }
-                    if (s < want) {
-                        want = s;
-                    }
-                }
-                switch (want) {
-                    case Worker.CONTINUE:
-                        break;
-                    case Worker.AWAIT_PUBLISH:
-                        awaitPublish(ws);
-                        break;
-                    case Worker.CLOSING:
-                        waitWhileClosing(ws);
-                        break;
-                    default:
-                        sleep(ws);
-                        break;
                 }
             }
         }
 
-        /** Closes the worker's files and tells its logger, then forgets it. */
+        /** One pass over the workers, then the most urgent wait any of them asked for. False once the thread may exit. */
+        private boolean pass() {
+            Thread.interrupted(); // a leftover interrupt would make every park() return at once
+            Worker[] ws = workers;
+            if (ws.length == 0) {
+                return !retire(this); // else a worker arrived meanwhile
+            }
+            int want = Worker.IDLE;
+            for (Worker w : ws) {
+                int s;
+                try {
+                    s = w.step();
+                } catch (Throwable t) {
+                    w.recover(t);
+                    s = Worker.CONTINUE;
+                }
+                if (s == Worker.DONE) {
+                    finish(w);
+                    s = Worker.CONTINUE; // the list has changed: read it again before sleeping
+                }
+                if (s < want) {
+                    want = s;
+                }
+            }
+            switch (want) {
+                case Worker.CONTINUE:
+                    break;
+                case Worker.AWAIT_PUBLISH:
+                    awaitPublish(ws);
+                    break;
+                case Worker.CLOSING:
+                    waitWhileClosing(ws);
+                    break;
+                default:
+                    sleep(ws);
+                    break;
+            }
+            return true;
+        }
+
+        /**
+         * Closes the worker's files, tells its logger, then forgets it. The logger is told first,
+         * so a close() waiting on it is released without waiting for the pool's lock, which a
+         * registration in progress may hold while it runs the thread factory.
+         */
         private void finish(Worker w) {
             try {
                 w.finish();
             } catch (Throwable t) {
                 w.recover(t); // finish() guards itself; this is a last resort
             } finally {
-                unregister(this, w);
-                Runnable callback = w.onTerminated();
-                if (callback != null) {
-                    callback.run();
+                try {
+                    Runnable callback = w.onTerminated();
+                    if (callback != null) {
+                        callback.run();
+                    }
+                } catch (Throwable t) {
+                    w.recover(t);
+                } finally {
+                    unregister(this, w);
                 }
             }
         }
@@ -364,7 +408,14 @@ public final class WorkerPool {
          */
         private void sleep(Worker[] ws) {
             for (Worker w : ws) {
-                w.beforeSleep();
+                try {
+                    w.beforeSleep();
+                } catch (Throwable t) {
+                    // E.g. an OutOfMemoryError from a write (FileOutputStream allocates a native
+                    // buffer for writes over 8 KiB) or from building a warning. The records stay
+                    // buffered and the next step writes them out, or fails the file properly.
+                    w.recover(t);
+                }
             }
             boolean deep = true;
             long nanos = Long.MAX_VALUE;

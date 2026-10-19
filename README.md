@@ -498,9 +498,17 @@ every guard on both sides of the stats identity.
 `build` runs the unit, integration and stress tests, then the allocation tests in two separate
 JVMs (`allocationTest` and `allocationTestNoEA`). The tests also check the benchmark's null-device
 sink against the library's file checks, so `test` compiles the benchmark sources too. It passes on
-Windows 11 and on Ubuntu 24.04 (WSL 2). It needs a JDK 17 installed locally: the build won't download one (see below), and the
-Gradle wrapper and every dependency are pinned by checksum (`gradle/wrapper/gradle-wrapper.properties`
-and `gradle/verification-metadata.xml`), so a tampered download fails the build. The library is
+Windows 11 and on Ubuntu 24.04 (WSL 2). A fresh checkout builds as it is: the only thing it needs
+installed is a Java runtime to start Gradle with. The wrapper downloads Gradle 8.14.4 and checks
+it against the SHA-256 in `gradle/wrapper/gradle-wrapper.properties` (the wrapper jar itself
+matches the checksum Gradle publishes for that version); the build asks for a Java 17 toolchain
+and, if none is installed, downloads one through the Foojay toolchain resolver; and every plugin
+and dependency, the resolver included, is pinned by SHA-256 in `gradle/verification-metadata.xml`,
+so a tampered download fails the build. The one thing that isn't checksum-pinned is a downloaded
+JDK: Gradle's dependency verification covers plugins and dependencies only, so the JDK comes from
+its vendor over HTTPS through the Foojay Disco API and is checked for the version asked for.
+Install a JDK 17 yourself, or set `org.gradle.java.installations.auto-download=false` in
+`gradle.properties`, if you would rather it never downloaded one. The library is
 `build/libs/EfficientLogger-1.0-SNAPSHOT.jar`, with no dependencies. Benchmarks run separately:
 
 ```

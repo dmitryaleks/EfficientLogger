@@ -163,11 +163,17 @@ public final class ManyLoggersBenchmark {
         }
         Arrays.sort(latencies, 0, k);
         Arrays.sort(lateness, 0, k);
-        long dropped = queueFull + tooLarge + diskLow + rateCap;
-        out.printf(Locale.ROOT, "traces: %d attempted of %d planned, %d accepted, %d dropped by the caps, %d written, %d lines on disk in %d files; %s%n",
-                attempted, expected, accepted, dropped, written, lines, countFiles(dir),
-                lines == written && accepted == written + fileFull && accepted + dropped == attempted
-                        ? (dropped == 0 ? "nothing lost" : "every trace accounted for") : "MISMATCH");
+        // Every attempted trace is either accepted or dropped at log(); every accepted one is either
+        // written or dropped later, by a worker (the stats identity once the loggers are closed).
+        long droppedAtLog = queueFull + tooLarge + diskLow + rateCap;
+        long droppedLater = invalidId + fileFull + ioError + abandoned;
+        boolean accounted = lines == written && accepted + droppedAtLog == attempted && accepted == written + droppedLater;
+        out.printf(Locale.ROOT, "traces: %d attempted of %d planned; %d accepted and %d dropped at log() (queue full %d, too large %d,"
+                        + " disk %d, rate %d); of the accepted, %d written and %d dropped later (invalid id %d, file full %d, I/O %d,"
+                        + " abandoned %d); %d lines on disk in %d files; %s%n",
+                attempted, expected, accepted, droppedAtLog, queueFull, tooLarge, diskLow, rateCap, written, droppedLater, invalidId,
+                fileFull, ioError, abandoned, lines, countFiles(dir),
+                !accounted ? "MISMATCH" : droppedAtLog + droppedLater == 0 ? "nothing lost" : "every trace accounted for");
         out.printf(Locale.ROOT, "producers ran %.1f s; pool threads while running: %d; close() of %d loggers took %d ms, %d returned true%n",
                 produced / 1e9, poolThreads, loggers, closeNanos / 1_000_000, closedCleanly);
         out.printf(Locale.ROOT, "log() latency (us): p50 %.1f  p99 %.1f  p99.9 %.1f  max %.1f%n",

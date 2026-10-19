@@ -425,6 +425,32 @@ the caller nothing it can measure. The 2.6 ms maximum is the first `log()` call 
 always; this time all four producers made theirs in the same millisecond and waited together on
 the same class loading and call-site linking.
 
+### Making the guards bite
+
+The runs above show the guards costing nothing when they don't apply. This one checks that each
+does what the README says when it does. The settings were chosen from the environment so that a
+prediction could be made before running: the traces are 82, 83 and 84 bytes with their separator
+for one-, two- and three-digit sequence numbers (so 8,290 bytes for a logger's first 100, then 84
+each), and the volume had 397.7 GiB free. Each experiment is the same minute (100 loggers, 5
+traces/s each, 300 per logger) with one guard set to bite, on the Windows machine above,
+2026-10-19.
+
+| Guard, setting | Hypothesis | Observed | Match |
+|---|---|---|---|
+| `maxFileSizeKb` 16 (`-Pmany.fileKb=16`) | 8,290 + 96 × 84 = 16,354 bytes fit, so every logger writes exactly 196 lines and drops 104 as `fileFull`; every file is 16,354 bytes; 100 warnings naming that size | all 100 loggers 196 written, 104 `fileFull`; 100 files of 16,354 bytes; 100 warnings "is at maxFileSizeKb (16354 bytes)"; `log()` 3.6 µs p50 | exact |
+| `maxFiles` 60 (`-Pmany.maxFiles=60`) | 60 files with 300 lines; 40 loggers write nothing and count 300 `droppedInvalidId` each; 40 warnings; which 40 is a race | 60 files × 300 lines, 40 loggers at 0 / 300, 40 warnings. The winners were loggers 000 to 059: the benchmark paces logger *i*'s traces at an offset proportional to *i*, so the lowest numbers reach the workers first | exact (the race has a bias) |
+| `minFreeDiskSpace` 500,000 MiB floor, 1,000,000 MiB resume (`-Pmany.minFreeMb=500000`) | the floor is above the 397.7 GiB free, so every message is shed from the first: 0 accepted, 30,000 `droppedDiskSpace`, no file created; per logger a start warning, about five ten-second progress reports and one "before close", about 700 warnings | 0 accepted, 30,000 `droppedDiskSpace`, 0 files; 650 warnings: 100 starts quoting "397.7 GiB, below minFreeDiskSpace=488.3 GiB", 450 progress reports, 100 "dropped 300 before close"; `log()` 2.5 µs p50, max 466 µs | exact on the counts; 650 against about 700 |
+| `maxCharsPerSecond` 10,000 shared (`-Pmany.charsPerSecond=10000`) | at most rate × (60 s + the 1 s burst) of chars, so at most 610,000 / 82.6 = 7,385 traces plus one message of slack, and at least 95% of 7,263 | 7,386 accepted, 22,614 dropped, every one accounted for; the accepted traces average 82.60 chars, so 610,084 chars were charged: the budget plus 84, which is the one message the meter lets through by judging before it charges. Per logger between 50 and 114, since the bucket is shared | exact, to one message |
+
+Three things the experiments showed beyond their numbers. The shed path returns before the
+routing hash and the queue are touched, so the disk run's slowest call was 466 µs, not the usual
+2.5 ms first call that loads those classes. The `maxFiles` race is not random: a steady,
+staggered load hands the files to whoever logs first, and with this benchmark that is the
+lowest-numbered loggers. And the benchmark's own summary line was wrong until these runs: it
+counted only drops made at `log()` time, so the file-cap run reported "nothing lost" with 10,400
+drops and the `maxFiles` run reported "MISMATCH" with every trace accounted for. It now counts
+every guard on both sides of the stats identity.
+
 ## On Linux
 
 - **Rotate with `copytruncate`.** The logger keeps each file open, so if logrotate renames a

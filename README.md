@@ -262,6 +262,22 @@ What this shows:
 To run it with real files instead, add `-p output=disk`. The numbers then depend mostly on
 the disk.
 
+**Many quiet loggers.** `ManyLoggersBenchmark` (`gradlew manyLoggers`) is the other shape of
+load: 100 loggers, one worker each, every one writing 5 traces a second to its own file on the
+shared pool, for one minute, through the public API, with real files. It then closes every logger
+and prints each one's `stats()`. On the Windows machine above, on 2026-10-19: all 30,000 traces
+accepted, written and on disk in 100 files, nothing dropped or lost, no warnings; the 100 loggers
+ran on the pool's 4 threads; `close()` of all 100 took 11 ms; `log()` took 3.1 µs at p50, 59 µs
+at p99 and 2.5 ms at worst. The report lists the slowest calls with their JVM uptime, so they can
+be matched against `-Xlog:safepoint,gc,class+load` (pass it with `-Pmany.jvmArgs`); doing so
+shows the worst call is always the first `log()` in the JVM, which loads the routing-hash class
+and links the queue's `VarHandle` call sites in the interpreter (1.7 to 2.5 ms, once per JVM),
+the next ones (1 to 1.6 ms, a couple per minute) coincide with nothing in the JVM's log and are
+the OS taking the core from the producer, and a cluster of 0.35 ms calls on every producer at
+once is the JVM's periodic cleanup safepoint. None involves the queue. Its options are
+`-Pmany.loggers`, `-Pmany.rate`, `-Pmany.seconds`, `-Pmany.producers`, `-Pmany.dir` and
+`-Pmany.jvmArgs`.
+
 ## On Linux
 
 - **Rotate with `copytruncate`.** The logger keeps each file open, so if logrotate renames a
@@ -314,6 +330,8 @@ and `gradle/verification-metadata.xml`), so a tampered download fails the build.
 .\gradlew.bat jmh                                         # all benchmarks; results in build/results/jmh
 .\gradlew.bat jmhJar                                      # or build the jar and pass JMH options:
 java -jar build/libs/EfficientLogger-1.0-SNAPSHOT-jmh.jar LoggerBenchmark -prof gc -p output=disk
+.\gradlew.bat manyLoggers                                 # the one-minute soak: 100 loggers at 5 traces/s each
+.\gradlew.bat manyLoggers -Pmany.loggers=500 -Pmany.rate=1 -Pmany.seconds=30   # its options (also producers, dir)
 ```
 
 The design, the reasoning behind it and the milestones are in [PLAN.md](PLAN.md).

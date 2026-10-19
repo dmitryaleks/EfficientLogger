@@ -89,6 +89,20 @@ jmh {
     (findProperty("jmhProfilers") as String?)?.let { profilers = it.split(",") }
 }
 
+// A one-minute soak through the public API: 100 loggers, one worker each, 5 traces/s each to 100
+// files on the shared pool, then every logger's stats. .\gradlew.bat manyLoggers [-Pmany.loggers=100
+// -Pmany.rate=5 -Pmany.seconds=60 -Pmany.producers=4 -Pmany.dir=build/many-loggers]
+tasks.register<JavaExec>("manyLoggers") {
+    description = "Runs ManyLoggersBenchmark: many loggers writing a slow trickle each for a fixed time"
+    group = "benchmark"
+    classpath = sourceSets["jmh"].runtimeClasspath
+    mainClass = "org.example.efficientlogger.ManyLoggersBenchmark"
+    for (option in listOf("loggers", "rate", "seconds", "producers", "dir")) {
+        (findProperty("many.$option") as String?)?.let { systemProperty("many.$option", it) }
+    }
+    (findProperty("many.jvmArgs") as String?)?.let { jvmArgs(it.split(" ")) } // e.g. -Xlog:safepoint,gc:file=build/jvm.log
+}
+
 tasks.named<Jar>("jmhJar") {
     manifest {
         attributes("Multi-Release" to "true") // log4j-core has Java 9+ versions of some classes

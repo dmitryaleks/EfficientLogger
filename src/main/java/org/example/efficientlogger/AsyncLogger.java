@@ -145,18 +145,14 @@ final class AsyncLogger implements EfficientLogger {
             return false;
         }
         if (disk != null && disk.shedding()) {
+            if (closing()) {
+                return rejectClosed(); // after close it is only that
+            }
             disk.recordDrop();
-            if (disk.due(clock.getAsLong())) {
-                rings[0].wakeConsumer(); // a worker takes the next reading, so shedding ends even if they are all asleep
+            if (disk.shouldWake(clock.getAsLong())) {
+                rings[0].wakeConsumer(); // a worker takes the overdue reading, so shedding ends even if they are all asleep
             }
             return false;
-        }
-        if (rate != null) {
-            long now = clock.getAsLong();
-            if (!rate.tryAcquire(len, now)) {
-                rate.recordDrop(now);
-                return false;
-            }
         }
         MpscRing ring = rings[Hashing.bucket(id, shardKey, rings.length)];
         long admitted = admission.tryAcquire(len);
@@ -166,6 +162,15 @@ final class AsyncLogger implements EfficientLogger {
                 return false;
             }
             return rejectClosed();
+        }
+        if (rate != null) {
+            // After admission, so a message the queue refuses (or a closed logger) is never charged to the rate.
+            long now = clock.getAsLong();
+            if (!rate.tryAcquire(len, now)) {
+                admission.release(Admission.delta(len)); // it won't be queued after all
+                rate.recordDrop(now);
+                return false;
+            }
         }
         ring.offer(id, json, admitted); // can't fail or throw, so the admitted slot is always published
         return true;

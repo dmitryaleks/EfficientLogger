@@ -5,8 +5,10 @@ import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * The low-water mark on free disk space ({@code minFreeDiskSpace}): sheds every message while the
@@ -29,26 +31,74 @@ final class DiskWatch {
 
     static final long CHECK_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
 
+    /** One reading per volume per interval, shared by every logger on that volume. Never shrinks: one entry per volume. */
+    private static final ConcurrentHashMap<FileStore, VolumeReading> VOLUMES = new ConcurrentHashMap<>();
+
     /**
      * The usable space of the volume holding {@code directory}, as the OS reports it (quotas
-     * included). The file store is looked up once; each reading is then one system call, which
-     * the JDK answers with a small object, so a worker taking readings allocates a few dozen bytes
-     * a second. That is the one exception to the worker allocating nothing.
+     * included). The file store is looked up once, and its readings are shared by every logger on
+     * the same volume, so a hundred loggers on one disk take one reading a second between them.
+     * Each reading is one system call, which the JDK answers with a small object, so the thread
+     * taking it allocates a few dozen bytes a second: the one exception to the worker allocating
+     * nothing. Like a write, the call can stall on a hung network volume.
      */
     static Probe forDirectory(Path directory) {
         return new Probe() {
-            private volatile FileStore store;
+            private volatile VolumeReading volume;
 
             @Override
             public long usableBytes() throws IOException {
-                FileStore s = store;
-                if (s == null) {
-                    s = Files.getFileStore(directory);
-                    store = s;
+                VolumeReading v = volume;
+                if (v == null) {
+                    v = VOLUMES.computeIfAbsent(Files.getFileStore(directory), VolumeReading::new);
+                    volume = v;
                 }
-                return s.getUsableSpace();
+                return v.read();
             }
         };
+    }
+
+    /**
+     * The last reading of one volume, reused while younger than the interval. A thread that finds
+     * another already refreshing it uses the last reading rather than wait, so a stalled volume
+     * stalls one thread, not every logger on it; only the very first reading is waited for.
+     */
+    private static final class VolumeReading {
+        private final FileStore store;
+        private final ReentrantLock refreshing = new ReentrantLock();
+        private volatile long bytes = -1; // -1: no reading yet
+        private volatile long atNanos;
+
+        VolumeReading(FileStore store) {
+            this.store = store;
+        }
+
+        long read() throws IOException {
+            long now = System.nanoTime();
+            long last = bytes;
+            if (last >= 0 && now - atNanos < CHECK_INTERVAL_NANOS) {
+                return last;
+            }
+            if (last >= 0) {
+                if (!refreshing.tryLock()) {
+                    return last;
+                }
+            } else {
+                refreshing.lock();
+            }
+            try {
+                last = bytes;
+                if (last >= 0 && System.nanoTime() - atNanos < CHECK_INTERVAL_NANOS) {
+                    return last; // refreshed while we waited
+                }
+                long fresh = store.getUsableSpace();
+                bytes = fresh;
+                atNanos = System.nanoTime();
+                return fresh;
+            } finally {
+                refreshing.unlock();
+            }
+        }
     }
 
     private final Probe probe;
@@ -56,6 +106,7 @@ final class DiskWatch {
     private final long resumeAbove;
     private final Warnings warnings;
     private final AtomicLong nextCheckNanos;
+    private final AtomicLong nextWakeNanos; // the drop path wakes a worker at most once per interval
     private final DropEpisode episode;
     private volatile boolean shedding;
     private volatile long lastFree; // the last reading, for the warnings
@@ -76,7 +127,10 @@ final class DiskWatch {
         this.resumeAbove = resumeAbove;
         this.warnings = warnings;
         this.nextCheckNanos = new AtomicLong(now);
-        this.episode = new DropEpisode(warnings, () -> shedCause, () -> "free disk space is back to " + human(lastFree));
+        this.nextWakeNanos = new AtomicLong(now);
+        this.episode = new DropEpisode(warnings, () -> shedCause, () -> probeFailed
+                ? "free disk space can no longer be read, so minFreeDiskSpace isn't enforced"
+                : "free disk space is back to " + human(lastFree));
         check(now);
     }
 
@@ -95,9 +149,17 @@ final class DiskWatch {
         return episode.drops();
     }
 
-    /** True if the next reading is due, so a producer that is dropping can wake a worker to take it. */
-    boolean due(long now) {
-        return now - nextCheckNanos.get() >= 0;
+    /**
+     * Producer, while dropping: true for one caller per interval once a reading is overdue. That
+     * caller wakes a worker to take it, so shedding ends even if every worker is asleep, and the
+     * other callers don't each unpark the worker (a spurious wake-up for one blocked in a handler).
+     */
+    boolean shouldWake(long now) {
+        if (now - nextCheckNanos.get() < 0) {
+            return false;
+        }
+        long wake = nextWakeNanos.get();
+        return now - wake >= 0 && nextWakeNanos.compareAndSet(wake, now + CHECK_INTERVAL_NANOS);
     }
 
     /**

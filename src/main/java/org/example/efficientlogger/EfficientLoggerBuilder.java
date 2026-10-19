@@ -83,7 +83,10 @@ public final class EfficientLoggerBuilder {
      * {@code droppedCount()}, and reported with one warning when dropping starts and one with the
      * count once it has stopped for a second. Costs the caller one CAS per message. A single
      * message larger than the burst is still accepted while the logger is under the cap; it then
-     * holds the following messages back until its share of time has passed, up to a day.
+     * holds the following messages back until its share of time has passed, up to a day. In
+     * async mode a message is charged only once the queue has taken it, so one the queue refuses
+     * costs nothing; in sync mode it is charged before it is written, so one that then fails to
+     * write (an invalid id, a full file, an I/O error) stays charged.
      *
      * @param charsPerSecond at least 1
      */

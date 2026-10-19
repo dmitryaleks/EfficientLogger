@@ -5,9 +5,12 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /** The free-space low-water mark on a fake probe and a fake clock. */
 class DiskWatchTest {
@@ -106,13 +109,44 @@ class DiskWatchTest {
     }
 
     @Test
-    void dueSaysWhenTheNextReadingMayBeTaken() {
+    void oneDroppingCallerPerIntervalWakesAWorkerOnceAReadingIsOverdue() {
         DiskWatch w = watch(0);
-        assertFalse(w.due(999 * MS));
-        assertTrue(w.due(1_000 * MS));
+        assertFalse(w.shouldWake(999 * MS), "not overdue yet");
+        assertTrue(w.shouldWake(1_000 * MS), "overdue: this caller wakes a worker");
+        assertFalse(w.shouldWake(1_000 * MS), "the next caller doesn't (review 20, C2)");
+        assertFalse(w.shouldWake(1_999 * MS));
+        assertTrue(w.shouldWake(2_000 * MS), "still nobody took the reading: one more wake");
+        w.check(2_000 * MS); // the worker takes it
+        assertFalse(w.shouldWake(2_500 * MS), "nothing is overdue");
+        assertTrue(w.shouldWake(3_000 * MS), "overdue again");
+    }
+
+    @Test
+    void anEpisodeCutShortByAProbeFailureSaysSo() {
+        DiskWatch w = watch(0);
+        free = 100 << 10;
         w.check(1_000 * MS);
-        assertFalse(w.due(1_500 * MS));
-        assertTrue(w.due(2_000 * MS));
+        w.recordDrop();
+        w.check(1_100 * MS);
+        assertEquals(1, warnings.size(), warnings::toString);
+
+        probeFails = true;
+        w.check(2_000 * MS);
+        assertFalse(w.shedding());
+        assertEquals(3, warnings.size(), warnings::toString);
+        assertEquals("can't read the free space of the log directory's volume, so minFreeDiskSpace isn't enforced | no such volume",
+                warnings.get(1));
+        assertEquals("free disk space can no longer be read, so minFreeDiskSpace isn't enforced; dropped 1 message (1 in total)",
+                warnings.get(2), "not 'back to' the reading that started the shedding (review 20, C3)");
+    }
+
+    @Test
+    void readingsOfOneVolumeAreSharedBetweenLoggers(@TempDir Path dir) throws IOException {
+        Path sub = Files.createDirectories(dir.resolve("sub"));
+        long a = DiskWatch.forDirectory(dir).usableBytes();
+        long b = DiskWatch.forDirectory(sub).usableBytes();
+        assertTrue(a > 0, "a real reading");
+        assertEquals(a, b, "the second probe, on the same volume within the interval, reuses the first's reading");
     }
 
     @Test

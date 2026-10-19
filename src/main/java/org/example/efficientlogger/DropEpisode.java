@@ -6,10 +6,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
- * Turns a run of dropped messages, all for one cause, into warnings: one when the run starts and
- * one with the count when it ends, so a cause that keeps dropping can't flood the handler. At most
- * one start is reported per {@link #REPORT_INTERVAL_NANOS}; drops during an episode that went
- * unreported are folded into the next report, so no drop goes uncounted.
+ * Turns a run of dropped messages, all for one cause, into warnings: one when the run starts, one
+ * every {@link #REPORT_INTERVAL_NANOS} while it goes on with the count so far, and one with the
+ * total when it ends, so a cause that keeps dropping can't flood the handler and yet is never
+ * silent for long. At most one warning is emitted per interval, except that an episode's end is
+ * always reported once its start was; drops during an episode that went unreported are folded
+ * into the next report, so no drop goes uncounted.
  *
  * <p>Producers only increment a counter, so dropping a message never prints or locks. A worker
  * calls {@link #check} now and then with whether the cause still holds; its fast path is two
@@ -37,6 +39,7 @@ final class DropEpisode {
     private boolean startEmitted; // this episode's start was emitted, not rate-limited away
     private boolean hasReported;  // any warning has been emitted
     private long nextReportNanos; // earliest time to emit the next one
+    private long sinceReport;     // drops already covered by this episode's start or progress reports
 
     /**
      * @param cause the start warning, built only when one is emitted
@@ -74,9 +77,11 @@ final class DropEpisode {
                 if (d != reported) { // new drops: an episode begins
                     active = true;
                     startEmitted = false;
+                    sinceReport = reported;
                     if (reportDue(now)) {
                         message = cause.get();
                         startEmitted = true;
+                        sinceReport = d;
                     }
                 }
             } else if (!over) { // the episode is over
@@ -87,9 +92,12 @@ final class DropEpisode {
                     startEmitted = false;
                 }
                 // else: stay active and unreported until a report is due, so the count isn't lost
-            } else if (!startEmitted && reportDue(now)) { // still dropping: announce the episode late
-                message = cause.get();
+            } else if (reportDue(now)) { // still dropping, an interval on: announce it late, or say how many so far
+                message = startEmitted
+                        ? cause.get() + "; still dropping: " + messages(d - sinceReport) + " since the last report (" + d + " in total)"
+                        : cause.get();
                 startEmitted = true;
+                sinceReport = d;
             }
         }
         if (message != null) {

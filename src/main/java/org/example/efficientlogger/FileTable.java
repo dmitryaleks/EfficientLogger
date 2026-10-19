@@ -340,7 +340,11 @@ final class FileTable {
                 reportIoError("can't check the size of " + f.path + "; dropping its messages for 1 s", e, now);
                 return false;
             }
-            if (size >= f.fullAtBytes) {
+            if (size >= f.fullAtBytes || size >= maxFileBytes) {
+                // Still full: not shrunk, or shrunk but not below the cap (a file left larger than
+                // the cap by a run with a bigger one). Either way no new warning; remember the
+                // smaller size so a further shrink is seen.
+                f.fullAtBytes = Math.min(f.fullAtBytes, size);
                 f.retryAtNanos = now + RETRY_NANOS;
                 return false;
             }

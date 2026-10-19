@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
 /** The output rate cap as a meter on a fake clock. */
@@ -54,6 +55,39 @@ class RateLimitTest {
         assertTrue(capped.tryAcquire(Integer.MAX_VALUE, 0), "would be 68 years at this rate; charged a day");
         assertFalse(capped.tryAcquire(1, TimeUnit.HOURS.toNanos(23)));
         assertTrue(capped.tryAcquire(1, TimeUnit.DAYS.toNanos(1) - RateLimit.BURST_NANOS));
+    }
+
+    /** Several producers against one meter: the total accepted can't exceed the rate times the time plus one burst. */
+    @Test
+    void staysExactUnderContention() throws InterruptedException {
+        long rate = 1_000_000; // chars/s
+        int len = 100;
+        RateLimit r = new RateLimit(rate, out, System.nanoTime());
+        long start = System.nanoTime();
+        long until = start + 500 * MS;
+        AtomicLong accepted = new AtomicLong();
+        Thread[] producers = new Thread[4];
+        for (int i = 0; i < producers.length; i++) {
+            producers[i] = new Thread(() -> {
+                long n = 0;
+                while (System.nanoTime() - until < 0) {
+                    if (r.tryAcquire(len, System.nanoTime())) {
+                        n++;
+                    }
+                }
+                accepted.addAndGet(n);
+            });
+            producers[i].start();
+        }
+        for (Thread p : producers) {
+            p.join();
+        }
+        long elapsed = System.nanoTime() - start;
+        long chars = accepted.get() * len;
+        long bound = (long) (rate * ((elapsed + RateLimit.BURST_NANOS) / 1e9)) + len;
+        assertTrue(chars <= bound, "accepted " + chars + " chars in " + elapsed / MS + " ms; the cap allows " + bound);
+        assertTrue(chars >= rate * (elapsed / 1e9) * 0.5,
+                "accepted only " + chars + " chars in " + elapsed / MS + " ms although the offered load was far over the cap");
     }
 
     @Test

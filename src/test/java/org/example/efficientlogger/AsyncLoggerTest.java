@@ -430,6 +430,55 @@ class AsyncLoggerTest {
         assertEquals(103 - accepted, s.droppedRateLimit());
     }
 
+    /** The caps' drop paths used to count a call after close as their own drop, not as a rejection (review 20, C1). */
+    @Test
+    void rejectionsAfterCloseWithTheCapsOnCountAsRejectedClosed() {
+        long[] free = {0};
+        freeSpace = () -> free[0];
+        AsyncLogger shedding = manual(builder().minFreeDiskSpace(1 << 20, 2 << 20));
+        assertFalse(shedding.log("a", json(1)), "shed: the volume is full");
+        shedding.close(Duration.ZERO);
+        drainAndFinish(shedding);
+        assertFalse(shedding.log("a", json(2)));
+        LoggerStats s = shedding.stats();
+        assertEquals(1, s.droppedDiskSpace(), "only the one before close");
+        assertEquals(1, s.rejectedClosed());
+        assertEquals(1, shedding.droppedCount());
+
+        freeSpace = null;
+        AsyncLogger rated = manual(builder().maxCharsPerSecond(1));
+        assertTrue(rated.log("a", "x".repeat(1000)), "accepted while calm, then charged 1000 s");
+        assertFalse(rated.log("a", json(1)));
+        rated.close(Duration.ZERO);
+        drainAndFinish(rated);
+        assertFalse(rated.log("a", json(2)));
+        s = rated.stats();
+        assertEquals(1, s.droppedRateLimit(), "only the one before close");
+        assertEquals(1, s.rejectedClosed());
+    }
+
+    /** The rate is charged once the queue has taken a message, so a message the queue refuses costs nothing (review 20, C4). */
+    @Test
+    void aMessageTheQueueRefusesIsNotChargedToTheRate() {
+        AsyncLogger logger = manual(builder().maxQueuedMessages(1).maxCharsPerSecond(20)); // a 7-char message is 0.35 s
+        Worker w = logger.worker(0);
+        assertTrue(logger.log("a", json(1))); // the output is 0.35 s ahead
+        assertFalse(logger.log("a", json(2)), "the queue holds one");
+        assertEquals(1, logger.stats().droppedQueueFull());
+        assertEquals(0, logger.stats().droppedRateLimit());
+        w.runOnce();
+        assertTrue(logger.log("a", json(3))); // 0.7 s
+        w.runOnce();
+        assertTrue(logger.log("a", json(4)), "judged at 0.7 s ahead: it would have been refused had the queue's drop been charged"); // 1.05 s
+        w.runOnce();
+        assertFalse(logger.log("a", json(5)), "1.05 s ahead: over the burst");
+        assertEquals(1, logger.stats().droppedRateLimit());
+        assertEquals(0, logger.stats().queuedMessages(), "the refused message's admission was given back");
+        logger.close(Duration.ZERO);
+        drainAndFinish(logger);
+        assertEquals(json(1) + "\n" + json(3) + "\n" + json(4) + "\n", content("a"));
+    }
+
     // ---- flush ----
 
     /**

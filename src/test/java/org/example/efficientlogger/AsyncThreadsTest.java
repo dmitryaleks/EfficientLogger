@@ -674,6 +674,39 @@ class AsyncThreadsTest {
     }
 
     /**
+     * minFreeDiskSpace on real threads. The free-space reading is taken by a worker; when every
+     * worker is asleep, a dropping caller wakes one to take it, so shedding both starts and ends on
+     * a logger with no other traffic (review 20, C2).
+     */
+    @Test
+    void sheddingStartsAndEndsOnAnOtherwiseIdleLogger() throws Exception {
+        long[] free = {10L << 20};
+        TestHooks hooks = new TestHooks();
+        hooks.freeSpace = () -> free[0];
+        AsyncLogger logger = start(builder().minFreeDiskSpace(1 << 20, 2 << 20).flushIntervalMillis(10)
+                .workerPool(WorkerPool.create(1)), hooks);
+        assertTrue(logger.log("a", json(1)));
+        assertTrue(logger.flush(WAIT));
+        Thread worker = logger.thread(0);
+        await(() -> worker.getState() == Thread.State.WAITING, "the worker to fall into deep sleep");
+
+        free[0] = 512 << 10; // the volume fills while nobody is looking
+        LockSupport.parkNanos(MILLISECONDS.toNanos(1_100)); // for the reading interval to pass, not for a result
+        assertTrue(logger.log("a", json(2)), "accepted: no reading has been taken since the volume filled");
+        await(() -> !logger.log("a", json(3)), "the woken worker to take the reading and start shedding");
+
+        free[0] = 3L << 20; // the volume recovers; only a dropping caller can get the next reading taken
+        await(() -> logger.log("a", json(4)), "a dropping caller to wake the worker, which ends the shedding");
+        assertTrue(logger.close(WAIT));
+        LoggerStats s = logger.stats();
+        assertTrue(s.droppedDiskSpace() >= 1, s::toString);
+        assertEquals(s.accepted(), s.written(), s::toString);
+        assertTrue(warnings.stream().anyMatch(w -> w.startsWith("free disk space is 512.0 KiB, below minFreeDiskSpace=1.0 MiB")),
+                warnings::toString);
+        assertTrue(warnings.stream().anyMatch(w -> w.startsWith("free disk space is back to 3.0 MiB; dropped")), warnings::toString);
+    }
+
+    /**
      * A producer cut off after being admitted but before claiming a ring slot leaves the queue
      * size above zero with nothing in any ring to drain. close() gives up after 2 s, says so, and
      * returns false. If that producer was merely stalled and resumes, its log() returns true, but

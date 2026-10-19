@@ -655,6 +655,76 @@ class FileTableTest {
     }
 
     @Test
+    void aFileLeftLargerThanTheCapStaysFullQuietlyUntilItIsBelowIt() {
+        maxFileBytes = 10;
+        sinks.preset(file("a"), "x".repeat(30)); // from a run with a bigger cap
+        FileTable t = table(8192);
+        t.append("a", "{}", 0);
+        assertEquals(1, warnings(t).size());
+
+        sinks.preset(file("a"), "x".repeat(20)); // truncated, but not below the cap
+        t.append("a", "{}", 1_000 * MS);
+        assertEquals(2, t.droppedFileFull());
+        assertEquals(0, sinks.opens, "not reopened");
+        assertTrue(warnings(t).isEmpty(), "and not warned about again (review 20, C8)");
+
+        sinks.preset(file("a"), "x".repeat(5)); // now below the cap
+        t.append("a", "{}", 2_000 * MS);
+        t.flushDirty(2_000 * MS);
+        assertEquals("xxxxx\n{}\n", sinks.content(file("a")), "reopened, its torn line finished, and written to");
+        assertEquals(1, t.written());
+        assertEquals(2, t.droppedFileFull());
+    }
+
+    @Test
+    void aFullFileWhoseSizeCantBeReadIsTreatedAsAnIoError() {
+        maxFileBytes = 10;
+        FileTable t = table(8192);
+        t.append("a", "{\"n\":12345}", 0); // 11 bytes and a separator: never fits
+        assertEquals(1, t.droppedFileFull());
+        assertEquals(1, warnings(t).size());
+
+        sinks.presetNonRegular(file("a")); // swapped for a symlink meanwhile
+        t.append("a", "{}", 1_000 * MS);
+        assertEquals(1, t.droppedFileFull(), "counted as an I/O loss instead");
+        assertEquals(1, t.lostIoError());
+        List<String> w = warnings(t);
+        assertEquals(1, w.size(), w::toString);
+        assertTrue(w.get(0).startsWith("can't check the size of " + file("a") + "; dropping its messages for 1 s | refusing to use"), w.get(0));
+    }
+
+    @Test
+    void fullFilesAreEvictedAndClosedLikeAnyEntry() {
+        maxFileBytes = 10;
+        FileTable t = table(8192, "\n", 2); // room for two entries
+        t.append("a", "{\"n\":12345}", 0); // full at once
+        t.append("b", "{}", 0);
+        t.append("c", "{}", 0); // evicts a, the least recently used
+        assertEquals(2, t.entryCount());
+        assertEquals(2, t.openCount());
+        t.append("d", "{\"n\":12345}", 0); // evicts b (writing it out); d is full at once
+        assertEquals(1, t.openCount());
+        t.closeAll(0);
+        assertEquals(0, t.openCount());
+        assertEquals(0, t.entryCount());
+        assertEquals(2, t.droppedFileFull());
+        assertEquals(2, t.written());
+        assertEquals(0, budget.open(), "every open-file slot given back");
+    }
+
+    @Test
+    void theSeparatorCountsTowardsTheCap() {
+        maxFileBytes = 8;
+        FileTable t = table(8192, "\r\n", 1024 + FileTable.EXTRA_ENTRIES);
+        t.append("a", "{}", 0); // 4 bytes
+        t.append("a", "{}", 0); // 8: fits exactly
+        t.append("a", "{}", 0); // 12: full
+        assertEquals("{}\r\n{}\r\n", sinks.content(file("a")));
+        assertEquals(1, t.droppedFileFull());
+        assertEquals(2, t.written());
+    }
+
+    @Test
     void closeAllWritesEverythingAndClosesEveryFile() {
         FileTable t = table(8192);
         t.append("a", "{\"n\":1}", 0);

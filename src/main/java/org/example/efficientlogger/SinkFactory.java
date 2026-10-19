@@ -1,7 +1,11 @@
 package org.example.efficientlogger;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 
 /** The logger's only contact with the file system, so tests can replace it. */
 interface SinkFactory {
@@ -24,6 +28,24 @@ interface SinkFactory {
      * regular file.
      */
     int lastByte(Path path) throws IOException;
+
+    /**
+     * The size of {@code path} in bytes, or 0 if it doesn't exist. Must refuse, rather than
+     * measure, anything that is not a regular file. Called when a file is opened and, for a file
+     * that has reached maxFileSizeKb, once a second while messages for it arrive.
+     */
+    default long size(Path path) throws IOException {
+        BasicFileAttributes attrs;
+        try {
+            attrs = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        } catch (NoSuchFileException e) {
+            return 0;
+        }
+        if (!attrs.isRegularFile()) {
+            throw new IOException("refusing to use " + path + ": not a regular file");
+        }
+        return attrs.size();
+    }
 
     /** Creates {@code dir} and its parents if it doesn't exist. True if it was missing. */
     boolean createDirectoryIfMissing(Path dir) throws IOException;

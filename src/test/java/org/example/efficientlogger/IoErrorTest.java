@@ -217,7 +217,7 @@ class IoErrorTest {
 
     private void start(Mode mode, Path dir, SinkFactory sinkFactory, Consumer<EfficientLoggerBuilder> options) {
         this.mode = mode;
-        EfficientLoggerBuilder b = EfficientLogger.builder(dir, "{id}.json")
+        EfficientLoggerBuilder b = EfficientLogger.builder(dir, "{id}.json", 1 << 20)
                 .warningHandler((message, cause) -> warnings.add(cause == null ? message : message + " | " + cause.getMessage()));
         if (mode == Mode.SYNC) {
             b.synchronous();

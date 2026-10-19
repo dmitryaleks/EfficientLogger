@@ -11,12 +11,14 @@ final class Warnings {
 
     static final long IO_ERROR_REPORT_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
     static final int MAX_INVALID_ID_REPORTS = 100;
+    static final int MAX_FILE_FULL_REPORTS = 100;
 
     /** A warning built while holding a lock, to be emitted after releasing it. */
     record Pending(String message, Throwable cause) {}
 
     private final WarningHandler handler;
     private final AtomicInteger invalidIdReports = new AtomicInteger();
+    private final AtomicInteger fileFullReports = new AtomicInteger();
     private final AtomicBoolean thrashReported = new AtomicBoolean();
     private final AtomicBoolean maxFilesReported = new AtomicBoolean();
     private final AtomicLong tooLongIds = new AtomicLong();
@@ -146,6 +148,15 @@ final class Warnings {
         }
         int n = invalidIdReports.incrementAndGet();
         return n <= MAX_INVALID_ID_REPORTS ? n : 0;
+    }
+
+    /** Numbers full-file reports 1 to 100; returns 0 once that many have been made. */
+    int admitFileFullReport() {
+        if (fileFullReports.get() >= MAX_FILE_FULL_REPORTS) {
+            return 0;
+        }
+        int n = fileFullReports.incrementAndGet();
+        return n <= MAX_FILE_FULL_REPORTS ? n : 0;
     }
 
     /** True the first time only. */

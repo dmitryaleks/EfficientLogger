@@ -28,10 +28,15 @@ final class Config {
     static final int DEFAULT_SYNC_STRIPES = 16;
     static final int SYNC_STRIPES_MAX = 256;
     static final int BATCH_SIZE_MAX = 256;
+    static final long MAX_FILE_SIZE_KB_MAX = Long.MAX_VALUE / 1024;
 
     // Both modes
     final Path directory; // absolute and normalized
     final FileNamePattern fileNamePattern;
+    final long maxFileBytes; // a file never grows past this; maxFileSizeKb * 1024
+    final long minFreeDiskBytes; // shed messages while the volume has less free; 0 means off
+    final long resumeFreeDiskBytes; // ...until it has at least this much again
+    final long maxCharsPerSecond; // the output rate cap; 0 means off
     final int maxIdLength; // log() rejects longer IDs at once: they can't fit in a file name
     final int maxIdLengthBeforeNormalizing; // with normalizeIds: longer ones can't normalize to fit, so skip the copy
     final boolean synchronous;
@@ -77,6 +82,10 @@ final class Config {
         }
         directory = b.directory.toAbsolutePath().normalize();
         fileNamePattern = FileNamePattern.parse(directory, b.fileNamePattern);
+        maxFileBytes = b.maxFileSizeKb * 1024;
+        minFreeDiskBytes = b.minFreeDiskBytes != null ? b.minFreeDiskBytes : 0;
+        resumeFreeDiskBytes = b.resumeFreeDiskBytes != null ? b.resumeFreeDiskBytes : 0;
+        maxCharsPerSecond = b.maxCharsPerSecond != null ? b.maxCharsPerSecond : 0;
         maxIdLength = fileNamePattern.maxIdLength();
         maxIdLengthBeforeNormalizing = maxIdLength * FileNamePattern.MAX_NORMALIZATION_SHRINK;
         synchronous = b.synchronous;

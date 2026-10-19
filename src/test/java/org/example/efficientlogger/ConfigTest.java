@@ -32,7 +32,39 @@ class ConfigTest {
     Path dir;
 
     private EfficientLoggerBuilder builder() {
-        return new EfficientLoggerBuilder(dir, "events-{id}.json");
+        return new EfficientLoggerBuilder(dir, "events-{id}.json", 1 << 20);
+    }
+
+    @Test
+    void maxFileSizeKbIsMandatoryAndChecked() {
+        assertThrows(IllegalArgumentException.class, () -> new EfficientLoggerBuilder(dir, "{id}.json", 0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new EfficientLoggerBuilder(dir, "{id}.json", Config.MAX_FILE_SIZE_KB_MAX + 1));
+        assertEquals(100 * 1024L, new EfficientLoggerBuilder(dir, "{id}.json", 100).buildConfig().maxFileBytes);
+        assertEquals(Config.MAX_FILE_SIZE_KB_MAX * 1024,
+                new EfficientLoggerBuilder(dir, "{id}.json", Config.MAX_FILE_SIZE_KB_MAX).buildConfig().maxFileBytes);
+    }
+
+    @Test
+    void diskSpaceAndRateCapsAreOffByDefaultAndChecked() {
+        Config c = builder().buildConfig();
+        assertEquals(0, c.minFreeDiskBytes);
+        assertEquals(0, c.resumeFreeDiskBytes);
+        assertEquals(0, c.maxCharsPerSecond);
+
+        c = builder().minFreeDiskSpace(1 << 20, 4 << 20).maxCharsPerSecond(5000).buildConfig();
+        assertEquals(1 << 20, c.minFreeDiskBytes);
+        assertEquals(4 << 20, c.resumeFreeDiskBytes);
+        assertEquals(5000, c.maxCharsPerSecond);
+        assertEquals(10, builder().minFreeDiskSpace(10, 10).buildConfig().resumeFreeDiskBytes, "no hysteresis is allowed");
+
+        assertThrows(IllegalArgumentException.class, () -> builder().minFreeDiskSpace(0, 10));
+        assertThrows(IllegalArgumentException.class, () -> builder().minFreeDiskSpace(10, 9));
+        assertThrows(IllegalArgumentException.class, () -> builder().maxCharsPerSecond(0));
+
+        c = builder().synchronous().minFreeDiskSpace(1, 1).maxCharsPerSecond(1).buildConfig();
+        assertEquals(1, c.minFreeDiskBytes, "both modes take them");
+        assertEquals(1, c.maxCharsPerSecond);
     }
 
     @Test
@@ -238,8 +270,8 @@ class ConfigTest {
 
     @Test
     void nullArgumentsAreRejected() {
-        assertThrows(NullPointerException.class, () -> new EfficientLoggerBuilder(null, "{id}"));
-        assertThrows(NullPointerException.class, () -> new EfficientLoggerBuilder(dir, null));
+        assertThrows(NullPointerException.class, () -> new EfficientLoggerBuilder(null, "{id}", 1 << 20));
+        assertThrows(NullPointerException.class, () -> new EfficientLoggerBuilder(dir, null, 1 << 20));
         assertThrows(NullPointerException.class, () -> builder().closeTimeout(null));
         assertThrows(NullPointerException.class, () -> builder().workerPool(null));
         assertThrows(NullPointerException.class, () -> builder().warningHandler(null));
@@ -262,13 +294,13 @@ class ConfigTest {
     void invalidPatternFailsTheBuild() {
         IllegalArgumentException e = assertThrows(
                 IllegalArgumentException.class,
-                () -> new EfficientLoggerBuilder(dir, "sub/{id}.json").buildConfig());
+                () -> new EfficientLoggerBuilder(dir, "sub/{id}.json", 1 << 20).buildConfig());
         assertTrue(e.getMessage().contains("contains '/'"), e.getMessage());
     }
 
     @Test
     void directoryIsMadeAbsoluteAndNormalized() {
-        Config c = new EfficientLoggerBuilder(Paths.get("logs", "..", "out"), "{id}").buildConfig();
+        Config c = new EfficientLoggerBuilder(Paths.get("logs", "..", "out"), "{id}", 1 << 20).buildConfig();
         assertEquals(Paths.get("out").toAbsolutePath(), c.directory);
     }
 
@@ -277,7 +309,7 @@ class ConfigTest {
         try (FileSystem zip = FileSystems.newFileSystem(dir.resolve("logs.zip"), Map.of("create", "true"))) {
             IllegalArgumentException e = assertThrows(
                     IllegalArgumentException.class,
-                    () -> new EfficientLoggerBuilder(zip.getPath("/logs"), "{id}").buildConfig());
+                    () -> new EfficientLoggerBuilder(zip.getPath("/logs"), "{id}", 1 << 20).buildConfig());
             assertTrue(e.getMessage().contains("default file system"), e.getMessage());
         }
     }

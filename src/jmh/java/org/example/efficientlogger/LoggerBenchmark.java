@@ -228,7 +228,7 @@ public class LoggerBenchmark {
         if (nullDevice) {
             hooks.sinks = new NullDeviceSinks();
         }
-        EfficientLoggerBuilder b = EfficientLogger.builder(dir, "{id}.json")
+        EfficientLoggerBuilder b = EfficientLogger.builder(dir, "{id}.json", 1 << 20)
                 .warningHandler((message, cause) -> {}); // drops are counted by Outcome instead
         if (synchronous) {
             b.synchronous();

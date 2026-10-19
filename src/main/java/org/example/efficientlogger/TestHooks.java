@@ -8,6 +8,8 @@ final class TestHooks {
 
     SinkFactory sinks = FileOutputStreamSink.FACTORY;
     LongSupplier nanoClock = System::nanoTime;
+    /** How minFreeDiskSpace reads the free space; null means the log directory's file store. */
+    DiskWatch.Probe freeSpace = null;
 
     /**
      * The key of the hash that picks each ID's worker or stripe (see {@link Hashing#bucket}).

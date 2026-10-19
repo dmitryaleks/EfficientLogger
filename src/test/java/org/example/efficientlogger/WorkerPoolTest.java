@@ -339,7 +339,7 @@ class WorkerPoolTest {
     // ---- helpers ----
 
     private EfficientLoggerBuilder builder(String sub) {
-        return EfficientLogger.builder(dir.resolve(sub), "{id}.json")
+        return EfficientLogger.builder(dir.resolve(sub), "{id}.json", 1 << 20)
                 .warningHandler((message, cause) -> warnings.add(cause == null ? message : message + " | " + cause));
     }
 

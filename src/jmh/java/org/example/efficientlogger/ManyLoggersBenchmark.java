@@ -62,7 +62,7 @@ public final class ManyLoggersBenchmark {
         String[] ids = new String[loggers];
         for (int i = 0; i < loggers; i++) {
             ids[i] = String.format(Locale.ROOT, "%03d", i);
-            all[i] = EfficientLogger.builder(dir, "logger-{id}.json").warningHandler(onWarning).build();
+            all[i] = EfficientLogger.builder(dir, "logger-{id}.json", 1 << 20).warningHandler(onWarning).build();
         }
         out.printf(Locale.ROOT, "built; the shared pool runs %d thread(s)%n", WorkerPool.shared().threads());
 

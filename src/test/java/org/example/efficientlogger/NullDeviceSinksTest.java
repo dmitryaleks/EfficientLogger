@@ -46,7 +46,7 @@ class NullDeviceSinksTest {
         List<String> warnings = Collections.synchronizedList(new ArrayList<>());
         TestHooks hooks = new TestHooks();
         hooks.sinks = new NullDeviceSinks();
-        EfficientLoggerBuilder b = EfficientLogger.builder(dir, "{id}.json")
+        EfficientLoggerBuilder b = EfficientLogger.builder(dir, "{id}.json", 1 << 20)
                 .warningHandler((message, cause) -> warnings.add(cause == null ? message : message + " | " + cause));
         if (synchronous) {
             b.synchronous();

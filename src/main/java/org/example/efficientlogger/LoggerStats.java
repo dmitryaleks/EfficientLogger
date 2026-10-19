@@ -2,8 +2,8 @@ package org.example.efficientlogger;
 
 /**
  * A snapshot of a logger's counters, in messages unless noted. Once a logger is closed,
- * {@code accepted == written + droppedInvalidId + lostIoError + abandoned}, and {@code abandoned}
- * is 0 unless {@code close} gave up (see {@link EfficientLogger#close(java.time.Duration)}).
+ * {@code accepted == written + droppedInvalidId + droppedFileFull + lostIoError + abandoned}, and
+ * {@code abandoned} is 0 unless {@code close} gave up (see {@link EfficientLogger#close(java.time.Duration)}).
  *
  * @param accepted taken for writing: queued in async mode, attempted in sync mode, and in both
  *     modes those rejected at once because the id was too long for a file name
@@ -12,6 +12,12 @@ package org.example.efficientlogger;
  * @param droppedTooLarge dropped because the message alone was longer than maxQueuedChars
  * @param droppedInvalidId dropped because the id can't be used in a file name, including ids
  *     too long for one, which {@code log} rejects at once
+ * @param droppedFileFull dropped because writing the message would take its file past
+ *     maxFileSizeKb (the file is tried again once a second, in case it has been truncated)
+ * @param droppedDiskSpace dropped because the log volume's free space was below
+ *     minFreeDiskSpace; always 0 unless that option is set
+ * @param droppedRateLimit dropped because the logger was over maxCharsPerSecond; always 0
+ *     unless that option is set
  * @param lostIoError lost to I/O errors, including messages dropped while a failed file waits
  *     to be retried (and, should one ever happen, to unexpected internal errors)
  * @param abandoned queued but never written, because {@code close} gave up on a queue that had
@@ -31,6 +37,9 @@ public record LoggerStats(
         long droppedQueueFull,
         long droppedTooLarge,
         long droppedInvalidId,
+        long droppedFileFull,
+        long droppedDiskSpace,
+        long droppedRateLimit,
         long lostIoError,
         long abandoned,
         long rejectedClosed,

@@ -80,7 +80,7 @@ class AsyncThreadsTest {
     @Test
     void buildIsAsynchronousByDefault() throws Exception {
         Thread worker;
-        try (EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json").build()) { // on the shared pool
+        try (EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json", 1 << 20).build()) { // on the shared pool
             assertTrue(logger instanceof AsyncLogger);
             assertTrue(logger.log("a", json(1)));
             assertTrue(logger.log("b", json(2)));
@@ -962,7 +962,7 @@ class AsyncThreadsTest {
     // ---- helpers ----
 
     private EfficientLoggerBuilder builder() {
-        return EfficientLogger.builder(dir, "{id}.json")
+        return EfficientLogger.builder(dir, "{id}.json", 1 << 20)
                 .workerPool(pool)
                 .warningHandler((message, cause) -> warnings.add(cause == null ? message : message + " | " + cause));
     }

@@ -6,6 +6,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
 /**
  * Asynchronous mode: {@code log} admits the message against the queue limits and puts it in the
@@ -25,6 +26,9 @@ final class AsyncLogger implements EfficientLogger {
     private final boolean registerShutdownHook;
     private final Admission admission;
     private final OverflowTracker tracker;
+    private final DiskWatch disk; // null unless minFreeDiskSpace is set
+    private final RateLimit rate; // null unless maxCharsPerSecond is set
+    private final LongSupplier clock;
     private final Warnings warnings;
     private final OpenFileBudget budget;
     private final long maxChars;
@@ -44,6 +48,13 @@ final class AsyncLogger implements EfficientLogger {
         FileCreationBudget fileBudget = new FileCreationBudget(config.maxFiles);
         admission = new Admission(config.maxQueuedMessages, config.maxQueuedChars);
         tracker = new OverflowTracker(admission, config, warnings);
+        clock = hooks.nanoClock;
+        long now = clock.getAsLong();
+        disk = config.minFreeDiskBytes > 0
+                ? new DiskWatch(hooks.freeSpace != null ? hooks.freeSpace : DiskWatch.forDirectory(config.directory),
+                        config.minFreeDiskBytes, config.resumeFreeDiskBytes, warnings, now)
+                : null;
+        rate = config.maxCharsPerSecond > 0 ? new RateLimit(config.maxCharsPerSecond, warnings, now) : null;
         maxChars = config.maxQueuedChars;
         maxIdLength = config.maxIdLength;
         maxIdLengthBeforeNormalizing = config.maxIdLengthBeforeNormalizing;
@@ -67,8 +78,8 @@ final class AsyncLogger implements EfficientLogger {
         for (int i = 0; i < n; i++) {
             rings[i] = new MpscRing(config.ringCapacity, startIndex, config.wakeCount, config.wakeChars);
             FileTable files = new FileTable(config.fileNamePattern, config.lineSeparator, config.fileBufferBytes,
-                    config.maxFileEntries, hooks.sinks, budget, fileBudget, warnings);
-            workers[i] = new Worker(rings[i], files, admission, tracker, warnings, hooks.nanoClock, batchSize,
+                    config.maxFileEntries, config.maxFileBytes, hooks.sinks, budget, fileBudget, warnings);
+            workers[i] = new Worker(rings[i], files, admission, tracker, disk, rate, warnings, hooks.nanoClock, batchSize,
                     config.flushIntervalNanos, config.eagerWakeup, hooks.beforeBatch);
             workers[i].onTerminated(this::workerFinished);
         }
@@ -133,6 +144,20 @@ final class AsyncLogger implements EfficientLogger {
             }
             return false;
         }
+        if (disk != null && disk.shedding()) {
+            disk.recordDrop();
+            if (disk.due(clock.getAsLong())) {
+                rings[0].wakeConsumer(); // a worker takes the next reading, so shedding ends even if they are all asleep
+            }
+            return false;
+        }
+        if (rate != null) {
+            long now = clock.getAsLong();
+            if (!rate.tryAcquire(len, now)) {
+                rate.recordDrop(now);
+                return false;
+            }
+        }
         MpscRing ring = rings[Hashing.bucket(id, shardKey, rings.length)];
         long admitted = admission.tryAcquire(len);
         if (admitted <= 0) {
@@ -192,7 +217,7 @@ final class AsyncLogger implements EfficientLogger {
 
     @Override
     public long droppedCount() {
-        return tracker.drops() + warnings.oversizeMessages();
+        return tracker.drops() + warnings.oversizeMessages() + (disk != null ? disk.drops() : 0) + (rate != null ? rate.drops() : 0);
     }
 
     @Override
@@ -211,16 +236,19 @@ final class AsyncLogger implements EfficientLogger {
         }
         long written = 0;
         long invalidId = tooLongIds;
+        long fileFull = 0;
         long lostIoError = 0;
         for (Worker w : workers) {
             written += w.files.written();
             invalidId += w.files.droppedInvalidId();
+            fileFull += w.files.droppedFileFull();
             lostIoError += w.files.lostIoError();
         }
         long oversize = warnings.oversizeMessages();
         long queueFull = tracker.drops();
         long word = admission.get();
-        return new LoggerStats(accepted, written, queueFull, oversize, invalidId, lostIoError, abandoned,
+        return new LoggerStats(accepted, written, queueFull, oversize, invalidId, fileFull,
+                disk != null ? disk.drops() : 0, rate != null ? rate.drops() : 0, lostIoError, abandoned,
                 rejectedClosed.get(), Admission.messages(word), Admission.chars(word), budget.open());
     }
 

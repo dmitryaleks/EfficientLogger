@@ -53,6 +53,8 @@ final class Worker implements MpscRing.Handler {
     final FileTable files;
     private final Admission admission;
     private final OverflowTracker tracker;
+    private final DiskWatch disk; // null unless minFreeDiskSpace is set
+    private final RateLimit rate; // null unless maxCharsPerSecond is set
     private final Warnings warnings;
     private final LongSupplier clock;
     private final int batchSize;
@@ -79,12 +81,14 @@ final class Worker implements MpscRing.Handler {
     private volatile Thread thread; // the pool thread serving this worker; null when tests run it by hand
     private Runnable onTerminated; // set by the logger before the worker runs
 
-    Worker(MpscRing ring, FileTable files, Admission admission, OverflowTracker tracker, Warnings warnings,
-            LongSupplier clock, int batchSize, long flushIntervalNanos, boolean eager, Runnable beforeBatch) {
+    Worker(MpscRing ring, FileTable files, Admission admission, OverflowTracker tracker, DiskWatch disk, RateLimit rate,
+            Warnings warnings, LongSupplier clock, int batchSize, long flushIntervalNanos, boolean eager, Runnable beforeBatch) {
         this.ring = ring;
         this.files = files;
         this.admission = admission;
         this.tracker = tracker;
+        this.disk = disk;
+        this.rate = rate;
         this.warnings = warnings;
         this.clock = clock;
         this.batchSize = batchSize;
@@ -167,7 +171,18 @@ final class Worker implements MpscRing.Handler {
         long now = clock.getAsLong();
         files.flushDirty(now);
         warnings.emitAll(files.takeWarnings());
+        checkLimits(now);
+    }
+
+    /** Reports what the queue, the disk and the rate cap have dropped since last time; takes a free-space reading if one is due. */
+    private void checkLimits(long now) {
         tracker.check(now);
+        if (disk != null) {
+            disk.check(now);
+        }
+        if (rate != null) {
+            rate.check(now);
+        }
     }
 
     /**
@@ -262,7 +277,7 @@ final class Worker implements MpscRing.Handler {
         if (files.dirtyCount() != 0 && now - files.firstDirtyNanos() >= flushIntervalNanos) {
             files.flushDirty(now);
         }
-        tracker.check(now);
+        checkLimits(now);
         warnings.reportTooLongIds();
         warnings.reportOversizeMessages();
         warnings.emitAll(files.takeWarnings());
@@ -274,6 +289,12 @@ final class Worker implements MpscRing.Handler {
         try {
             files.closeAll(clock.getAsLong());
             tracker.finalReport();
+            if (disk != null) {
+                disk.finalReport();
+            }
+            if (rate != null) {
+                rate.finalReport();
+            }
             warnings.reportTooLongIds();
             warnings.reportOversizeMessages();
             warnings.emitAll(files.takeWarnings());

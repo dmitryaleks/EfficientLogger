@@ -39,11 +39,13 @@ final class FileTable {
     private static final int LOST_IO_ERROR = 1;
     private static final int DROPPED_INVALID_ID = 2;
     private static final int BUFFERED = 3; // records in file buffers, not yet handed to the OS
+    private static final int FILE_FULL = 4; // records dropped because their file was at maxFileSizeKb
 
     private final FileNamePattern pattern;
     private final byte[] separator;
     private final int bufferBytes;
     private final int maxEntries;
+    private final long maxFileBytes;
     private final SinkFactory sinks;
     private final OpenFileBudget budget;
     private final FileCreationBudget fileBudget;
@@ -64,15 +66,17 @@ final class FileTable {
     private byte[] scratch; // write-through mode
 
     // Written by the owner with opaque stores, so other threads can read them without tearing.
-    private final long[] counters = new long[4];
+    private final long[] counters = new long[5];
     private List<Warnings.Pending> pendingWarnings;
 
-    FileTable(FileNamePattern pattern, byte[] separator, int bufferBytes, int maxEntries,
+    /** @param maxFileBytes a file never grows past this: records that would take it past are dropped */
+    FileTable(FileNamePattern pattern, byte[] separator, int bufferBytes, int maxEntries, long maxFileBytes,
             SinkFactory sinks, OpenFileBudget budget, FileCreationBudget fileBudget, Warnings warnings) {
         this.pattern = pattern;
         this.separator = separator;
         this.bufferBytes = bufferBytes;
         this.maxEntries = maxEntries;
+        this.maxFileBytes = maxFileBytes;
         this.sinks = sinks;
         this.budget = budget;
         this.fileBudget = fileBudget;
@@ -82,7 +86,11 @@ final class FileTable {
 
     // ---- buffered mode (async workers) ----
 
-    /** Adds a record to its file's buffer, writing the buffer out first if the record doesn't fit. */
+    /**
+     * Adds a record to its file's buffer, writing the buffer out first if the record doesn't fit.
+     * A record that would take the file past {@code maxFileBytes} is dropped instead, and the file
+     * is closed as full (see {@link #fileFull}).
+     */
     void append(String id, String json, long now) {
         FileState f = id == lastId ? lastFile : lookup(id, now);
         touch(f, now);
@@ -102,7 +110,14 @@ final class FileTable {
             r = Utf8.encode(json, 0, b, start, limit);
             fits = Utf8.nextChar(r) == json.length();
         }
-        if (!fits) {
+        if (fits) {
+            // The buffer's earlier records plus this one is what the file grows by.
+            if (f.bytesOnDisk + Utf8.endPos(r) + separator.length > maxFileBytes) {
+                f.pos = start; // forget the encoded bytes
+                fileFull(f, now);
+                return;
+            }
+        } else {
             // Write out the complete records before it, then encode it from offset 0.
             f.pos = start;
             if (start > 0 && !writeOut(f, now)) {
@@ -110,20 +125,44 @@ final class FileTable {
                 return;
             }
             r = Utf8.encode(json, 0, b, 0, limit);
-            while (Utf8.nextChar(r) != json.length()) {
+            boolean whole = Utf8.nextChar(r) == json.length();
+            long bytes = whole ? Utf8.endPos(r) : encodedBytes(json, b, limit);
+            if (f.bytesOnDisk + bytes + separator.length > maxFileBytes) {
+                fileFull(f, now);
+                return;
+            }
+            if (!whole) {
                 // Larger than the whole buffer: the one case where a record is split across writes.
-                f.pos = Utf8.endPos(r);
-                if (!writeOut(f, now)) {
-                    add(LOST_IO_ERROR, 1);
-                    return;
+                r = Utf8.encode(json, 0, b, 0, limit);
+                while (Utf8.nextChar(r) != json.length()) {
+                    f.pos = Utf8.endPos(r);
+                    if (!writeOut(f, now)) {
+                        add(LOST_IO_ERROR, 1);
+                        return;
+                    }
+                    r = Utf8.encode(json, Utf8.nextChar(r), b, 0, limit);
                 }
-                r = Utf8.encode(json, Utf8.nextChar(r), b, 0, limit);
             }
         }
         f.pos = putSeparator(b, Utf8.endPos(r));
         f.pendingRecords++;
         add(BUFFERED, 1);
         markDirty(f, now);
+    }
+
+    /**
+     * The encoded size of a record too large for the buffer, found by encoding it piecewise into
+     * {@code b} (which must hold nothing) and discarding the pieces. Only such records pay for
+     * encoding twice; a record that fits is measured by the encoding that is then written.
+     */
+    private long encodedBytes(String json, byte[] b, int limit) {
+        long r = Utf8.encode(json, 0, b, 0, limit);
+        long total = Utf8.endPos(r);
+        while (Utf8.nextChar(r) != json.length()) {
+            r = Utf8.encode(json, Utf8.nextChar(r), b, 0, limit);
+            total += Utf8.endPos(r);
+        }
+        return total;
     }
 
     /** Hands every buffered record to the OS. */
@@ -162,6 +201,15 @@ final class FileTable {
         }
         int limit = b.length - separator.length;
         long r = Utf8.encode(json, 0, b, 0, limit);
+        boolean whole = Utf8.nextChar(r) == json.length();
+        long bytes = whole ? Utf8.endPos(r) : encodedBytes(json, b, limit);
+        if (f.bytesOnDisk + bytes + separator.length > maxFileBytes) {
+            fileFull(f, now);
+            return false;
+        }
+        if (!whole) {
+            r = Utf8.encode(json, 0, b, 0, limit); // measured above; now write it in pieces
+        }
         while (Utf8.nextChar(r) != json.length()) {
             if (!writeRaw(f, b, Utf8.endPos(r), now)) {
                 add(LOST_IO_ERROR, 1);
@@ -224,6 +272,11 @@ final class FileTable {
         return (long) LONGS.getOpaque(counters, BUFFERED);
     }
 
+    /** Records dropped because their file was at maxFileSizeKb. */
+    long droppedFileFull() {
+        return (long) LONGS.getOpaque(counters, FILE_FULL);
+    }
+
     /** Records dropped because their ID can't be a file name. */
     long droppedInvalidId() {
         return (long) LONGS.getOpaque(counters, DROPPED_INVALID_ID);
@@ -272,8 +325,25 @@ final class FileTable {
     }
 
     private boolean reopenIfDue(FileState f, long now) {
-        if (f.state != FileState.FAILED || now - f.retryAtNanos < 0) {
+        if ((f.state != FileState.FAILED && f.state != FileState.FULL) || now - f.retryAtNanos < 0) {
             return false;
+        }
+        if (f.state == FileState.FULL) {
+            // Worth reopening only if something has made the file smaller (truncated or rotated
+            // it); otherwise it is still full, and so is any record that would fit in the gap.
+            long size;
+            try {
+                size = sinks.size(f.path);
+            } catch (IOException | RuntimeException e) {
+                f.state = FileState.FAILED;
+                f.retryAtNanos = now + RETRY_NANOS;
+                reportIoError("can't check the size of " + f.path + "; dropping its messages for 1 s", e, now);
+                return false;
+            }
+            if (size >= f.fullAtBytes) {
+                f.retryAtNanos = now + RETRY_NANOS;
+                return false;
+            }
         }
         open(f, now);
         return f.state == FileState.OPEN;
@@ -302,12 +372,21 @@ final class FileTable {
                 }
                 reserved = true;
             }
+            long size = last >= 0 ? sinks.size(f.path) : 0;
+            if (size >= maxFileBytes) {
+                // Already at the cap, e.g. from an earlier run: nothing more fits, so don't open it.
+                budget.release();
+                markFull(f, size, now);
+                return;
+            }
             sink = openSink(f.path, now);
             if (last >= 0 && last != '\n') {
                 // The file ends mid-line, e.g. after a crash: finish that line so ours starts clean.
                 sink.write(separator, 0, separator.length);
+                size += separator.length;
             }
             f.sink = sink;
+            f.bytesOnDisk = size;
             f.state = FileState.OPEN;
             openCount++;
         } catch (IOException | RuntimeException e) { // see writeRaw
@@ -410,6 +489,7 @@ final class FileTable {
     private boolean writeRaw(FileState f, byte[] b, int len, long now) {
         try {
             f.sink.write(b, 0, len);
+            f.bytesOnDisk += len;
             return true;
         } catch (IOException | RuntimeException e) {
             // A sink that throws unchecked is broken just the same. Failing the file keeps one bad
@@ -470,8 +550,42 @@ final class FileTable {
     }
 
     private void dropFor(FileState f) {
+        if (f.state == FileState.FULL) {
+            add(FILE_FULL, 1);
+            return;
+        }
         boolean noFile = f.state == FileState.INVALID || f.state == FileState.CAPPED;
         add(noFile ? DROPPED_INVALID_ID : LOST_IO_ERROR, 1);
+    }
+
+    /**
+     * The record just offered would take f past maxFileBytes: count it as dropped, write out what
+     * the buffer holds (which fits), close the file and mark it FULL. It is reopened only once it
+     * has shrunk (see {@link #reopenIfDue}), which is checked at most once a second.
+     */
+    private void fileFull(FileState f, long now) {
+        add(FILE_FULL, 1);
+        flushFile(f, now);
+        if (f.state != FileState.OPEN) {
+            return; // the write failed: fail() has closed the file and will retry it
+        }
+        Exception e = closeSink(f);
+        if (e != null) {
+            reportIoError("can't close " + f.path, e, now);
+        }
+        markFull(f, f.bytesOnDisk, now);
+    }
+
+    private void markFull(FileState f, long size, long now) {
+        f.state = FileState.FULL;
+        f.fullAtBytes = size;
+        f.retryAtNanos = now + RETRY_NANOS;
+        int n = warnings.admitFileFullReport();
+        if (n != 0) {
+            warn("file " + f.path + " is at maxFileSizeKb (" + size + " bytes); dropping its messages (counted in"
+                    + " stats().droppedFileFull()) until something truncates it, checked once a second"
+                    + (n == Warnings.MAX_FILE_FULL_REPORTS ? " (further full files won't be reported)" : ""), null);
+        }
     }
 
     private void add(int counter, long n) {

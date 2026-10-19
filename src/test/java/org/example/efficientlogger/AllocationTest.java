@@ -76,7 +76,7 @@ class AllocationTest {
 
     @Test
     void asyncLogAllocatesNothingOnTheCallerOrTheWorker() {
-        try (EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json")
+        try (EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json", 1 << 20)
                 .maxQueuedMessages(1 << 20) // room for a whole round, so nothing is dropped
                 .maxQueuedChars(1L << 30)
                 .workerPool(WorkerPool.create(1)) // a thread of its own, so what it allocates is this logger's
@@ -96,7 +96,7 @@ class AllocationTest {
         CountDownLatch release = new CountDownLatch(1);
         TestHooks hooks = new TestHooks();
         hooks.beforeBatch = () -> awaitUninterruptibly(release); // the worker takes nothing, so the queue stays full
-        EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json")
+        EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json", 1 << 20)
                 .maxQueuedMessages(1024)
                 .warningHandler((message, cause) -> {})
                 .build(hooks);
@@ -110,9 +110,53 @@ class AllocationTest {
         }
     }
 
+    /** The rate cap is a CAS and the disk mark a volatile read on the accepted path, so nothing changes for the caller. */
+    @Test
+    void asyncLogAllocatesNothingWithTheRateCapAndDiskMarkOn() {
+        try (EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json", 1 << 20)
+                .maxQueuedMessages(1 << 20)
+                .maxQueuedChars(1L << 30)
+                .maxCharsPerSecond(1L << 50) // never reached
+                .minFreeDiskSpace(1, 1) // never below: the volume has more than a byte free
+                .workerPool(WorkerPool.create(1))
+                .build()) {
+            // The worker isn't measured here: its once-a-second free-space reading allocates a few bytes by design.
+            List<Round> rounds = measure(logger, CALLS, CALLS, null, true);
+            assertWithin(CALLER_ALLOWANCE, rounds, false, CALLS, "log() with the rate cap and disk mark on");
+            assertEquals(0, logger.droppedCount());
+        }
+    }
+
+    @Test
+    void asyncLogAllocatesNothingWhenSheddingForDiskSpace() {
+        TestHooks hooks = new TestHooks();
+        hooks.freeSpace = () -> 0; // a full volume
+        try (EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json", 1 << 20)
+                .minFreeDiskSpace(1 << 20, 2 << 20)
+                .warningHandler((message, cause) -> {})
+                .build(hooks)) {
+            List<Round> rounds = measure(logger, CALLS, 0, null, false);
+            assertWithin(CALLER_ALLOWANCE, rounds, false, CALLS, "log() shedding for disk space");
+            assertEquals((long) (WARMUP_ROUNDS + MEASURED_ROUNDS) * CALLS, logger.stats().droppedDiskSpace());
+        }
+    }
+
+    @Test
+    void asyncLogAllocatesNothingWhenOverTheRateCap() {
+        try (EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json", 1 << 20)
+                .maxCharsPerSecond(1)
+                .warningHandler((message, cause) -> {})
+                .build()) {
+            assertTrue(logger.log("a", "x".repeat(100_000)), "accepted while calm; at a char a second it is charged a day");
+            List<Round> rounds = measure(logger, CALLS, 0, null, false);
+            assertWithin(CALLER_ALLOWANCE, rounds, false, CALLS, "log() over the rate cap");
+            assertEquals((long) (WARMUP_ROUNDS + MEASURED_ROUNDS) * CALLS, logger.stats().droppedRateLimit());
+        }
+    }
+
     @Test
     void logAfterCloseAllocatesNothing() {
-        EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json").build();
+        EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json", 1 << 20).build();
         assertTrue(logger.close(Duration.ofSeconds(10)));
         List<Round> rounds = measure(logger, CALLS, 0, null, false);
         assertWithin(CALLER_ALLOWANCE, rounds, false, CALLS, "log() after close");
@@ -122,7 +166,7 @@ class AllocationTest {
     @Test
     void syncLogAllocatesNothing() {
         int calls = 100_000;
-        try (EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json").synchronous().build()) {
+        try (EfficientLogger logger = EfficientLogger.builder(dir, "{id}.json", 1 << 20).synchronous().build()) {
             List<Round> rounds = measure(logger, calls, calls, null, false);
             assertWithin(CALLER_ALLOWANCE, rounds, false, calls, "log() in sync mode");
         }

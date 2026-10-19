@@ -25,6 +25,7 @@ class FileTableTest {
     private FakeSinks sinks = new FakeSinks(DIR);
     private OpenFileBudget budget = new OpenFileBudget(1024);
     private FileCreationBudget fileBudget = new FileCreationBudget(FileCreationBudget.UNLIMITED);
+    private long maxFileBytes = Long.MAX_VALUE;
 
     private FileTable table(int bufferBytes) {
         return table(bufferBytes, "\n", 1024 + FileTable.EXTRA_ENTRIES);
@@ -32,7 +33,7 @@ class FileTableTest {
 
     private FileTable table(int bufferBytes, String separator, int maxEntries) {
         return new FileTable(FileNamePattern.parse(DIR, "{id}.json"), separator.getBytes(US_ASCII),
-                bufferBytes, maxEntries, sinks, budget, fileBudget, warnings);
+                bufferBytes, maxEntries, maxFileBytes, sinks, budget, fileBudget, warnings);
     }
 
     /** Emits the table's queued warnings and returns everything emitted since the last call. */
@@ -581,6 +582,77 @@ class FileTableTest {
     }
 
     // ---- closing ----
+
+    // ---- maxFileSizeKb ----
+
+    @Test
+    void stopsWritingAFileAtItsCapAndDropsTheRestUntilItIsTruncated() {
+        maxFileBytes = 20; // two 8-byte records fit, a third wouldn't
+        FileTable t = table(8192);
+        t.append("a", "{\"n\":1}", 0);
+        t.append("a", "{\"n\":2}", 0);
+        t.append("a", "{\"n\":3}", 0); // would make 24 bytes
+        assertEquals("{\"n\":1}\n{\"n\":2}\n", sinks.content(file("a")), "what fits is written out when the file fills");
+        assertEquals(2, t.written());
+        assertEquals(1, t.droppedFileFull());
+        assertEquals(0, t.openCount(), "the full file is closed");
+        assertEquals(0, t.dirtyCount());
+        assertEquals(List.of("file " + file("a") + " is at maxFileSizeKb (16 bytes); dropping its messages (counted in"
+                + " stats().droppedFileFull()) until something truncates it, checked once a second"), warnings(t));
+
+        t.append("a", "{\"n\":4}", 500 * MS); // within the second: dropped without looking at the file
+        assertEquals(2, t.droppedFileFull());
+        t.append("a", "{\"n\":5}", 1_000 * MS); // a second later: still 16 bytes, so still full, and no second warning
+        assertEquals(3, t.droppedFileFull());
+        assertEquals(0, t.openCount());
+        assertTrue(warnings(t).isEmpty());
+
+        sinks.truncate(file("a")); // logrotate's copytruncate
+        t.append("a", "{\"n\":6}", 1_500 * MS); // not checked yet
+        assertEquals(4, t.droppedFileFull());
+        t.append("a", "{\"n\":7}", 2_000 * MS); // checked: the file has shrunk, so it is reopened and written to
+        t.flushDirty(2_000 * MS);
+        assertEquals("{\"n\":7}\n", sinks.content(file("a")));
+        assertEquals(3, t.written());
+        assertEquals(1, t.openCount());
+        assertEquals(4, t.droppedFileFull());
+        assertTrue(warnings(t).isEmpty());
+    }
+
+    @Test
+    void aFileAlreadyAtTheCapIsNotEvenOpened() {
+        maxFileBytes = 10;
+        sinks.preset(file("a"), "0123456789\n"); // 11 bytes, from an earlier run
+        FileTable t = table(8192);
+        t.append("a", "{}", 0);
+        assertEquals(1, t.droppedFileFull());
+        assertEquals(0, t.openCount());
+        assertEquals(0, sinks.opens);
+        assertEquals(1, warnings(t).size());
+        assertEquals("0123456789\n", sinks.content(file("a")));
+        assertEquals(0, budget.open(), "the open-file slot was given back");
+    }
+
+    @Test
+    void aRecordLargerThanTheBufferIsMeasuredBeforeAnyOfItIsWritten() {
+        maxFileBytes = 100;
+        FileTable t = table(64); // records over 62 bytes are written in pieces
+        t.append("a", "x".repeat(150), 0); // 151 bytes would take three writes; none happens
+        assertTrue(sinks.writes.isEmpty());
+        assertEquals(1, t.droppedFileFull());
+        assertEquals(1, warnings(t).size());
+        assertFalse(t.writeThrough("b", "y".repeat(150), 0));
+        assertTrue(sinks.writes.isEmpty());
+        assertEquals(2, t.droppedFileFull());
+
+        // A record that fits is written, in pieces, and counts towards the cap exactly.
+        assertTrue(t.writeThrough("c", "z".repeat(99), 0));
+        assertEquals("z".repeat(99) + "\n", sinks.content(file("c")));
+        assertFalse(t.writeThrough("c", "{}", 0), "the file is at the cap to the byte");
+        assertEquals(3, t.droppedFileFull());
+        assertEquals(1, t.written());
+        assertEquals(0, t.lostIoError());
+    }
 
     @Test
     void closeAllWritesEverythingAndClosesEveryFile() {

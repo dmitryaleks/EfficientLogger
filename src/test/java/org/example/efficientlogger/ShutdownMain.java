@@ -30,7 +30,7 @@ public final class ShutdownMain {
                 LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
             }
         };
-        logger.set((AsyncLogger) EfficientLogger.builder(dir, "{id}.json")
+        logger.set((AsyncLogger) EfficientLogger.builder(dir, "{id}.json", 1 << 20)
                 .registerShutdownHook(!mode.equals("nohook"))
                 .build(hooks));
 

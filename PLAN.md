@@ -31,7 +31,7 @@ It is one CAS on an admission word, one atomic add on the shard tail, two refere
 
 ```java
 public interface EfficientLogger extends AutoCloseable {
-  static EfficientLoggerBuilder builder(Path directory, String fileNamePattern); // exactly one "{id}", e.g. "events-{id}.json"
+  static EfficientLoggerBuilder builder(Path directory, String fileNamePattern, long maxFileSizeKb); // exactly one "{id}", e.g. "events-{id}.json"; the cap on each file, mandatory
   boolean log(String id, String json);  // false = dropped (limits / too large / closed; sync: invalid id or I/O failure). Only throws NPE on null args.
   boolean flush(Duration timeout);      // async: everything accepted before the call has reached the OS (no fsync). sync: true at once.
   boolean flush();                      // flush(closeTimeout)
@@ -42,7 +42,8 @@ public interface EfficientLogger extends AutoCloseable {
 }
 public interface WarningHandler { void warn(String message, Throwable causeOrNull); static WarningHandler stderr(); }
 public record LoggerStats(long accepted, long written, long droppedQueueFull, long droppedTooLarge,
-    long droppedInvalidId, long lostIoError, long rejectedClosed, long queuedMessages, long queuedChars, int openFiles) {}
+    long droppedInvalidId, long droppedFileFull, long droppedDiskSpace, long droppedRateLimit, long lostIoError,
+    long abandoned, long rejectedClosed, long queuedMessages, long queuedChars, int openFiles) {}
 ```
 - **IDs are `String`s.** They are immutable and cache their hash. `CharSequence` is not accepted because it may be mutable and can't be queued by reference.
 - **Sync mode is the explicit `synchronous()` flag.** `workerThreads(0)` is rejected, so a miscomputed 0 can't silently switch modes.
@@ -64,6 +65,9 @@ public record LoggerStats(long accepted, long written, long droppedQueueFull, lo
 | `warningHandler(WarningHandler)` | stderr | |
 | `lineSeparator(String)` | `"\n"` | `"\n"` or `"\r\n"` |
 | `syncStripes(int)` | 16 | Power of two 1..256, sync only |
+| `maxFileSizeKb` (builder argument) | mandatory | A file never grows past it. A record that would take it past is dropped (`droppedFileFull`), the file is closed as FULL, and once a second (while records for it arrive) its size is re-read; it is reopened once smaller than when it filled, i.e. after a `copytruncate`. Size tracked as size-at-open plus bytes written; a record larger than the buffer is measured by a dry encode before any piece is written. |
+| `minFreeDiskSpace(shedBelow, resumeAbove)` | off | `DiskWatch`: free space of the directory's `FileStore`, read at most once a second by whichever thread finds it due (a worker in `runOnce`/`beforeSleep`; the caller in sync mode; a dropping async caller wakes worker 0 when a reading is due, so shedding ends even if every worker is asleep). `log()` reads one volatile flag. Hysteresis between the two marks. Reported through `DropEpisode`. |
+| `maxCharsPerSecond(long)` | off | `RateLimit`: GCRA with one CAS per `log()` on a padded TAT word; burst of 1 s; judged before charging, so an oversize message passes when calm and then blocks the rest; a message is charged at most a day. Reported through `DropEpisode`, whose episode ends after 1 s without drops. |
 
 ---
 

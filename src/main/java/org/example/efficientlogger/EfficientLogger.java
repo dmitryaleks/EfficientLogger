@@ -7,8 +7,8 @@ import java.time.Duration;
  * Appends JSON strings, one per line, to one file per ID.
  *
  * <pre>{@code
- * try (EfficientLogger logger = EfficientLogger.builder(Path.of("logs"), "events-{id}.json").build()) {
- *     logger.log("42", "{\"event\":\"login\"}"); // appends a line to logs/events-42.json
+ * try (EfficientLogger logger = EfficientLogger.builder(Path.of("logs"), "events-{id}.json", 100 * 1024).build()) {
+ *     logger.log("42", "{\"event\":\"login\"}"); // appends a line to logs/events-42.json, up to 100 MiB
  * }
  * }</pre>
  *
@@ -28,9 +28,15 @@ public interface EfficientLogger extends AutoCloseable {
      *
      * @param directory where the files go; created if it doesn't exist
      * @param fileNamePattern file name with exactly one {@code {id}}, e.g. {@code "events-{id}.json"}
+     * @param maxFileSizeKb the most a file may grow to, in kilobytes of 1024 bytes, at least 1. A
+     *     message that would take its file past this is dropped and counted (in
+     *     {@code stats().droppedFileFull()}), with a warning per file; the file is checked again
+     *     once a second and written to again once something has truncated it, for example
+     *     logrotate with {@code copytruncate}
+     * @throws IllegalArgumentException if {@code maxFileSizeKb} is out of range
      */
-    static EfficientLoggerBuilder builder(Path directory, String fileNamePattern) {
-        return new EfficientLoggerBuilder(directory, fileNamePattern);
+    static EfficientLoggerBuilder builder(Path directory, String fileNamePattern, long maxFileSizeKb) {
+        return new EfficientLoggerBuilder(directory, fileNamePattern, maxFileSizeKb);
     }
 
     /**
@@ -42,9 +48,11 @@ public interface EfficientLogger extends AutoCloseable {
      * this changes what valid JSON means. The JSON is not otherwise checked.
      *
      * @return true if the message was accepted. False if it was dropped: the id is too long for a
-     *     file name; the queue was full or the message too large (async); the id can't be used in a
-     *     file name for another reason, or the file has an I/O error (sync; in async mode these are
-     *     found later and only counted); or the logger is closed
+     *     file name; the queue was full or the message too large (async); free disk space is below
+     *     {@code minFreeDiskSpace} or the logger is over {@code maxCharsPerSecond}, if set; the id
+     *     can't be used in a file name for another reason, the file is at {@code maxFileSizeKb}, or
+     *     the file has an I/O error (sync; in async mode these are found later and only counted);
+     *     or the logger is closed
      * @throws NullPointerException if {@code id} or {@code json} is null
      */
     boolean log(String id, String json);
@@ -64,8 +72,10 @@ public interface EfficientLogger extends AutoCloseable {
     boolean flush();
 
     /**
-     * Messages dropped because the queue was full or a single message was longer than
-     * maxQueuedChars. Always 0 in synchronous mode. {@link #stats()} counts every kind of loss.
+     * Messages {@code log} dropped at once for want of room: the queue was full or a single message
+     * was longer than maxQueuedChars (async only), free disk space was below minFreeDiskSpace, or
+     * the logger was over maxCharsPerSecond. {@link #stats()} counts every kind of loss, including
+     * those found after a message was accepted.
      */
     long droppedCount();
 

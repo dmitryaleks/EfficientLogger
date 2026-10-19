@@ -5,12 +5,15 @@ writing, so `log()` returns at once: it never blocks on I/O, and it allocates no
 runtime dependencies.
 
 ```java
-try (EfficientLogger logger = EfficientLogger.builder(Path.of("logs"), "events-{id}.json").build()) {
+try (EfficientLogger logger = EfficientLogger.builder(Path.of("logs"), "events-{id}.json", 100 * 1024).build()) {
     logger.log("42", "{\"event\":\"login\"}"); // appends a line to logs/events-42.json
 }
 ```
 
 Files are opened in append mode, so a restarted process carries on where the last one stopped.
+The third argument is the most a file may grow to, in kilobytes (of 1024 bytes); here 100 MiB.
+It is mandatory: a logger that writes one file per ID must have a ceiling on each of them (see
+"Files have a size cap" under "What to expect").
 
 ## Two modes
 
@@ -28,10 +31,14 @@ Files are opened in append mode, so a restarted process carries on where the las
 
 ## Options
 
-All set on the builder; each setter checks its argument at once.
+`builder(directory, fileNamePattern, maxFileSizeKb)` takes the three things every logger needs;
+everything else is set on the builder, and each setter checks its argument at once.
 
 | Option | Default | Range and notes |
 |---|---|---|
+| `maxFileSizeKb` (builder argument) | mandatory | 1 to 2^63/1024 kilobytes of 1024 bytes. A message that would take its file past this is dropped and counted (`droppedFileFull`), with a warning per file (the first 100). The file is checked once a second and written to again once something has truncated it. |
+| `minFreeDiskSpace(long shedBelow, long resumeAbove)` | off | Bytes. Drop every message while the log volume has less than `shedBelow` free, until it has at least `resumeAbove`; the gap is hysteresis. Read once a second, on a worker (sync mode: by a caller). Counted in `droppedDiskSpace` and `droppedCount()`, with a warning when shedding starts and one when it ends. |
+| `maxCharsPerSecond(long)` | off | At least 1. Caps the logger's own output: a leaky bucket over message chars with a burst of one second's worth. Messages over it are dropped at once, counted in `droppedRateLimit` and `droppedCount()`, with a warning when dropping starts and one when it has stopped for a second. |
 | `workerThreads(int)` | 1 | 1 to 16 workers, each with its own queue and files. Each ID always goes to the same worker. The workers are spread over the pool's threads, so this is also the most threads that can write for this logger at once. Async only. |
 | `synchronous()` | off | Write on the calling thread. |
 | `maxQueuedMessages(int)` | 65,536 | 1 to 2^23. Messages beyond the limit are dropped. Async only. |
@@ -77,6 +84,32 @@ Combining an async-only option with `synchronous()`, or `syncStripes` without it
   Once the queue has made no progress for 2 seconds, the workers give up on what is left, warn,
   and close the files; `close()` then returns false, and the messages left behind are counted in
   `stats()` as `queuedMessages` and, for those that had reached a queue, `abandoned`.
+- **Files have a size cap.** A file never grows past `maxFileSizeKb`. A message that would take
+  it past the cap is dropped and counted in `stats().droppedFileFull()`, with one warning per file
+  (for the first 100 files); what was already buffered for the file is written out, and the file is
+  closed. Once a second, while messages for it keep arriving, the logger checks whether the file
+  has shrunk, and if something has truncated it (logrotate's `copytruncate`, or you) it writes to
+  it again. The size is known exactly: the file's size when opened plus what the logger has
+  written. A message larger than the buffer is measured before any of it is written, so a file is
+  never left with part of a message.
+- **Low disk space sheds messages, if you ask.** With `minFreeDiskSpace(shedBelow, resumeAbove)`,
+  the logger reads the log volume's free space once a second (one system call, on a worker thread;
+  in sync mode on whichever caller finds the reading due) and drops every message while it is
+  below `shedBelow`, until it is back above `resumeAbove`. The gap between the two keeps a volume
+  hovering around the mark from switching the logger on and off. Shed messages are counted in
+  `stats().droppedDiskSpace()`, with one warning when shedding starts (with the reading) and one
+  with the count when it ends. If the volume can't be read, nothing is shed and that is warned
+  about once. A worker that has gone to sleep is woken by a dropping caller when the next reading
+  is due, so shedding ends even on an otherwise idle logger.
+- **An output rate cap, if you ask.** `maxCharsPerSecond(n)` bounds what the logger accepts, as a
+  leaky bucket over the chars of accepted messages with a burst of one second's worth: a burst of
+  up to that goes through, and over any longer period the accepted messages average no more than
+  the cap. It is one CAS per `log()` call, exact under contention, and it needs no system calls,
+  so unlike the disk-space mark it can't be fooled by other programs writing to the volume. A
+  message larger than the burst is still accepted when the logger is under the cap, and then
+  holds the following messages back until its share of time has passed (at most a day). Drops
+  are counted in `stats().droppedRateLimit()`, with a warning when they start and one with the
+  count once they have stopped for a second.
 - **IDs must make portable, safe file names.** The whole name must fit in 255 characters and
   bytes; `log()` rejects a longer ID at once, before queueing it. The name can't:
   - be empty, `.` or `..`, or a Windows device name such as `CON` or `NUL`
@@ -108,17 +141,22 @@ Combining an async-only option with `synchronous()`, or `syncStripes` without it
 - **Warnings** go to the `WarningHandler`, never to the caller as exceptions. A handler may call
   `log()`, `flush()` or `close()`. It must be thread-safe: with several workers, or several threads
   logging in sync mode, it is called from more than one thread at once.
-- **`stats()`** returns counters: accepted, written, dropped (queue full, too large, invalid ID),
-  lost to I/O errors, abandoned at close, rejected after close, queued, and open files. Once a
-  logger is closed, `accepted == written + droppedInvalidId + lostIoError + abandoned`, and
-  `abandoned` is 0 unless `close()` gave up as described above.
+- **`stats()`** returns counters: accepted, written, dropped (queue full, too large, invalid ID,
+  file at its cap, low disk space, over the rate cap), lost to I/O errors, abandoned at close,
+  rejected after close, queued, and open files. Once a logger is closed,
+  `accepted == written + droppedInvalidId + droppedFileFull + lostIoError + abandoned`, and
+  `abandoned` is 0 unless `close()` gave up as described above. `droppedCount()` is what `log()`
+  dropped at once for want of room: queue full, too large, low disk space and the rate cap.
 
 ## Allocation and threads
 
 `log()` allocates nothing on the Java heap, whether it queues a message, drops one, writes one
-(sync mode) or is called after close, and neither does the async worker. `AllocationTest` checks
-this by counting each thread's allocation over millions of calls, once normally and once with
-escape analysis off, so the JIT can't hide an allocation.
+(sync mode) or is called after close, with or without the rate cap and the disk-space mark, and
+neither does the async worker. `AllocationTest` checks this by counting each thread's allocation
+over millions of calls, once normally and once with escape analysis off, so the JIT can't hide an
+allocation. The one exception is reading free space for `minFreeDiskSpace`: the JDK answers that
+system call with a small object, so the thread that takes the reading, a worker or in sync mode a
+caller, allocates a few dozen bytes once a second.
 
 What the caller does is up to the caller: building an ID with `"user-" + n` for each call
 allocates, so keep IDs around when you can.
@@ -284,7 +322,10 @@ once is the JVM's periodic cleanup safepoint. None involves the queue. Its optio
   file, the logger goes on writing to the renamed one, and the new file stays empty until the
   logger reopens it, normally at the next restart. With `copytruncate`, writing carries on in
   the original file without a gap, since it is open for appending. Lines written between
-  logrotate's copy and its truncate are lost, as with any program that logs to a file.
+  logrotate's copy and its truncate are lost, as with any program that logs to a file. A file
+  that had reached `maxFileSizeKb` is noticed to have shrunk within a second and written to
+  again, so set the cap above the size at which logrotate rotates, and the cap only ever bites
+  if rotation stops.
 - **Keep the log directory private to the service's user.** The logger refuses to write to
   anything that isn't a regular file, so a symlink, FIFO or device left at a file's path by
   another user can't redirect the writes or block a thread; those messages are dropped and

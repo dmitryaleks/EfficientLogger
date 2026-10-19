@@ -9,6 +9,7 @@ final class FileState {
     static final byte FAILED = 1; // not open; retry opening at retryAtNanos
     static final byte INVALID = 2; // the ID can't be used as a file name
     static final byte CAPPED = 3; // no file: the logger is at its maxFiles limit
+    static final byte FULL = 4; // not open: at maxFileSizeKb; at retryAtNanos, see whether it has shrunk
 
     final String id;
     final Path path; // null when INVALID
@@ -22,6 +23,8 @@ final class FileState {
     FileState lruNext; // towards the least recently used
     long lastUsedNanos;
     long retryAtNanos;
+    long bytesOnDisk; // while OPEN: the file's size once the buffer is written out, less the buffer
+    long fullAtBytes; // while FULL: its size when it filled; it is reopened only once smaller than this
 
     FileState(String id, Path path) {
         this.id = id;

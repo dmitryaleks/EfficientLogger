@@ -33,9 +33,10 @@ class AsyncLoggerTest {
     private int batchSize; // 0: the logger's own
     private long ringStartIndex;
     private long shardKey; // fixed (0 by default), so worker assignment is predictable
+    private DiskWatch.Probe freeSpace; // for minFreeDiskSpace tests
 
     private EfficientLoggerBuilder builder() {
-        return EfficientLogger.builder(dir, "{id}.json")
+        return EfficientLogger.builder(dir, "{id}.json", 1 << 20)
                 .warningHandler((message, cause) -> warnings.add(cause == null ? message : message + " | " + cause.getMessage()));
     }
 
@@ -48,6 +49,7 @@ class AsyncLoggerTest {
         hooks.batchSize = batchSize;
         hooks.ringStartIndex = ringStartIndex;
         hooks.shardKey = shardKey;
+        hooks.freeSpace = freeSpace;
         return (AsyncLogger) b.build(hooks);
     }
 
@@ -337,6 +339,95 @@ class AsyncLoggerTest {
         assertFalse(logger.log("d", thirty));
         assertTrue(logger.log("d", "x".repeat(10)));
         assertEquals(100, logger.stats().queuedChars());
+    }
+
+    // ---- minFreeDiskSpace and maxCharsPerSecond ----
+
+    @Test
+    void shedsMessagesWhileDiskSpaceIsLowWithHysteresis() {
+        long[] free = {10L << 20};
+        freeSpace = () -> free[0];
+        AsyncLogger logger = manual(builder().minFreeDiskSpace(1 << 20, 2 << 20));
+        Worker w = logger.worker(0);
+        assertTrue(logger.log("a", json(1)));
+
+        free[0] = 512 << 10; // the volume fills up; the next reading, a second after the last, sees it
+        assertTrue(logger.log("a", json(2)), "not read yet");
+        now[0] = 1_000 * MS;
+        w.runOnce();
+        assertFalse(logger.log("a", json(3)));
+        assertFalse(logger.log("a", json(4)));
+        LoggerStats s = logger.stats();
+        assertEquals(2, s.droppedDiskSpace());
+        assertEquals(2, logger.droppedCount());
+        assertEquals(2, s.accepted());
+        assertTrue(warnings.isEmpty(), "producers never warn; the worker does on its next pass");
+        w.runOnce();
+        assertEquals(List.of("free disk space is 512.0 KiB, below minFreeDiskSpace=1.0 MiB; dropping messages until it is back"
+                + " above 2.0 MiB"), warnings);
+
+        free[0] = 1536 << 10; // above the floor, below the resume mark
+        now[0] = 2_000 * MS;
+        w.runOnce();
+        assertFalse(logger.log("a", json(5)), "hysteresis: still shedding");
+        free[0] = 3L << 20;
+        now[0] = 3_000 * MS;
+        w.runOnce();
+        assertTrue(logger.log("a", json(6)));
+        assertEquals(2, warnings.size(), warnings::toString);
+        assertEquals("free disk space is back to 3.0 MiB; dropped 3 messages (3 in total)", warnings.get(1));
+
+        logger.close(Duration.ZERO);
+        drainAndFinish(logger);
+        assertEquals(json(1) + "\n" + json(2) + "\n" + json(6) + "\n", content("a"));
+        s = logger.stats();
+        assertEquals(3, s.droppedDiskSpace());
+        assertEquals(3, s.accepted());
+        assertEquals(s.accepted(), s.written() + s.droppedInvalidId() + s.droppedFileFull() + s.lostIoError() + s.abandoned());
+        assertEquals(2, warnings.size(), "nothing left to report at close");
+    }
+
+    @Test
+    void capsTheOutputRateAndDropsTheExcess() {
+        AsyncLogger logger = manual(builder().maxCharsPerSecond(20)); // a 7-char message is 0.35 s of output
+        Worker w = logger.worker(0);
+        assertTrue(logger.log("a", json(1))); // the output is now 0.35 s ahead
+        assertTrue(logger.log("a", json(2))); // 0.7 s
+        assertTrue(logger.log("a", json(3))); // judged at 0.7 s, so accepted; now 1.05 s ahead
+        assertFalse(logger.log("a", json(4)), "1.05 s ahead: over the burst of one second");
+        assertFalse(logger.log("a", json(5)));
+        LoggerStats s = logger.stats();
+        assertEquals(2, s.droppedRateLimit());
+        assertEquals(2, logger.droppedCount());
+        assertEquals(3, s.accepted());
+        assertTrue(warnings.isEmpty(), "producers never warn");
+        w.runOnce();
+        assertEquals(List.of("output rate limit reached (maxCharsPerSecond=20); dropping messages until the rate falls"), warnings);
+
+        now[0] = 100 * MS;
+        assertTrue(logger.log("a", json(6)), "0.1 s later the output is 0.95 s ahead: within the burst again");
+        assertFalse(logger.log("a", json(7)));
+        now[0] = 1_200 * MS; // more than a second with nothing dropped
+        w.runOnce();
+        assertEquals("output rate is back under the limit; dropped 3 messages (3 in total)", warnings.get(1));
+
+        // Over a long stretch, calls at ten a second are accepted at the cap: 20 chars/s is one message per 0.35 s.
+        now[0] = 10_000 * MS;
+        int accepted = 0;
+        for (int i = 0; i < 100; i++) {
+            now[0] += 100 * MS;
+            if (logger.log("b", json(i))) {
+                accepted++;
+            }
+        }
+        assertTrue(accepted >= 25 && accepted <= 31, "10 s at the cap is 28 messages, give or take the burst: " + accepted);
+
+        logger.close(Duration.ZERO);
+        drainAndFinish(logger);
+        s = logger.stats();
+        assertEquals(4 + accepted, s.written());
+        assertEquals(s.accepted(), s.written());
+        assertEquals(103 - accepted, s.droppedRateLimit());
     }
 
     // ---- flush ----

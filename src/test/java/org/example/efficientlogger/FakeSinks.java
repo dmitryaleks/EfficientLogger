@@ -133,6 +133,23 @@ final class FakeSinks implements SinkFactory {
     }
 
     @Override
+    public long size(Path path) throws IOException {
+        if (nonRegular.contains(path)) {
+            throw new IOException("refusing to use " + path + ": not a regular file");
+        }
+        ByteArrayOutputStream content = contents.get(path);
+        return content == null ? 0 : content.size();
+    }
+
+    /** Empties {@code path} in place, as logrotate's copytruncate does; a sink still open keeps appending to it. */
+    void truncate(Path path) {
+        ByteArrayOutputStream content = contents.get(path);
+        if (content != null) {
+            content.reset();
+        }
+    }
+
+    @Override
     public boolean createDirectoryIfMissing(Path dir) {
         return directories.add(dir);
     }

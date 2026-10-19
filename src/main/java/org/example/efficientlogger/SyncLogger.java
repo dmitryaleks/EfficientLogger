@@ -28,6 +28,8 @@ final class SyncLogger implements EfficientLogger {
     private final Stripe[] stripes;
     private final Duration closeTimeout;
     private final Warnings warnings;
+    private final DiskWatch disk; // null unless minFreeDiskSpace is set
+    private final RateLimit rate; // null unless maxCharsPerSecond is set
     private final OpenFileBudget budget;
     private final LongSupplier clock;
     private final int maxIdLength;
@@ -54,11 +56,17 @@ final class SyncLogger implements EfficientLogger {
         budget = new OpenFileBudget(config.maxOpenFiles);
         FileCreationBudget fileBudget = new FileCreationBudget(config.maxFiles);
         clock = hooks.nanoClock;
+        long now = clock.getAsLong();
+        disk = config.minFreeDiskBytes > 0
+                ? new DiskWatch(hooks.freeSpace != null ? hooks.freeSpace : DiskWatch.forDirectory(config.directory),
+                        config.minFreeDiskBytes, config.resumeFreeDiskBytes, warnings, now)
+                : null;
+        rate = config.maxCharsPerSecond > 0 ? new RateLimit(config.maxCharsPerSecond, warnings, now) : null;
         closeTimeout = config.closeTimeout;
         stripes = new Stripe[config.syncStripes];
         for (int i = 0; i < stripes.length; i++) {
             stripes[i] = new Stripe(new FileTable(config.fileNamePattern, config.lineSeparator,
-                    config.fileBufferBytes, config.maxFileEntries, hooks.sinks,
+                    config.fileBufferBytes, config.maxFileEntries, config.maxFileBytes, hooks.sinks,
                     budget, fileBudget, warnings));
         }
     }
@@ -80,6 +88,21 @@ final class SyncLogger implements EfficientLogger {
             rejectedClosed.incrementAndGet();
             return false;
         }
+        long now = clock.getAsLong();
+        if (disk != null) {
+            disk.check(now); // the caller takes the reading when one is due: there is no worker to do it
+            if (disk.shedding()) {
+                disk.recordDrop();
+                return false;
+            }
+        }
+        if (rate != null) {
+            rate.check(now);
+            if (!rate.tryAcquire(json.length(), now)) {
+                rate.recordDrop(now);
+                return false;
+            }
+        }
         Stripe s = stripes[Hashing.bucket(id, shardKey, stripes.length)];
         boolean written;
         List<Warnings.Pending> pending;
@@ -88,7 +111,7 @@ final class SyncLogger implements EfficientLogger {
                 rejectedClosed.incrementAndGet();
                 return false;
             }
-            written = s.files.writeThrough(id, json, clock.getAsLong());
+            written = s.files.writeThrough(id, json, now);
             pending = s.files.takeWarnings();
         }
         if (pending != null) {
@@ -117,20 +140,24 @@ final class SyncLogger implements EfficientLogger {
 
     @Override
     public long droppedCount() {
-        return 0; // no queue, so nothing is dropped for space
+        // No queue, so nothing is dropped for space; only the disk and rate limits drop here.
+        return (disk != null ? disk.drops() : 0) + (rate != null ? rate.drops() : 0);
     }
 
     @Override
     public LoggerStats stats() {
         long written = 0;
         long invalidId = warnings.tooLongIds();
+        long fileFull = 0;
         long lostIoError = 0;
         for (Stripe s : stripes) {
             written += s.files.written();
             invalidId += s.files.droppedInvalidId();
+            fileFull += s.files.droppedFileFull();
             lostIoError += s.files.lostIoError();
         }
-        return new LoggerStats(written + invalidId + lostIoError, written, 0, 0, invalidId, lostIoError, 0,
+        return new LoggerStats(written + invalidId + fileFull + lostIoError, written, 0, 0, invalidId, fileFull,
+                disk != null ? disk.drops() : 0, rate != null ? rate.drops() : 0, lostIoError, 0,
                 rejectedClosed.get(), 0, 0, budget.open());
     }
 
@@ -148,6 +175,12 @@ final class SyncLogger implements EfficientLogger {
                 pending = s.files.takeWarnings();
             }
             warnings.emitAll(pending);
+        }
+        if (disk != null) {
+            disk.finalReport();
+        }
+        if (rate != null) {
+            rate.finalReport();
         }
         warnings.reportSuppressedIoErrors();
         return true;

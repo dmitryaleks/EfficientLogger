@@ -23,7 +23,11 @@ public final class EfficientLoggerBuilder {
     // Read by Config. A null option means "not set": use the default.
     final Path directory;
     final String fileNamePattern;
+    final long maxFileSizeKb;
     boolean synchronous;
+    Long minFreeDiskBytes;
+    Long resumeFreeDiskBytes;
+    Long maxCharsPerSecond;
     Integer workerThreads;
     Integer maxQueuedMessages;
     Long maxQueuedChars;
@@ -41,9 +45,51 @@ public final class EfficientLoggerBuilder {
     Set<PosixFilePermission> filePermissions;
     boolean normalizeIds;
 
-    EfficientLoggerBuilder(Path directory, String fileNamePattern) {
+    EfficientLoggerBuilder(Path directory, String fileNamePattern, long maxFileSizeKb) {
         this.directory = Objects.requireNonNull(directory, "directory");
         this.fileNamePattern = Objects.requireNonNull(fileNamePattern, "fileNamePattern");
+        this.maxFileSizeKb = checkRange("maxFileSizeKb", maxFileSizeKb, 1, Config.MAX_FILE_SIZE_KB_MAX);
+    }
+
+    /**
+     * Sheds every message while the log directory's volume has less than {@code shedBelowBytes}
+     * free, until it has at least {@code resumeAboveBytes} again; the gap is hysteresis, so a
+     * volume hovering around the mark doesn't flip the logger on and off. Off by default. Free
+     * space is read at most once a second (one system call), on a worker thread, or in sync mode
+     * by the caller that finds the reading due. Shed messages are counted in
+     * {@code stats().droppedDiskSpace()} and {@code droppedCount()}, with one warning when
+     * shedding starts and one with the count when it ends. If the volume can't be queried,
+     * nothing is shed and that is warned about once.
+     *
+     * @param shedBelowBytes at least 1
+     * @param resumeAboveBytes at least {@code shedBelowBytes}
+     */
+    public EfficientLoggerBuilder minFreeDiskSpace(long shedBelowBytes, long resumeAboveBytes) {
+        checkRange("minFreeDiskSpace shedBelowBytes", shedBelowBytes, 1, Long.MAX_VALUE);
+        if (resumeAboveBytes < shedBelowBytes) {
+            throw new IllegalArgumentException("minFreeDiskSpace resumeAboveBytes must be at least shedBelowBytes ("
+                    + shedBelowBytes + "), was " + resumeAboveBytes);
+        }
+        this.minFreeDiskBytes = shedBelowBytes;
+        this.resumeFreeDiskBytes = resumeAboveBytes;
+        return this;
+    }
+
+    /**
+     * Caps the logger's own output at this many chars of messages per second, as a leaky bucket
+     * with a burst of one second's worth: a burst up to that size goes through, and over any
+     * longer period the accepted messages average no more than the cap. Off by default. Messages
+     * over the cap are dropped at once, counted in {@code stats().droppedRateLimit()} and
+     * {@code droppedCount()}, and reported with one warning when dropping starts and one with the
+     * count once it has stopped for a second. Costs the caller one CAS per message. A single
+     * message larger than the burst is still accepted while the logger is under the cap; it then
+     * holds the following messages back until its share of time has passed, up to a day.
+     *
+     * @param charsPerSecond at least 1
+     */
+    public EfficientLoggerBuilder maxCharsPerSecond(long charsPerSecond) {
+        this.maxCharsPerSecond = checkRange("maxCharsPerSecond", charsPerSecond, 1, Long.MAX_VALUE);
+        return this;
     }
 
     /**

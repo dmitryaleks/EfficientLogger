@@ -39,7 +39,7 @@ class SyncLoggerTest {
     private final List<String> warnings = Collections.synchronizedList(new ArrayList<>());
 
     private EfficientLoggerBuilder builder() {
-        return EfficientLogger.builder(dir, "events-{id}.json")
+        return EfficientLogger.builder(dir, "events-{id}.json", 1 << 20)
                 .synchronous()
                 .warningHandler((message, cause) -> warnings.add(cause == null ? message : message + " | " + cause.getMessage()));
     }
@@ -53,6 +53,39 @@ class SyncLoggerTest {
     }
 
     // ---- basics ----
+
+    /** In sync mode there is no worker, so the caller takes the free-space reading when one is due. */
+    @Test
+    void shedsForLowDiskSpaceAndCapsTheRateInSyncModeToo() throws IOException {
+        long[] now = {0};
+        long[] free = {10L << 20};
+        TestHooks hooks = new TestHooks();
+        hooks.nanoClock = () -> now[0];
+        hooks.freeSpace = () -> free[0];
+        try (EfficientLogger logger = builder().minFreeDiskSpace(1 << 20, 2 << 20).maxCharsPerSecond(20).build(hooks)) {
+            assertTrue(logger.log("a", "{\"n\":1}")); // 7 chars: 0.35 s of output each
+            assertTrue(logger.log("a", "{\"n\":2}"));
+            assertTrue(logger.log("a", "{\"n\":3}"));
+            assertFalse(logger.log("a", "{\"n\":4}"), "over the rate");
+
+            free[0] = 100 << 10;
+            now[0] = 2_000 * MS; // the rate has recovered, and a free-space reading is due: this call takes it
+            assertFalse(logger.log("a", "{\"n\":5}"), "shed");
+            LoggerStats s = logger.stats();
+            assertEquals(1, s.droppedRateLimit());
+            assertEquals(1, s.droppedDiskSpace());
+            assertEquals(2, logger.droppedCount());
+            assertEquals(3, s.accepted());
+
+            free[0] = 5L << 20;
+            now[0] = 3_000 * MS;
+            assertTrue(logger.log("a", "{\"n\":6}"));
+            assertEquals("{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n{\"n\":6}\n", read("a"));
+        }
+        assertTrue(warnings.contains("output rate limit reached (maxCharsPerSecond=20); dropping messages until the rate falls"), warnings::toString);
+        assertTrue(warnings.contains("free disk space is 100.0 KiB, below minFreeDiskSpace=1.0 MiB; dropping messages until it is back above 2.0 MiB"),
+                warnings::toString);
+    }
 
     @Test
     void writesEachMessageBeforeLogReturns() throws IOException {
@@ -132,7 +165,7 @@ class SyncLoggerTest {
     @Test
     void createsTheDirectory() throws IOException {
         Path nested = dir.resolve("x").resolve("y");
-        try (EfficientLogger logger = EfficientLogger.builder(nested, "{id}.json").synchronous().build()) {
+        try (EfficientLogger logger = EfficientLogger.builder(nested, "{id}.json", 1 << 20).synchronous().build()) {
             logger.log("a", "{}");
         }
         assertEquals("{}\n", Files.readString(nested.resolve("a.json"), UTF_8));
@@ -142,7 +175,7 @@ class SyncLoggerTest {
     void buildFailsWhenTheDirectoryIsAFile() throws IOException {
         Path notADirectory = Files.createFile(dir.resolve("plain-file"));
         UncheckedIOException e = assertThrows(UncheckedIOException.class,
-                () -> EfficientLogger.builder(notADirectory, "{id}.json").synchronous().build());
+                () -> EfficientLogger.builder(notADirectory, "{id}.json", 1 << 20).synchronous().build());
         assertTrue(e.getMessage().startsWith("can't create directory"), e.getMessage());
     }
 
@@ -213,7 +246,7 @@ class SyncLoggerTest {
         assumeTrue(java.nio.file.FileSystems.getDefault().supportedFileAttributeViews().contains("posix"),
                 "POSIX permissions only");
         Path logs = dir.resolve("private");
-        try (EfficientLogger logger = EfficientLogger.builder(logs, "{id}.json")
+        try (EfficientLogger logger = EfficientLogger.builder(logs, "{id}.json", 1 << 20)
                 .synchronous()
                 .filePermissions(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"))
                 .warningHandler((message, cause) -> warnings.add(message))

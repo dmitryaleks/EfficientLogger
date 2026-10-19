@@ -364,7 +364,11 @@ once is the JVM's periodic cleanup safepoint. None involves the queue. Its optio
 `-Pmany.loggers`, `-Pmany.rate`, `-Pmany.seconds`, `-Pmany.producers`, `-Pmany.dir` and
 `-Pmany.jvmArgs`, plus the caps: `-Pmany.fileKb` (each file's `maxFileSizeKb`, 1 GiB by
 default), `-Pmany.minFreeMb` (turns on `minFreeDiskSpace` with that floor and twice it to
-resume) and `-Pmany.charsPerSecond` (turns on `maxCharsPerSecond`, per logger).
+resume), `-Pmany.charsPerSecond` (turns on `maxCharsPerSecond`, per logger) and `-Pmany.maxFiles`.
+
+With the recipe from "The guards at a glance" (100 MiB files, `maxFiles(10_000)`, a 2 GiB floor
+with a 4 GiB resume mark, 5,000,000 chars/s), the minute wrote all 30,000 traces with nothing
+dropped and no warnings; `log()` took 2.8 µs at p50 and 45 µs at p99, the same as without caps.
 
 With all three caps on but none binding (1 MiB files, a 1 GiB free-space floor, 1,000 chars/s
 per logger), the same minute wrote all 30,000 traces with nothing dropped; `log()` took 4.0 µs

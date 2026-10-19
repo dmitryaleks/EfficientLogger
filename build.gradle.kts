@@ -97,7 +97,7 @@ tasks.register<JavaExec>("manyLoggers") {
     group = "benchmark"
     classpath = sourceSets["jmh"].runtimeClasspath
     mainClass = "org.example.efficientlogger.ManyLoggersBenchmark"
-    for (option in listOf("loggers", "rate", "seconds", "producers", "dir", "fileKb", "minFreeMb", "charsPerSecond")) {
+    for (option in listOf("loggers", "rate", "seconds", "producers", "dir", "fileKb", "minFreeMb", "charsPerSecond", "maxFiles")) {
         (findProperty("many.$option") as String?)?.let { systemProperty("many.$option", it) }
     }
     (findProperty("many.jvmArgs") as String?)?.let { jvmArgs(it.split(" ")) } // e.g. -Xlog:safepoint,gc:file=build/jvm.log

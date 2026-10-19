@@ -27,12 +27,13 @@ import java.util.stream.Stream;
  * <pre>
  *   .\gradlew.bat manyLoggers
  *   .\gradlew.bat manyLoggers -Pmany.loggers=100 -Pmany.rate=5 -Pmany.seconds=60 -Pmany.producers=4 -Pmany.dir=build/many-loggers
- *   .\gradlew.bat manyLoggers -Pmany.fileKb=1024 -Pmany.minFreeMb=1024 -Pmany.charsPerSecond=200   # the caps
+ *   .\gradlew.bat manyLoggers -Pmany.fileKb=1024 -Pmany.minFreeMb=1024 -Pmany.charsPerSecond=200 -Pmany.maxFiles=10000  # the caps
  * </pre>
  *
  * <p>The caps: {@code many.fileKb} is each file's maxFileSizeKb (default 1 GiB, so it never bites);
  * {@code many.minFreeMb} turns on minFreeDiskSpace with that floor and twice it as the resume mark;
- * {@code many.charsPerSecond} turns on maxCharsPerSecond, per logger. At 5 traces of about 95 chars
+ * {@code many.charsPerSecond} turns on maxCharsPerSecond, per logger; {@code many.maxFiles} turns on
+ * maxFiles, per logger. At 5 traces of about 95 chars
  * a second, a cap of 200 chars/s lets about two of every five through.
  *
  * <p>The producers are a few threads that each own a share of the loggers and pace their calls:
@@ -53,6 +54,7 @@ public final class ManyLoggersBenchmark {
         long fileKb = Long.getLong("many.fileKb", 1 << 20);
         long minFreeMb = Long.getLong("many.minFreeMb", 0);
         long charsPerSecond = Long.getLong("many.charsPerSecond", 0);
+        int maxFiles = Integer.getInteger("many.maxFiles", 0);
         PrintStream out = System.out;
 
         clean(dir);
@@ -66,7 +68,8 @@ public final class ManyLoggersBenchmark {
         int tracesPerLogger = (int) (seconds * rate);
         out.printf(Locale.ROOT, "%d loggers, 1 worker each, %s traces/s each (%s/s in all), %d s, %d producer threads, files in %s%n",
                 loggers, fmt(rate), fmt(rate * loggers), seconds, producers, dir);
-        out.printf(Locale.ROOT, "caps: maxFileSizeKb=%d%s%s%n", fileKb,
+        out.printf(Locale.ROOT, "caps: maxFileSizeKb=%d%s%s%s%n", fileKb,
+                maxFiles > 0 ? ", maxFiles=" + maxFiles : ", no maxFiles",
                 minFreeMb > 0 ? ", minFreeDiskSpace(" + minFreeMb + " MiB, " + 2 * minFreeMb + " MiB)" : ", no minFreeDiskSpace",
                 charsPerSecond > 0 ? ", maxCharsPerSecond=" + charsPerSecond + " per logger" : ", no maxCharsPerSecond");
 
@@ -80,6 +83,9 @@ public final class ManyLoggersBenchmark {
             }
             if (charsPerSecond > 0) {
                 b.maxCharsPerSecond(charsPerSecond);
+            }
+            if (maxFiles > 0) {
+                b.maxFiles(maxFiles);
             }
             all[i] = b.build();
         }

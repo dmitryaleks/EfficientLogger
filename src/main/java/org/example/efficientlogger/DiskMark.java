@@ -33,27 +33,37 @@ final class DiskMark {
     static final long CHECK_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
     private static final long UNSET = Long.MIN_VALUE;
 
-    private volatile long shedBelow; // 0: the mark isn't set
-    private volatile long resumeAbove;
+    /** The two thresholds, read together so no reading sees one old and one new. */
+    private record Marks(long shedBelow, long resumeAbove) {}
+
+    private volatile Marks marks; // null: the mark isn't set
     private final ConcurrentHashMap<Object, Volume> volumes = new ConcurrentHashMap<>(); // by FileStore, or by directory for tests
 
-    /** Sets the thresholds for every volume. */
+    /**
+     * Sets the thresholds for every volume, and makes every volume take a fresh reading at its next
+     * check, so the new mark applies as soon as a worker or caller looks rather than up to an
+     * interval later.
+     */
     void set(long shedBelow, long resumeAbove) {
         assert shedBelow >= 1 && resumeAbove >= shedBelow;
-        this.resumeAbove = resumeAbove;
-        this.shedBelow = shedBelow;
+        marks = new Marks(shedBelow, resumeAbove);
+        for (Volume v : volumes.values()) {
+            v.nextCheckNanos.set(UNSET);
+        }
     }
 
     boolean enabled() {
-        return shedBelow > 0;
+        return marks != null;
     }
 
     long shedBelow() {
-        return shedBelow;
+        Marks m = marks;
+        return m == null ? 0 : m.shedBelow();
     }
 
     long resumeAbove() {
-        return resumeAbove;
+        Marks m = marks;
+        return m == null ? 0 : m.resumeAbove();
     }
 
     /**
@@ -68,10 +78,21 @@ final class DiskMark {
         try {
             store = Files.getFileStore(directory);
         } catch (IOException | RuntimeException e) {
-            // No file store to share with: a volume of this directory's own, whose readings fail
-            // (and are reported once) until the mark is turned off or the directory comes back.
-            return volumes.computeIfAbsent(directory, k -> new Volume(() -> {
-                throw new IOException("can't find the file store of " + directory, e);
+            // No file store to share with yet (the directory is unreadable, or on a volume that is
+            // down): a volume of this directory's own, whose probe keeps looking for the store and
+            // reads from it once found. Until then its readings fail, which is reported once.
+            return volumes.computeIfAbsent(directory, k -> new Volume(new Probe() {
+                private volatile FileStore found;
+
+                @Override
+                public long usableBytes() throws IOException {
+                    FileStore s = found;
+                    if (s == null) {
+                        s = Files.getFileStore(directory);
+                        found = s;
+                    }
+                    return s.getUsableSpace();
+                }
             }));
         }
         return volumes.computeIfAbsent(store, k -> new Volume(store::getUsableSpace));
@@ -133,12 +154,13 @@ final class DiskMark {
             if ((next != UNSET && now - next < 0) || !nextCheckNanos.compareAndSet(next, now + CHECK_INTERVAL_NANOS)) {
                 return null; // not due, or another thread is taking this reading
             }
-            long below = shedBelow;
-            long above = resumeAbove;
-            if (below <= 0) {
+            Marks m = marks;
+            if (m == null) {
                 shedding = false;
                 return null;
             }
+            long below = m.shedBelow();
+            long above = m.resumeAbove();
             long free;
             try {
                 free = probe.usableBytes();

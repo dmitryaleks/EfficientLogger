@@ -707,6 +707,48 @@ class AsyncThreadsTest {
     }
 
     /**
+     * The rate cap is one bucket for the process: two loggers that share a TestHooks (and so its
+     * limits) are charged together under concurrent producers, and their own counts add up to the
+     * whole (review 21).
+     */
+    @Test
+    void twoLoggersShareOneRateBucketUnderConcurrentProducers() throws Exception {
+        long rate = 10_000; // chars/s: with 10-char messages, 1,000 a second plus a burst of 1,000
+        TestHooks hooks = nullSinks();
+        AsyncLogger a = start(builder().maxCharsPerSecond(rate), hooks);
+        AsyncLogger b = start(builder(), hooks); // sets no rate: the shared one stands
+        int calls = 100_000;
+        long start = System.nanoTime();
+        Thread ta = new Thread(() -> {
+            for (int i = 0; i < calls; i++) {
+                a.log("a", "0123456789");
+            }
+        });
+        Thread tb = new Thread(() -> {
+            for (int i = 0; i < calls; i++) {
+                b.log("b", "0123456789");
+            }
+        });
+        ta.start();
+        tb.start();
+        ta.join();
+        tb.join();
+        long elapsed = System.nanoTime() - start;
+        assertTrue(a.close(WAIT));
+        assertTrue(b.close(WAIT));
+
+        LoggerStats sa = a.stats();
+        LoggerStats sb = b.stats();
+        long accepted = sa.accepted() + sb.accepted();
+        assertEquals(2L * calls, accepted + sa.droppedRateLimit() + sb.droppedRateLimit(), "every call accepted or counted by its logger");
+        assertEquals(accepted, sa.written() + sb.written());
+        long allowed = (long) (rate * ((elapsed + RateMeter.BURST_NANOS) / 1e9)) / 10 + 1;
+        assertTrue(accepted <= allowed, "accepted " + accepted + " between them in " + elapsed / 1_000_000 + " ms; one bucket allows " + allowed);
+        assertTrue(accepted >= 100, "the burst alone is a thousand chars: " + accepted);
+        assertTrue(sb.droppedRateLimit() > 0, "b, which set no rate, is capped too: " + sb);
+    }
+
+    /**
      * A producer cut off after being admitted but before claiming a ring slot leaves the queue
      * size above zero with nothing in any ring to drain. close() gives up after 2 s, says so, and
      * returns false. If that producer was merely stalled and resumes, its log() returns true, but

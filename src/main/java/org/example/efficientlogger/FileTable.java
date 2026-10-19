@@ -354,28 +354,33 @@ final class FileTable {
                 return false;
             }
         }
-        // FAILED: the retry is due. CAPPED: the process's maxFiles may have been raised; open() checks.
+        if (f.state == FileState.CAPPED && fileBudget.created() >= fileBudget.max()) {
+            // Still at maxFiles: nothing to try. (Trying would take an open-file slot and could
+            // evict a live file to make room, only to find the budget still full; review 21, S1.)
+            f.retryAtNanos = now + RETRY_NANOS;
+            return false;
+        }
+        // FAILED: the retry is due. CAPPED: the process's maxFiles has room now.
         open(f, now);
         return f.state == FileState.OPEN;
     }
 
-    /** Opens f's file. Afterwards f is OPEN, or FAILED with a retry time. */
+    /**
+     * Opens f's file. Afterwards f is OPEN, or FAILED with a retry time, or CAPPED or FULL. The
+     * budgets are consulted before an open-file slot is taken, so an ID that turns out capped or a
+     * file that turns out full never evicts a live file to make room for nothing (review 21, S1).
+     */
     private void open(FileState f, long now) {
-        if (budget.acquire()) {
-            while (budget.isOver() && evictLeastRecentlyUsedOpen(now, true)) {
-                // close our own files until back under the cap, or none are left
-            }
-        }
         Sink sink = null;
         boolean reserved = false; // a maxFiles unit taken for the file this call creates
+        boolean slot = false; // an open-file slot taken
         try {
             int last = sinks.lastByte(f.path);
             if (last == SinkFactory.MISSING) {
                 if (!fileBudget.tryCreate()) {
                     // The file doesn't exist yet and the process is at its maxFiles limit: don't
                     // create another. Reopening a file that already exists, even an empty one, is
-                    // always allowed. Tried again in a second, in case the limit is raised.
-                    budget.release();
+                    // always allowed. Tried again once the limit has room.
                     f.state = FileState.CAPPED;
                     f.retryAtNanos = now + RETRY_NANOS;
                     reportMaxFilesReached();
@@ -387,9 +392,14 @@ final class FileTable {
             long cap = limits.maxFileBytes();
             if (size >= cap) {
                 // Already at the cap, e.g. from an earlier run: nothing more fits, so don't open it.
-                budget.release();
                 markFull(f, size, now, cap);
                 return;
+            }
+            slot = true;
+            if (budget.acquire()) {
+                while (budget.isOver() && evictLeastRecentlyUsedOpen(now, true)) {
+                    // close our own files until back under the cap, or none are left
+                }
             }
             sink = openSink(f.path, now);
             if (last >= 0 && last != '\n') {
@@ -412,7 +422,9 @@ final class FileTable {
                 // the cap can be exceeded by that one file.)
                 fileBudget.release();
             }
-            budget.release();
+            if (slot) {
+                budget.release();
+            }
             f.state = FileState.FAILED;
             f.retryAtNanos = now + RETRY_NANOS;
             reportIoError("can't open " + f.path + "; dropping its messages for 1 s", e, now);

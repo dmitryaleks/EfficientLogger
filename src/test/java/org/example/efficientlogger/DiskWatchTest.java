@@ -186,6 +186,35 @@ class DiskWatchTest {
         assertSame(limits.disk.volume(dir, null), limits.disk.volume(sub, null));
     }
 
+    /** A directory with no reachable file store at build gets a volume that keeps looking for one (review 21, S2). */
+    @Test
+    void aDirectoryWithoutAFileStoreYetGetsAVolumeThatKeepsLooking(@TempDir Path dir) throws IOException {
+        Path missing = dir.resolve("not-there-yet");
+        limits.disk.set(1, 1);
+        DiskMark.Volume v = limits.disk.volume(missing, null);
+        DiskWatch w = new DiskWatch(v, out, 0);
+        assertEquals(1, warnings.size(), warnings::toString);
+        assertTrue(warnings.get(0).startsWith("can't read the free space of the log directory's volume"), warnings.get(0));
+        assertFalse(w.shedding());
+
+        Files.createDirectories(missing); // the directory appears (or the volume is mounted)
+        w.check(1_000 * MS);
+        assertTrue(v.lastFree() > 0, "read from the file store found on the retry");
+        assertFalse(v.probeFailed());
+        assertEquals(1, warnings.size(), "nothing more to report");
+    }
+
+    @Test
+    void settingTheMarkMakesEveryVolumeReadAtOnce() {
+        DiskWatch w = watch(0); // reads at 0; the next reading would be due at 1 s
+        free = 100 << 10;
+        w.check(500 * MS);
+        assertFalse(w.shedding(), "not due");
+        limits.disk.set(MIB, 2 * MIB); // a build sets the mark (again)
+        w.check(600 * MS);
+        assertTrue(w.shedding(), "a fresh reading at the next check, not an interval later (review 21, S3/S4)");
+    }
+
     @Test
     void humanReadableSizes() {
         assertEquals("0 bytes", DiskWatch.human(0));

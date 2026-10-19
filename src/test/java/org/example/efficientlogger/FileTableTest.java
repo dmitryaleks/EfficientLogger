@@ -718,6 +718,34 @@ class FileTableTest {
         assertTrue(warnings(t).isEmpty(), "warned once");
     }
 
+    /**
+     * A capped ID's retry used to be a real open attempt, which at the open-file cap evicted a live
+     * file to make room and then found the process still at maxFiles, once a second (review 21, S1).
+     */
+    @Test
+    void aCappedIdsRetryDoesNotDisturbTheOpenFiles() {
+        limits.files.setMax(1);
+        budget = new OpenFileBudget(1); // this table may hold one file open
+        FileTable t = table(8192);
+        t.append("a", "{}", 0); // a: created and open
+        t.append("b", "{}", 0); // b: capped
+        assertEquals(1, warnings(t).size(), "the maxFiles warning");
+        for (int second = 1; second <= 10; second++) {
+            t.append("a", "{}", second * 1_000 * MS);
+            t.append("b", "{}", second * 1_000 * MS); // its retry is due every second
+        }
+        t.flushDirty(10_000 * MS);
+        assertEquals(1, sinks.opens, "a's file stayed open: b's retries didn't touch it");
+        assertEquals(11, t.written());
+        assertEquals(11, t.droppedInvalidId());
+        assertTrue(warnings(t).isEmpty(), "and no thrash warning");
+
+        limits.files.setMax(2); // a later build raises it: now b is worth trying
+        t.append("b", "{}", 11_000 * MS);
+        t.flushDirty(11_000 * MS);
+        assertEquals("{}\n", sinks.content(file("b")));
+    }
+
     @Test
     void aFullFileWhoseSizeCantBeReadIsTreatedAsAnIoError() {
         maxFileBytes = 10;

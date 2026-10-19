@@ -52,6 +52,8 @@ class ConfigTest {
         assertEquals(0, c.resumeFreeDiskBytes);
         assertEquals(0, c.maxCharsPerSecond);
 
+        assertFalse(c.maxFilesSet, "an unset maxFiles leaves the process's cap alone");
+        assertTrue(builder().maxFiles(10).buildConfig().maxFilesSet);
         c = builder().minFreeDiskSpace(1 << 20, 4 << 20).maxCharsPerSecond(5000).buildConfig();
         assertEquals(1 << 20, c.minFreeDiskBytes);
         assertEquals(4 << 20, c.resumeFreeDiskBytes);

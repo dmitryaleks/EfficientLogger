@@ -290,9 +290,7 @@ public final class EfficientLoggerBuilder {
      * @throws UncheckedIOException if the directory can't be created
      */
     public EfficientLogger build() {
-        TestHooks hooks = new TestHooks();
-        hooks.limits = ProcessLimits.shared();
-        return build(hooks);
+        return build(new TestHooks(ProcessLimits.shared()));
     }
 
     EfficientLogger build(TestHooks hooks) {
@@ -305,8 +303,20 @@ public final class EfficientLoggerBuilder {
         } catch (IOException e) {
             throw new UncheckedIOException("can't create directory " + config.directory, e);
         }
-        hooks.limits.apply(config); // the latest build sets the process-wide limits, for every logger
-        return config.synchronous ? new SyncLogger(config, hooks) : new AsyncLogger(config, hooks).start();
+        // The latest build sets the process-wide limits, for every logger: once the logger exists,
+        // so a build that fails leaves them alone, and before it runs, with a first reading of the
+        // volume under the new mark, so a logger built on a nearly full volume sheds from its
+        // first message.
+        if (config.synchronous) {
+            SyncLogger logger = new SyncLogger(config, hooks);
+            hooks.limits.apply(config);
+            logger.readLimits();
+            return logger;
+        }
+        AsyncLogger logger = new AsyncLogger(config, hooks);
+        hooks.limits.apply(config);
+        logger.readLimits();
+        return logger.start();
     }
 
     /** Validates the options and resolves defaults. */

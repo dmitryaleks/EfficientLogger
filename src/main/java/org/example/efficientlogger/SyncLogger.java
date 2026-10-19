@@ -67,6 +67,11 @@ final class SyncLogger implements EfficientLogger {
         }
     }
 
+    /** Takes a first free-space reading under the limits the builder has just applied. */
+    void readLimits() {
+        disk.check(clock.getAsLong());
+    }
+
     @Override
     public boolean log(String id, String json) {
         Objects.requireNonNull(id, "id");

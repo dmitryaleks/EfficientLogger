@@ -3,18 +3,27 @@ package org.example.efficientlogger;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.LongSupplier;
 
-/** Seams for tests. {@link EfficientLoggerBuilder#build()} uses the defaults. */
+/**
+ * Seams for tests. {@link EfficientLoggerBuilder#build()} uses the defaults, except that it passes
+ * the process's shared {@link ProcessLimits}; a {@code TestHooks} made without one gets a fresh
+ * instance, which keeps tests apart, as a private pool does.
+ */
 final class TestHooks {
 
     SinkFactory sinks = FileOutputStreamSink.FACTORY;
     LongSupplier nanoClock = System::nanoTime;
     /** How minFreeDiskSpace reads the free space; null means the log directory's file store. */
     DiskMark.Probe freeSpace = null;
-    /**
-     * The process-wide limits the logger shares. {@link EfficientLoggerBuilder#build()} uses
-     * {@link ProcessLimits#shared()}; a fresh instance here keeps tests apart, as a private pool does.
-     */
-    ProcessLimits limits = new ProcessLimits();
+    /** The process-wide limits the logger shares: see the class comment. */
+    ProcessLimits limits;
+
+    TestHooks() {
+        this(new ProcessLimits());
+    }
+
+    TestHooks(ProcessLimits limits) {
+        this.limits = limits;
+    }
 
     /**
      * The key of the hash that picks each ID's worker or stripe (see {@link Hashing#bucket}).

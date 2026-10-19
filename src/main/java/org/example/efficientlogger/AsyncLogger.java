@@ -87,6 +87,11 @@ final class AsyncLogger implements EfficientLogger {
         pool = hooks.startThreads ? (config.workerPool != null ? config.workerPool : WorkerPool.shared()) : null;
     }
 
+    /** Takes a first free-space reading under the limits the builder has just applied. */
+    void readLimits() {
+        disk.check(clock.getAsLong());
+    }
+
     /**
      * Hands the workers to the pool and registers the shutdown hook. The builder calls this once
      * construction has finished; the constructor itself hands {@code this} to nothing that runs.

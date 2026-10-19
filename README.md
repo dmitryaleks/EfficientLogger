@@ -95,10 +95,13 @@ Three things to know when choosing them:
   `minFreeDiskSpace` and `maxCharsPerSecond` are one setting each for the whole JVM, shared by
   every logger, including those built earlier: the file cap applies at each file's next record, a
   lower file count caps new IDs until it is raised, a new mark or rate is used at the next reading or
-  charge. Every `build()` sets the file cap, since it is mandatory; a build that leaves one of the
-  other three out leaves it as it is, so configure them once, on whichever logger you build first, or
-  on all of them alike. The queue limits, `maxOpenFiles` and the warning handler stay per logger, and
-  so does the counting and reporting of what the shared limits made each logger drop.
+  charge. Every `build()` sets the file cap, since it is mandatory, so use one constant for it
+  across the process: two loggers built with different values each reset the other's cap at its next
+  record. A build that leaves one of the other three out leaves it as it is, so configure them once,
+  on whichever logger you build first, or on all of them alike; to turn one off again, build with a
+  value that can't bite: `maxFiles(Integer.MAX_VALUE)`, `maxCharsPerSecond(Long.MAX_VALUE)` or
+  `minFreeDiskSpace(1, 1)`. The queue limits, `maxOpenFiles` and the warning handler stay per
+  logger, and so does the counting and reporting of what the shared limits made each logger drop.
 - **One bucket and one mark, many loggers.** A hundred loggers share the 5 MB/s above between them,
   and loggers whose directories are on one volume shed together on one reading of it. A logger that
   must keep writing while others are throttled needs its own process.

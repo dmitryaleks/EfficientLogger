@@ -103,6 +103,22 @@ tasks.register<JavaExec>("manyLoggers") {
     (findProperty("many.jvmArgs") as String?)?.let { jvmArgs(it.split(" ")) } // e.g. -Xlog:safepoint,gc:file=build/jvm.log
 }
 
+// An executable test, about 200 seconds: 500 writer threads, one ID each, 5 JSON lines/s each, 1,000
+// lines each, into 500 files through one logger with a single worker thread. Then it reads every file
+// back and prints the timings, among them how long after the last log() the worker had written it all;
+// exit code 1 if anything is missing. .\gradlew.bat singleWorkerSoak [-Psoak.writers=500 -Psoak.rate=5
+// -Psoak.lines=1000 -Psoak.dir=build/single-worker-soak -Psoak.flushMillis=100 -Psoak.verbose=true]
+tasks.register<JavaExec>("singleWorkerSoak") {
+    description = "Runs SingleWorkerSoak: many writers, one file each, through one logger with a single worker thread"
+    group = "benchmark"
+    classpath = sourceSets["jmh"].runtimeClasspath
+    mainClass = "org.example.efficientlogger.SingleWorkerSoak"
+    for (option in listOf("writers", "rate", "lines", "dir", "fileKb", "flushMillis", "verbose", "drainTimeoutSeconds")) {
+        (findProperty("soak.$option") as String?)?.let { systemProperty("soak.$option", it) }
+    }
+    (findProperty("soak.jvmArgs") as String?)?.let { jvmArgs(it.split(" ")) }
+}
+
 tasks.named<Jar>("jmhJar") {
     manifest {
         attributes("Multi-Release" to "true") // log4j-core has Java 9+ versions of some classes

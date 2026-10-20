@@ -451,6 +451,67 @@ counted only drops made at `log()` time, so the file-cap run reported "nothing l
 drops and the `maxFiles` run reported "MISMATCH" with every trace accounted for. It now counts
 every guard on both sides of the stats identity.
 
+### 500 writers through one worker thread
+
+`SingleWorkerSoak` (`gradlew singleWorkerSoak`) is the executable test for the other shape of
+many-producer load: one logger with a single worker thread, and 500 writer threads each logging
+JSON to its own file (500 IDs, 500 files) at 5 lines a second until each has written 1,000 lines,
+so about 200 seconds and 500,000 lines in all. Each line is about 350 bytes: a timestamp, the
+writer, a sequence number, the thread, and a `payload` of 256 hex digits of pseudo-random bits,
+different on every line. It measures the thing a single-threaded writer has to answer for: how far
+behind the producers it runs, and how long after the last `log()` returns it has handed everything
+to the OS. A watcher thread waits for the last writer and then polls `stats()` until `written`
+equals `accepted` (the worker counts a line written only once its file's buffer is flushed), and
+that moment, `flush()` and `close()` are all timed. Afterwards every file is read back and checked
+line by line: 1,000 lines, each a JSON object naming the right writer, `seq` counting up from 0,
+and a 256-hex-digit payload. It prints the timeline and gaps, the writers' pacing and `log()`
+latency, the worker's CPU time and queue depth, the final `stats()`, what is on disk, GC and
+warnings, then `PASS` or `FAIL` and exits 1 on a failure.
+
+```
+.\gradlew.bat singleWorkerSoak                                   # Windows: 500 writers, 5 lines/s, 1,000 lines each
+./gradlew singleWorkerSoak                                       # Linux
+./gradlew singleWorkerSoak -Psoak.writers=100 -Psoak.lines=200   # a 40-second version
+./gradlew singleWorkerSoak -Psoak.flushMillis=10 -Psoak.verbose=true
+```
+
+Its options are `-Psoak.writers` (500), `-Psoak.rate` (5, lines a second per writer),
+`-Psoak.lines` (1,000 per writer), `-Psoak.dir` (`build/single-worker-soak`), `-Psoak.fileKb`
+(each file's `maxFileSizeKb`, 1 GiB), `-Psoak.flushMillis` (the logger's `flushIntervalMillis`,
+100 by default), `-Psoak.verbose=true` (a row per writer), `-Psoak.drainTimeoutSeconds` (60, how
+long the watcher waits for `written` to catch up) and `-Psoak.jvmArgs`. It needs nothing but the
+JDK 17 toolchain the build already uses, and writes about 175 MiB.
+
+On the Windows machine above, on 2026-10-20: every one of the 500,000 lines was accepted,
+written, and found on disk in order, 1,000 to a file, with nothing dropped and no warnings. The
+last `log()` returned 200.003 s after the common start; the worker had every line handed to the
+OS 44 ms later (251 lines were still queued or buffered at that moment), `flush()` then found
+nothing to do (0.2 ms), and `close()` took 125 ms to close the 500 files. The gap is set by the
+100 ms flush interval: it is whatever is left of the timer window when the last line arrives, and
+an earlier run of the same test without the payload measured 117 ms. The one worker thread used
+7.9 s of CPU over the 200 s, 3.9% of a core and 15.8 µs per line, the same per-line cost as the
+run with 84-byte lines, so the bytes are not where the time goes. The queue, sampled every 50 ms,
+peaked at 1,214 messages and 425 KB of its 65,536-message, 16 MiB capacity, averaging 145; the
+worker was at most 1,470 lines behind the writers. `log()` took 1.2 µs at p50, 4.7 µs at p90,
+25 µs at p99 and 12.6 ms at worst; the three worst calls happened in the same millisecond on
+three writers, one pause landing on whoever was in `log()`, with 2 GCs totalling 18 ms in the
+whole run. The writers' pacing lateness (p50 9 ms) is the Windows timer granularity for 500
+parked threads, not the logger: every writer still finished within 23 ms of its planned 199.8 s.
+
+The same test on Linux (Ubuntu 24.04 under WSL 2 on the same machine, Temurin 17.0.20.1, files on
+ext4), the same day: again every line accepted, written and found in order, nothing dropped, no
+warnings. The worker was done 94 ms after the last `log()` (19 lines still in hand at that moment),
+`flush()` took 0.4 ms and `close()` 2.6 ms, so closing 500 files cost 2.6 ms there against 125 ms
+on NTFS. The worker used 5.4 s of CPU, 2.7% of a core and 10.9 µs per line; the queue peaked at
+342 messages, averaging 129, and the worker was at most 417 lines behind. `log()` took 1.3 µs at
+p50, 2.8 µs at p90 and 28 µs at p99, the same as on Windows, but 44 ms at worst: the slowest calls
+come in clusters, three writers at uptime 22.21 s and two at 67.43 s, so they are one pause each
+landing on every thread then inside `log()`, which is the virtual machine, not the queue. Linux
+honours short parks, so the writers' pacing lateness was 164 µs at p50 rather than 9 ms, and
+their 500 threads cost 30 s of CPU over the run (15% of a core) against 9.6 s on Windows, where
+the coarser timer wakes them less often. The watcher's 20 µs polls are also honoured there: it
+took 683 polls to see the drain end against 4 on Windows.
+
 ## On Linux
 
 - **Rotate with `copytruncate`.** The logger keeps each file open, so if logrotate renames a
@@ -517,6 +578,8 @@ Install a JDK 17 yourself, or set `org.gradle.java.installations.auto-download=f
 java -jar build/libs/EfficientLogger-1.0-SNAPSHOT-jmh.jar LoggerBenchmark -prof gc -p output=disk
 .\gradlew.bat manyLoggers                                 # the one-minute soak: 100 loggers at 5 traces/s each
 .\gradlew.bat manyLoggers -Pmany.loggers=500 -Pmany.rate=1 -Pmany.seconds=30   # its options (also producers, dir)
+.\gradlew.bat singleWorkerSoak                            # the 200-second test: 500 writers, 1,000 JSON lines each, one worker thread
+.\gradlew.bat singleWorkerSoak -Psoak.writers=100 -Psoak.lines=200             # its options (also rate, dir, flushMillis, verbose)
 ```
 
 The design, the reasoning behind it and the milestones are in [PLAN.md](PLAN.md).
